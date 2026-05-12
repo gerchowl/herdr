@@ -607,27 +607,45 @@ fn normalized_process_name(process: &crate::platform::ForegroundProcess) -> Stri
         }
     }
 
+    if identify_agent(effective).is_some() {
+        return effective.to_string();
+    }
+
+    if let Some(wrapped_agent) =
+        cmdline_argv0_agent_name(process.cmdline.as_deref().unwrap_or_default())
+    {
+        return wrapped_agent;
+    }
+
     effective.to_string()
 }
 
 fn wrapped_agent_name_from_cmdline(cmdline: &str) -> Option<String> {
     for token in cmdline.split_whitespace() {
-        let trimmed = token.trim_matches(|c| matches!(c, '"' | '\''));
-        if trimmed.is_empty() || trimmed.starts_with('-') {
-            continue;
+        if let Some(agent_name) = agent_name_from_path_token(token) {
+            return Some(agent_name);
         }
-
-        let basename = std::path::Path::new(trimmed)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or(trimmed);
-        let Some(agent) = parse_agent_label(basename) else {
-            continue;
-        };
-        return Some(agent_label(agent).to_string());
     }
 
     None
+}
+
+fn cmdline_argv0_agent_name(cmdline: &str) -> Option<String> {
+    agent_name_from_path_token(cmdline.split_whitespace().next()?)
+}
+
+fn agent_name_from_path_token(token: &str) -> Option<String> {
+    let trimmed = token.trim_matches(|c| matches!(c, '"' | '\''));
+    if trimmed.is_empty() || trimmed.starts_with('-') {
+        return None;
+    }
+
+    let basename = std::path::Path::new(trimmed)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(trimmed);
+    let agent = parse_agent_label(basename)?;
+    Some(agent_label(agent).to_string())
 }
 
 fn process_priority(process: &crate::platform::ForegroundProcess, normalized_name: &str) -> u8 {
@@ -733,6 +751,42 @@ mod tests {
     }
 
     #[test]
+    fn identify_agent_in_job_detects_nix_wrapped_codex_from_cmdline_argv0() {
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 123,
+            processes: vec![crate::platform::ForegroundProcess {
+                pid: 1,
+                name: ".codex-wrapped".to_string(),
+                argv0: None,
+                cmdline: Some("/etc/profiles/per-user/user/bin/codex --model gpt-5".to_string()),
+            }],
+        };
+
+        assert_eq!(
+            identify_agent_in_job(&job),
+            Some((Agent::Codex, "codex".to_string()))
+        );
+    }
+
+    #[test]
+    fn identify_agent_in_job_canonicalizes_nix_wrapped_aliases_from_cmdline_argv0() {
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 123,
+            processes: vec![crate::platform::ForegroundProcess {
+                pid: 1,
+                name: ".claude-code-wrapped".to_string(),
+                argv0: None,
+                cmdline: Some("/nix/store/example/bin/claude-code".to_string()),
+            }],
+        };
+
+        assert_eq!(
+            identify_agent_in_job(&job),
+            Some((Agent::Claude, "claude".to_string()))
+        );
+    }
+
+    #[test]
     fn identify_agent_in_job_detects_shell_wrapped_pi() {
         let job = crate::platform::ForegroundJob {
             process_group_id: 123,
@@ -753,6 +807,19 @@ mod tests {
     #[test]
     fn wrapped_agent_name_from_cmdline_ignores_plain_shell_flags() {
         assert_eq!(wrapped_agent_name_from_cmdline("bash -lc"), None);
+    }
+
+    #[test]
+    fn cmdline_argv0_agent_name_canonicalizes_known_aliases() {
+        assert_eq!(
+            cmdline_argv0_agent_name("/nix/store/example/bin/ghcs"),
+            Some("copilot".to_string())
+        );
+    }
+
+    #[test]
+    fn cmdline_argv0_agent_name_requires_exact_agent_basename() {
+        assert_eq!(cmdline_argv0_agent_name("/tmp/my-codex-helper"), None);
     }
 
     // ---- Workspace state rollup ----
