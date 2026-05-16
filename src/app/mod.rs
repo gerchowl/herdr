@@ -312,6 +312,7 @@ impl App {
         let mut state = AppState {
             terminals: std::collections::HashMap::new(),
             terminal_runtimes: std::collections::HashMap::new(),
+            direct_attach_resize_locks: std::collections::HashSet::new(),
             workspaces,
             active,
             selected,

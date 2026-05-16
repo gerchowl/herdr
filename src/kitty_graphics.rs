@@ -362,27 +362,25 @@ fn collect_visible_placements(
             return Vec::new();
         }
     };
-    let tab = match app
+    if app
         .workspaces
         .get(ws_idx)
         .and_then(crate::workspace::Workspace::active_tab)
+        .is_none()
     {
-        Some(t) => t,
-        None => {
-            tracing::debug!(ws_idx, "collect_visible_placements: no active tab");
-            return Vec::new();
-        }
-    };
+        tracing::debug!(ws_idx, "collect_visible_placements: no active tab");
+        return Vec::new();
+    }
 
     tracing::debug!(
         ws_idx,
-        tab_runtimes_len = tab.runtimes.len(),
+        terminal_runtimes_len = app.terminal_runtimes.len(),
         pane_infos_len = app.view.pane_infos.len(),
         "collect_visible_placements: starting iteration"
     );
     let mut placements = Vec::new();
     for info in &app.view.pane_infos {
-        let runtime = match tab.runtimes.get(&info.id) {
+        let runtime = match app.runtime_for_pane_in_workspace(ws_idx, info.id) {
             Some(rt) => rt,
             None => {
                 tracing::debug!(pane_id = ?info.id, "collect_visible_placements: runtime not found");

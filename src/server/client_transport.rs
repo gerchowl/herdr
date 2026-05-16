@@ -58,6 +58,12 @@ pub(crate) enum ServerEvent {
     },
     /// A client sent an input message.
     ClientInput { client_id: u64, data: Vec<u8> },
+    /// A client requested direct attach to one terminal.
+    ClientAttachTerminal {
+        client_id: u64,
+        terminal_id: String,
+        takeover: bool,
+    },
     /// A client sent a resize message.
     ClientResize {
         client_id: u64,
@@ -354,6 +360,14 @@ fn client_read_loop(
                 }
             }
             ClientMessage::Detach => ServerEvent::ClientDetach { client_id },
+            ClientMessage::AttachTerminal {
+                terminal_id,
+                takeover,
+            } => ServerEvent::ClientAttachTerminal {
+                client_id,
+                terminal_id,
+                takeover,
+            },
             ClientMessage::Hello { .. } => {
                 // Duplicate Hello — ignore.
                 continue;

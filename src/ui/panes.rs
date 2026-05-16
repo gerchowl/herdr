@@ -59,13 +59,15 @@ fn runtime_for_tab_pane<'a>(
     app: &'a AppState,
     tab: &'a crate::workspace::Tab,
     pane_id: crate::layout::PaneId,
-) -> Option<&'a TerminalRuntime> {
+) -> Option<(&'a crate::terminal::TerminalId, &'a TerminalRuntime)> {
+    let terminal_id = tab.terminal_id(pane_id)?;
     #[cfg(test)]
     if let Some(runtime) = tab.runtimes.get(&pane_id) {
-        return Some(runtime);
+        return Some((terminal_id, runtime));
     }
-    let terminal_id = tab.terminal_id(pane_id)?;
-    app.terminal_runtimes.get(terminal_id)
+    app.terminal_runtimes
+        .get(terminal_id)
+        .map(|runtime| (terminal_id, runtime))
 }
 
 fn stable_scrollbar_gutter(rt: &TerminalRuntime, pane_inner: Rect) -> (Rect, Option<Rect>) {
@@ -98,14 +100,16 @@ pub(super) fn resize_tab_panes(
 
     if tab.zoomed {
         let focused_id = tab.layout.focused();
-        if let Some(rt) = runtime_for_tab_pane(app, tab, focused_id) {
+        if let Some((terminal_id, rt)) = runtime_for_tab_pane(app, tab, focused_id) {
             let inner_rect = stable_terminal_inner_rect(area);
-            rt.resize(
-                inner_rect.height,
-                inner_rect.width,
-                cell_size.width_px,
-                cell_size.height_px,
-            );
+            if !app.direct_attach_resize_locks.contains(terminal_id) {
+                rt.resize(
+                    inner_rect.height,
+                    inner_rect.width,
+                    cell_size.width_px,
+                    cell_size.height_px,
+                );
+            }
         }
         return;
     }
@@ -117,14 +121,16 @@ pub(super) fn resize_tab_panes(
             area
         };
 
-        if let Some(rt) = runtime_for_tab_pane(app, tab, info.id) {
+        if let Some((terminal_id, rt)) = runtime_for_tab_pane(app, tab, info.id) {
             let inner_rect = stable_terminal_inner_rect(pane_inner);
-            rt.resize(
-                inner_rect.height,
-                inner_rect.width,
-                cell_size.width_px,
-                cell_size.height_px,
-            );
+            if !app.direct_attach_resize_locks.contains(terminal_id) {
+                rt.resize(
+                    inner_rect.height,
+                    inner_rect.width,
+                    cell_size.width_px,
+                    cell_size.height_px,
+                );
+            }
         }
     }
 }
@@ -152,7 +158,11 @@ pub(super) fn compute_pane_infos(
         let mut scrollbar_rect = None;
         if let Some(rt) = app.runtime_for_pane_in_workspace(ws_idx, focused_id) {
             (inner_rect, scrollbar_rect) = stable_scrollbar_gutter(rt, area);
-            if resize_panes {
+            if resize_panes
+                && ws.terminal_id(focused_id).is_some_and(|terminal_id| {
+                    !app.direct_attach_resize_locks.contains(terminal_id)
+                })
+            {
                 rt.resize(
                     inner_rect.height,
                     inner_rect.width,
@@ -191,7 +201,11 @@ pub(super) fn compute_pane_infos(
         let mut scrollbar_rect = None;
         if let Some(rt) = app.runtime_for_pane_in_workspace(ws_idx, info.id) {
             (inner_rect, scrollbar_rect) = stable_scrollbar_gutter(rt, pane_inner);
-            if resize_panes {
+            if resize_panes
+                && ws.terminal_id(info.id).is_some_and(|terminal_id| {
+                    !app.direct_attach_resize_locks.contains(terminal_id)
+                })
+            {
                 rt.resize(
                     inner_rect.height,
                     inner_rect.width,

@@ -508,16 +508,18 @@ mod tests {
         app.state.mode = Mode::Terminal;
         app.state.view.pane_infos = pane_infos;
 
-        let start_metrics = app.state.workspaces[0]
-            .runtime(pane_id)
+        let start_metrics = app
+            .state
+            .runtime_for_pane_in_workspace(0, pane_id)
             .and_then(crate::pane::PaneRuntime::scroll_metrics)
             .expect("initial scroll metrics");
         assert_eq!(start_metrics.offset_from_bottom, 0);
 
         app.handle_terminal_key_headless(TerminalKey::new(KeyCode::PageUp, KeyModifiers::empty()));
 
-        let end_metrics = app.state.workspaces[0]
-            .runtime(pane_id)
+        let end_metrics = app
+            .state
+            .runtime_for_pane_in_workspace(0, pane_id)
             .and_then(crate::pane::PaneRuntime::scroll_metrics)
             .expect("scroll metrics after PageUp");
         assert_eq!(
@@ -550,8 +552,9 @@ mod tests {
         app.state.view.pane_infos = pane_infos;
 
         app.handle_terminal_key_headless(TerminalKey::new(KeyCode::PageUp, KeyModifiers::empty()));
-        let after_up = app.state.workspaces[0]
-            .runtime(pane_id)
+        let after_up = app
+            .state
+            .runtime_for_pane_in_workspace(0, pane_id)
             .and_then(crate::pane::PaneRuntime::scroll_metrics)
             .expect("scroll metrics after PageUp");
         assert!(after_up.offset_from_bottom > 0);
@@ -560,8 +563,9 @@ mod tests {
             KeyCode::PageDown,
             KeyModifiers::empty(),
         ));
-        let after_down = app.state.workspaces[0]
-            .runtime(pane_id)
+        let after_down = app
+            .state
+            .runtime_for_pane_in_workspace(0, pane_id)
             .and_then(crate::pane::PaneRuntime::scroll_metrics)
             .expect("scroll metrics after PageDown");
         assert_eq!(after_down.offset_from_bottom, 0);
@@ -591,8 +595,9 @@ mod tests {
         app.state.view.pane_infos = pane_infos;
 
         app.handle_terminal_key_headless(TerminalKey::new(KeyCode::PageUp, KeyModifiers::empty()));
-        let after_press = app.state.workspaces[0]
-            .runtime(pane_id)
+        let after_press = app
+            .state
+            .runtime_for_pane_in_workspace(0, pane_id)
             .and_then(crate::pane::PaneRuntime::scroll_metrics)
             .expect("scroll metrics after PageUp press");
         assert_eq!(
@@ -605,8 +610,9 @@ mod tests {
                 .with_kind(KeyEventKind::Release),
         );
 
-        let after_release = app.state.workspaces[0]
-            .runtime(pane_id)
+        let after_release = app
+            .state
+            .runtime_for_pane_in_workspace(0, pane_id)
             .and_then(crate::pane::PaneRuntime::scroll_metrics)
             .expect("scroll metrics after PageUp release");
         assert_eq!(
@@ -640,8 +646,9 @@ mod tests {
 
         app.handle_terminal_key_headless(TerminalKey::new(KeyCode::PageUp, KeyModifiers::CONTROL));
 
-        let metrics = app.state.workspaces[0]
-            .runtime(pane_id)
+        let metrics = app
+            .state
+            .runtime_for_pane_in_workspace(0, pane_id)
             .and_then(crate::pane::PaneRuntime::scroll_metrics)
             .expect("scroll metrics after modified PageUp");
         assert_eq!(metrics.offset_from_bottom, 0);
@@ -672,16 +679,18 @@ mod tests {
         app.state.mode = Mode::Terminal;
         app.state.view.pane_infos = pane_infos;
 
-        let start_metrics = app.state.workspaces[0]
-            .runtime(pane_id)
+        let start_metrics = app
+            .state
+            .runtime_for_pane_in_workspace(0, pane_id)
             .and_then(crate::pane::PaneRuntime::scroll_metrics)
             .expect("initial scroll metrics");
         assert_eq!(start_metrics.offset_from_bottom, 0);
 
         app.handle_terminal_key_headless(TerminalKey::new(KeyCode::PageUp, KeyModifiers::empty()));
 
-        let end_metrics = app.state.workspaces[0]
-            .runtime(pane_id)
+        let end_metrics = app
+            .state
+            .runtime_for_pane_in_workspace(0, pane_id)
             .and_then(crate::pane::PaneRuntime::scroll_metrics)
             .expect("scroll metrics after PageUp");
         // Forwarded to pane, so test runtime doesn't process it — scroll stays at bottom.

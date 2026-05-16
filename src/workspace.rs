@@ -720,15 +720,25 @@ mod tests {
 
     #[test]
     fn workspace_identity_uses_identity_cwd() {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-workspace-identity-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let identity_cwd = root.join("pion");
+        std::fs::create_dir_all(identity_cwd.join(".git")).unwrap();
+
         let mut ws = Workspace::test_new("ignored");
         ws.custom_name = None;
-        ws.identity_cwd = PathBuf::from("/herdr-test/pion");
+        ws.identity_cwd = identity_cwd.clone();
 
         assert_eq!(ws.display_name(), "pion");
-        assert_eq!(
-            ws.resolved_identity_cwd(),
-            Some(PathBuf::from("/herdr-test/pion"))
-        );
+        assert_eq!(ws.resolved_identity_cwd(), Some(identity_cwd));
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

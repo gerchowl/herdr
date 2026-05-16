@@ -1143,10 +1143,10 @@ impl AppState {
     }
 
     fn forward_pane_reported_wheel(&self, info: &PaneInfo, mouse: MouseEvent) -> bool {
-        let Some(ws) = self.active.and_then(|i| self.workspaces.get(i)) else {
+        let Some(ws_idx) = self.active else {
             return false;
         };
-        let Some(rt) = ws.runtimes.get(&info.id) else {
+        let Some(rt) = self.runtime_for_pane_in_workspace(ws_idx, info.id) else {
             return false;
         };
         if !rt

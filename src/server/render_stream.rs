@@ -258,6 +258,34 @@ pub(crate) fn render_virtual_with_cell_size(
     (buffer, cursor)
 }
 
+/// Renders one server-owned terminal directly for `terminal attach` clients.
+pub(crate) fn render_terminal_virtual(
+    runtime: &crate::terminal::TerminalRuntime,
+    area: Rect,
+) -> (ratatui::buffer::Buffer, Option<CursorState>) {
+    let backend = CursorTrackingBackend::new(area.width, area.height);
+    let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend::new should never fail");
+
+    terminal
+        .draw(|frame| {
+            runtime.render(frame, area, true);
+        })
+        .expect("render to TestBackend should never fail");
+
+    let buffer = terminal.backend().buffer().clone();
+    let cursor = runtime
+        .cursor_state(area, true)
+        .map(|cursor| CursorState {
+            x: cursor.x,
+            y: cursor.y,
+            visible: cursor.visible && !crate::ui::pane_is_scrolled_back(runtime),
+            shape: cursor.shape,
+        })
+        .or_else(|| terminal.backend().rendered_cursor());
+
+    (buffer, cursor)
+}
+
 pub(crate) fn visible_hyperlinks(app_state: &AppState) -> Vec<((u16, u16), String, String)> {
     let Some(ws_idx) = app_state.active else {
         return Vec::new();

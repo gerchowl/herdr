@@ -79,6 +79,14 @@ pub enum ClientMessage {
 
     /// Graceful disconnect request.
     Detach,
+
+    /// Switch this connection into direct terminal attach mode.
+    AttachTerminal {
+        /// Terminal id to attach to.
+        terminal_id: String,
+        /// Replace an existing writable attach owner for this terminal.
+        takeover: bool,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -641,6 +649,18 @@ mod tests {
     #[test]
     fn client_detach_roundtrip() {
         let msg = ClientMessage::Detach;
+        let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
+        let (decoded, _): (ClientMessage, _) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+        assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn client_attach_terminal_roundtrip() {
+        let msg = ClientMessage::AttachTerminal {
+            terminal_id: "term_123".to_owned(),
+            takeover: true,
+        };
         let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
         let (decoded, _): (ClientMessage, _) =
             bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();

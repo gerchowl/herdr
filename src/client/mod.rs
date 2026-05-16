@@ -54,6 +54,54 @@ struct ClientState {
     sound_config: crate::config::SoundConfig,
     /// Whether this client may write Kitty graphics bytes to its host terminal.
     kitty_graphics_enabled: bool,
+    /// Direct attach prefix escape state. None for full-app clients.
+    attach_escape: Option<AttachEscapeState>,
+}
+
+#[derive(Debug, Default)]
+struct AttachEscapeState {
+    pending_prefix: bool,
+}
+
+#[derive(Debug)]
+enum AttachInputAction {
+    Forward(Vec<u8>),
+    Detach,
+    None,
+}
+
+impl AttachEscapeState {
+    fn filter_input(&mut self, data: Vec<u8>) -> AttachInputAction {
+        const PREFIX: u8 = 0x02; // Ctrl+B
+
+        let mut output = Vec::with_capacity(data.len());
+        for byte in data {
+            if self.pending_prefix {
+                self.pending_prefix = false;
+                match byte {
+                    b'q' => return AttachInputAction::Detach,
+                    PREFIX => output.push(PREFIX),
+                    other => {
+                        output.push(PREFIX);
+                        output.push(other);
+                    }
+                }
+                continue;
+            }
+
+            if byte == PREFIX {
+                self.pending_prefix = true;
+            } else {
+                output.push(byte);
+            }
+        }
+
+        if output.is_empty() {
+            AttachInputAction::None
+        } else {
+            AttachInputAction::Forward(output)
+        }
+    }
 }
 
 impl ClientState {
@@ -153,22 +201,42 @@ impl From<protocol::FramingError> for ClientError {
 ///
 /// Returns a guard that restores the terminal when dropped.
 fn setup_terminal(mouse_capture: bool) -> io::Result<TerminalGuard> {
+    setup_terminal_with_capabilities(true, mouse_capture)
+}
+
+/// Sets up a direct attach terminal.
+///
+/// Direct attach forwards stdin to the attached PTY, so it must not enable
+/// outer-terminal protocols that generate local responses or mouse reports.
+fn setup_direct_attach_terminal() -> io::Result<TerminalGuard> {
+    setup_terminal_with_capabilities(false, false)
+}
+
+fn setup_terminal_with_capabilities(
+    enable_client_protocols: bool,
+    mouse_capture: bool,
+) -> io::Result<TerminalGuard> {
     ratatui::init();
-    if mouse_capture {
-        execute!(io::stdout(), EnableMouseCapture)?;
+
+    if enable_client_protocols {
+        if mouse_capture {
+            execute!(io::stdout(), EnableMouseCapture)?;
+        } else {
+            execute!(io::stdout(), DisableMouseCapture)?;
+        }
+        execute!(
+            io::stdout(),
+            EnableBracketedPaste,
+            EnableFocusChange,
+            PushKeyboardEnhancementFlags(crate::input::ime_compatible_keyboard_enhancement_flags())
+        )?;
     } else {
         execute!(io::stdout(), DisableMouseCapture)?;
     }
-    execute!(
-        io::stdout(),
-        EnableBracketedPaste,
-        EnableFocusChange,
-        PushKeyboardEnhancementFlags(crate::input::ime_compatible_keyboard_enhancement_flags())
-    )?;
 
     // tmux doesn't understand kitty keyboard protocol push.
-    // Enable modifyOtherKeys mode 2 for tmux.
-    let in_tmux = std::env::var("TMUX").is_ok();
+    // Enable modifyOtherKeys mode 2 for tmux only for the full app client.
+    let in_tmux = enable_client_protocols && std::env::var("TMUX").is_ok();
     if in_tmux {
         io::stdout().write_all(b"\x1b[>4;2m")?;
         io::stdout().flush()?;
@@ -311,15 +379,41 @@ enum ClientLoopEvent {
 ///
 /// This is the entry point called from `main.rs` when running in client mode.
 pub fn run_client() -> io::Result<()> {
+    run_client_with_mode(
+        requested_render_encoding(),
+        None,
+        None,
+        "connecting to server",
+    )
+}
+
+/// Runs a direct terminal attach client.
+pub fn run_terminal_attach(terminal_id: String, takeover: bool) -> io::Result<()> {
+    run_client_with_mode(
+        RenderEncoding::TerminalAnsi,
+        Some((terminal_id, takeover)),
+        Some(AttachEscapeState::default()),
+        "attaching to terminal",
+    )
+}
+
+fn run_client_with_mode(
+    requested_encoding: RenderEncoding,
+    attach_request: Option<(String, bool)>,
+    attach_escape: Option<AttachEscapeState>,
+    log_message: &'static str,
+) -> io::Result<()> {
     init_logging();
 
     let loaded_config = crate::config::Config::load();
     let sound_config = loaded_config.config.ui.sound;
-    let kitty_graphics_enabled = loaded_config.config.experimental.kitty_graphics;
+    let direct_attach_requested = attach_request.is_some();
+    let kitty_graphics_enabled =
+        loaded_config.config.experimental.kitty_graphics && !direct_attach_requested;
 
     let socket_path = client_socket_path();
     crate::logging::startup("client");
-    info!(path = %socket_path.display(), "connecting to server");
+    info!(path = %socket_path.display(), "{log_message}");
 
     // Try to connect to the server.
     let mut stream = match UnixStream::connect(&socket_path) {
@@ -335,8 +429,6 @@ pub fn run_client() -> io::Result<()> {
     // Get the terminal geometry before handshake (before raw mode).
     let (cols, rows, cell_width_px, cell_height_px) =
         current_terminal_geometry(kitty_graphics_enabled);
-
-    let requested_encoding = requested_render_encoding();
 
     // Perform handshake while the stream is still in blocking mode.
     let negotiated_encoding = match do_handshake(
@@ -354,10 +446,26 @@ pub fn run_client() -> io::Result<()> {
         }
     };
 
-    // Now set up the terminal (raw mode, mouse, keyboard enhancements).
-    // This must happen AFTER the handshake succeeds, so we don't leave
-    // the terminal in raw mode if the server rejects us.
-    let _guard = setup_terminal(false).map_err(|err| {
+    if let Some((terminal_id, takeover)) = attach_request {
+        let attach = ClientMessage::AttachTerminal {
+            terminal_id,
+            takeover,
+        };
+        if let Err(err) = write_to_server(&mut stream, &attach) {
+            eprintln!("herdr: failed to request terminal attach: {err}");
+            std::process::exit(1);
+        }
+    }
+
+    // Now set up the terminal. This must happen AFTER the handshake succeeds,
+    // so we don't leave the terminal in raw mode if the server rejects us.
+    let direct_attach = attach_escape.is_some();
+    let _guard = if direct_attach {
+        setup_direct_attach_terminal()
+    } else {
+        setup_terminal(false)
+    }
+    .map_err(|err| {
         eprintln!("herdr: failed to set up terminal: {err}");
         err
     })?;
@@ -394,6 +502,7 @@ pub fn run_client() -> io::Result<()> {
             kitty_graphics_enabled,
             false,
             negotiated_encoding,
+            attach_escape,
         )
         .await
     });
@@ -439,6 +548,7 @@ async fn run_client_loop(
     kitty_graphics_enabled: bool,
     mouse_capture_active: bool,
     negotiated_encoding: RenderEncoding,
+    attach_escape: Option<AttachEscapeState>,
 ) -> Result<(), ClientError> {
     let mut state = ClientState {
         blit_encoder: blit::BlitEncoder::new(),
@@ -446,6 +556,7 @@ async fn run_client_loop(
         reported_size: (cols, rows),
         sound_config,
         kitty_graphics_enabled,
+        attach_escape,
     };
     debug!(?negotiated_encoding, "client render encoding active");
 
@@ -459,7 +570,9 @@ async fn run_client_loop(
         input::stdin_reader_loop(stdin_tx, &stdin_quit);
     });
 
-    query_host_terminal_theme();
+    if state.attach_escape.is_none() {
+        query_host_terminal_theme();
+    }
 
     // Spawn the resize poller thread.
     let resize_quit = should_quit.clone();
@@ -503,10 +616,22 @@ async fn run_client_loop(
 
         match event {
             ClientLoopEvent::StdinInput(data) => {
-                let events = crate::raw_input::parse_raw_input_bytes_sync(&data);
-                if crate::raw_input::events_require_host_surface_redraw(&events) {
-                    state.request_full_redraw();
-                }
+                let data = if let Some(attach_escape) = &mut state.attach_escape {
+                    match attach_escape.filter_input(data) {
+                        AttachInputAction::Forward(data) => data,
+                        AttachInputAction::Detach => {
+                            let _ = write_to_server(&mut write_stream, &ClientMessage::Detach);
+                            return Ok(());
+                        }
+                        AttachInputAction::None => continue,
+                    }
+                } else {
+                    let events = crate::raw_input::parse_raw_input_bytes_sync(&data);
+                    if crate::raw_input::events_require_host_surface_redraw(&events) {
+                        state.request_full_redraw();
+                    }
+                    data
+                };
                 let msg = ClientMessage::Input { data };
                 if let Err(e) = write_to_server(&mut write_stream, &msg) {
                     return Err(ClientError::ConnectionLost(e));
@@ -998,6 +1123,45 @@ mod tests {
         let mut output = Vec::new();
         write_terminal_restore_postlude(&mut output).unwrap();
         assert_eq!(output, b"\x1b[?25h\x1b[0 q");
+    }
+
+    #[test]
+    fn attach_escape_detaches_on_prefix_q() {
+        let mut escape = AttachEscapeState::default();
+        assert!(matches!(
+            escape.filter_input(vec![0x02]),
+            AttachInputAction::None
+        ));
+        assert!(matches!(
+            escape.filter_input(vec![b'q']),
+            AttachInputAction::Detach
+        ));
+    }
+
+    #[test]
+    fn attach_escape_sends_literal_prefix_on_double_prefix() {
+        let mut escape = AttachEscapeState::default();
+        assert!(matches!(
+            escape.filter_input(vec![0x02]),
+            AttachInputAction::None
+        ));
+        match escape.filter_input(vec![0x02]) {
+            AttachInputAction::Forward(bytes) => assert_eq!(bytes, vec![0x02]),
+            other => panic!("expected forwarded prefix, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attach_escape_forwards_prefix_before_non_escape_key() {
+        let mut escape = AttachEscapeState::default();
+        assert!(matches!(
+            escape.filter_input(vec![b'a', 0x02]),
+            AttachInputAction::Forward(bytes) if bytes == b"a"
+        ));
+        match escape.filter_input(vec![b'x']) {
+            AttachInputAction::Forward(bytes) => assert_eq!(bytes, vec![0x02, b'x']),
+            other => panic!("expected forwarded bytes, got {other:?}"),
+        }
     }
 
     #[test]

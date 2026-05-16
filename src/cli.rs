@@ -36,6 +36,7 @@ pub fn maybe_run(args: &[String]) -> std::io::Result<CommandOutcome> {
         "workspace" => run_workspace_command(&args[2..])?,
         "tab" => run_tab_command(&args[2..])?,
         "agent" => run_agent_command(&args[2..])?,
+        "terminal" => run_terminal_command(&args[2..])?,
         "pane" => run_pane_command(&args[2..])?,
         "wait" => run_wait_command(&args[2..])?,
         "integration" => run_integration_command(&args[2..])?,
@@ -280,6 +281,7 @@ fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
         "send" => agent_send(&args[1..]),
         "rename" => agent_rename(&args[1..]),
         "focus" => agent_focus(&args[1..]),
+        "attach" => agent_attach(&args[1..]),
         "start" => agent_start(&args[1..]),
         "help" | "--help" | "-h" => {
             print_agent_help();
@@ -287,6 +289,25 @@ fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
         }
         _ => {
             print_agent_help();
+            Ok(2)
+        }
+    }
+}
+
+fn run_terminal_command(args: &[String]) -> std::io::Result<i32> {
+    let Some(subcommand) = args.first().map(|arg| arg.as_str()) else {
+        print_terminal_help();
+        return Ok(2);
+    };
+
+    match subcommand {
+        "attach" => terminal_attach(&args[1..]),
+        "help" | "--help" | "-h" => {
+            print_terminal_help();
+            Ok(0)
+        }
+        _ => {
+            print_terminal_help();
             Ok(2)
         }
     }
@@ -904,6 +925,65 @@ fn agent_focus(args: &[String]) -> std::io::Result<i32> {
             target: target.clone(),
         }),
     })?)
+}
+
+fn agent_attach(args: &[String]) -> std::io::Result<i32> {
+    let (target, takeover) =
+        match parse_attach_target(args, "usage: herdr agent attach <target> [--takeover]") {
+            Ok(parsed) => parsed,
+            Err(code) => return Ok(code),
+        };
+
+    let response = send_request(&Request {
+        id: "cli:agent:attach:resolve".into(),
+        method: Method::AgentGet(AgentTarget {
+            target: target.clone(),
+        }),
+    })?;
+    if let Some(error) = response.get("error") {
+        eprintln!("{}", serde_json::to_string(error).unwrap());
+        return Ok(1);
+    }
+    let Some(terminal_id) = response["result"]["agent"]["terminal_id"].as_str() else {
+        eprintln!("agent attach failed: response did not include terminal_id");
+        return Ok(1);
+    };
+    crate::client::run_terminal_attach(terminal_id.to_owned(), takeover)?;
+    Ok(0)
+}
+
+fn terminal_attach(args: &[String]) -> std::io::Result<i32> {
+    let (terminal_id, takeover) = match parse_attach_target(
+        args,
+        "usage: herdr terminal attach <terminal_id> [--takeover]",
+    ) {
+        Ok(parsed) => parsed,
+        Err(code) => return Ok(code),
+    };
+    crate::client::run_terminal_attach(terminal_id, takeover)?;
+    Ok(0)
+}
+
+fn parse_attach_target(args: &[String], usage: &str) -> Result<(String, bool), i32> {
+    let Some(target) = args.first() else {
+        eprintln!("{usage}");
+        return Err(2);
+    };
+    let mut takeover = false;
+    for arg in &args[1..] {
+        match arg.as_str() {
+            "--takeover" => takeover = true,
+            "help" | "--help" | "-h" => {
+                eprintln!("{usage}");
+                return Err(0);
+            }
+            other => {
+                eprintln!("unknown option: {other}");
+                return Err(2);
+            }
+        }
+    }
+    Ok((target.clone(), takeover))
 }
 
 fn agent_rename(args: &[String]) -> std::io::Result<i32> {
@@ -1898,8 +1978,15 @@ fn print_agent_help() {
     eprintln!("  herdr agent send <target> <text>");
     eprintln!("  herdr agent rename <target> <name>|--clear");
     eprintln!("  herdr agent focus <target>");
+    eprintln!("  herdr agent attach <target> [--takeover]");
     eprintln!("  herdr agent start <name> [--cwd PATH] [--workspace ID] [--tab ID] [--split right|down] [--focus|--no-focus] -- <argv...>");
     eprintln!("  targets accept terminal ids, unique agent names, and legacy pane ids");
+}
+
+fn print_terminal_help() {
+    eprintln!("herdr terminal commands:");
+    eprintln!("  herdr terminal attach <terminal_id> [--takeover]");
+    eprintln!("  detach from direct attach with ctrl+b q; send literal ctrl+b with ctrl+b ctrl+b");
 }
 
 fn print_pane_help() {

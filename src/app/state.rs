@@ -822,6 +822,8 @@ pub struct AppState {
         std::collections::HashMap<crate::terminal::TerminalId, crate::terminal::TerminalState>,
     pub terminal_runtimes:
         std::collections::HashMap<crate::terminal::TerminalId, crate::terminal::TerminalRuntime>,
+    /// Terminal ids whose size is currently owned by a direct attach client.
+    pub direct_attach_resize_locks: std::collections::HashSet<crate::terminal::TerminalId>,
     pub workspaces: Vec<Workspace>,
     pub active: Option<usize>,
     pub selected: usize,
@@ -933,8 +935,7 @@ impl AppState {
         self.mode == Mode::Terminal
             && self
                 .active
-                .and_then(|idx| self.workspaces.get(idx))
-                .and_then(crate::workspace::Workspace::focused_runtime)
+                .and_then(|idx| self.focused_runtime_in_workspace(idx))
                 .and_then(crate::pane::PaneRuntime::input_state)
                 .is_some_and(crate::pane::InputState::mouse_reporting_enabled)
     }
@@ -1060,6 +1061,7 @@ impl AppState {
         Self {
             terminals: std::collections::HashMap::new(),
             terminal_runtimes: std::collections::HashMap::new(),
+            direct_attach_resize_locks: std::collections::HashSet::new(),
             workspaces: Vec::new(),
             active: None,
             selected: 0,
