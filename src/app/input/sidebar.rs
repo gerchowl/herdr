@@ -480,7 +480,7 @@ impl AppState {
             }
             row_y = row_y.saturating_add(2);
             if row_y < body.y + body.height {
-                row_y = row_y.saturating_add(1);
+                row_y = row_y.saturating_add(self.sidebar_row_gap);
             }
         }
         None
@@ -707,6 +707,51 @@ mod tests {
         assert_eq!(
             snapshot.workspaces[0].tabs[first_tab].focused,
             Some(second_pane.raw())
+        );
+    }
+
+    #[test]
+    fn agent_detail_target_row_stride_follows_sidebar_row_gap() {
+        let mut app = app_for_mouse_test();
+        let mut ws = Workspace::test_new("test");
+        let first_pane = ws.tabs[0].root_pane;
+        let second_tab = ws.test_add_tab(Some("logs"));
+        let second_pane = ws.tabs[second_tab].root_pane;
+        app.state.workspaces = vec![ws];
+        app.state.ensure_test_terminals();
+        for (tab_idx, pane) in [(0, first_pane), (second_tab, second_pane)] {
+            let terminal_id = app.state.workspaces[0].tabs[tab_idx].panes[&pane]
+                .attached_terminal_id
+                .clone();
+            app.state
+                .terminals
+                .get_mut(&terminal_id)
+                .unwrap()
+                .detected_agent = Some(Agent::Claude);
+        }
+        app.state.active = Some(0);
+        app.state.selected = 0;
+
+        let detail_area = app.state.agent_panel_rect();
+        let metrics = crate::ui::agent_panel_scroll_metrics(&app.state, detail_area);
+        let body = crate::ui::agent_panel_body_rect(
+            detail_area,
+            crate::ui::should_show_scrollbar(metrics),
+        );
+
+        // Default gap 1: entries are 2 rows + 1 blank, so the second entry
+        // starts at body.y + 3 and body.y + 2 is the blank row.
+        assert_eq!(
+            app.state.agent_detail_target_at(body.y + 3),
+            Some((0, second_tab, second_pane))
+        );
+        assert_eq!(app.state.agent_detail_target_at(body.y + 2), None);
+
+        // Gap 0: rows pack, second entry starts at body.y + 2.
+        app.state.sidebar_row_gap = 0;
+        assert_eq!(
+            app.state.agent_detail_target_at(body.y + 2),
+            Some((0, second_tab, second_pane))
         );
     }
 

@@ -481,9 +481,11 @@ fn workspace_list_visible_count(app: &AppState, area: Rect, scroll: usize) -> us
                 } else {
                     workspace_row_height(ws)
                 };
-                let gap = u16::from(
-                    !(*indented && next_entry_is_indented_workspace(&entries, entry_idx)),
-                );
+                let gap = if *indented && next_entry_is_indented_workspace(&entries, entry_idx) {
+                    0
+                } else {
+                    app.sidebar_row_gap
+                };
                 row_height.saturating_add(gap)
             }
         };
@@ -538,7 +540,7 @@ pub(crate) fn agent_panel_body_rect(area: Rect, has_scrollbar: bool) -> Rect {
     Rect::new(area.x, body_y, body_width, body_height)
 }
 
-fn agent_panel_visible_count(area: Rect) -> usize {
+fn agent_panel_visible_count(area: Rect, row_gap: u16) -> usize {
     let body = agent_panel_body_rect(area, false);
     if body.width == 0 || body.height < 2 {
         return 0;
@@ -550,14 +552,14 @@ fn agent_panel_visible_count(area: Rect) -> usize {
         used_rows = used_rows.saturating_add(2);
         visible += 1;
         if used_rows < body.height {
-            used_rows = used_rows.saturating_add(1);
+            used_rows = used_rows.saturating_add(row_gap);
         }
     }
     visible
 }
 
 pub(crate) fn agent_panel_scroll_metrics(app: &AppState, area: Rect) -> crate::pane::ScrollMetrics {
-    let viewport_rows = agent_panel_visible_count(area);
+    let viewport_rows = agent_panel_visible_count(area, app.sidebar_row_gap);
     let total_rows = agent_panel_entries(app).len();
     let max_offset_from_bottom = total_rows.saturating_sub(viewport_rows);
     let offset_from_bottom = total_rows
@@ -615,9 +617,11 @@ pub(crate) fn compute_workspace_list_areas(
                 } else {
                     workspace_row_height(ws)
                 };
-                let gap = u16::from(
-                    !(*indented && next_entry_is_indented_workspace(&entries, entry_idx)),
-                );
+                let gap = if *indented && next_entry_is_indented_workspace(&entries, entry_idx) {
+                    0
+                } else {
+                    app.sidebar_row_gap
+                };
                 if row_y.saturating_add(row_height).saturating_add(gap) > body_bottom {
                     break;
                 }
@@ -1160,7 +1164,7 @@ fn render_agent_detail(
         row_y += 1;
 
         if row_y < body_bottom {
-            row_y += 1;
+            row_y = row_y.saturating_add(app.sidebar_row_gap);
         }
     }
 
@@ -1478,6 +1482,31 @@ mod tests {
         assert_eq!(cards[1].ws_idx, 1);
         assert!(cards[1].indented);
         assert_eq!(cards[1].rect.y, cards[0].rect.y + cards[0].rect.height + 1);
+    }
+
+    #[test]
+    fn sidebar_row_gap_zero_packs_workspace_cards_adjacent() {
+        let mut app = AppState::test_new();
+        app.workspaces = vec![
+            crate::workspace::Workspace::test_new("one"),
+            crate::workspace::Workspace::test_new("two"),
+        ];
+        let area = Rect::new(0, 0, 30, 20);
+
+        let (cards, _) = compute_workspace_list_areas(&app, area);
+        assert_eq!(
+            cards[1].rect.y,
+            cards[0].rect.y + cards[0].rect.height + 1,
+            "default gap is one blank row"
+        );
+
+        app.sidebar_row_gap = 0;
+        let (cards, _) = compute_workspace_list_areas(&app, area);
+        assert_eq!(
+            cards[1].rect.y,
+            cards[0].rect.y + cards[0].rect.height,
+            "gap 0 packs cards adjacent"
+        );
     }
 
     #[test]
