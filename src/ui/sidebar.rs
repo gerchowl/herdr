@@ -677,7 +677,7 @@ pub(super) fn render_sidebar_collapsed(app: &AppState, frame: &mut Frame, area: 
     let sep_style = if is_navigating {
         Style::default().fg(p.accent)
     } else {
-        Style::default().fg(p.surface_dim)
+        Style::default().fg(p.divider_color())
     };
     let sep_x = area.x + area.width.saturating_sub(1);
     let buf = frame.buffer_mut();
@@ -737,7 +737,7 @@ pub(super) fn render_sidebar_collapsed(app: &AppState, frame: &mut Frame, area: 
         let buf = frame.buffer_mut();
         for x in ws_area.x..ws_area.x + ws_area.width {
             buf[(x, divider_y)].set_symbol("─");
-            buf[(x, divider_y)].set_style(Style::default().fg(p.surface_dim));
+            buf[(x, divider_y)].set_style(Style::default().fg(p.divider_color()));
         }
     }
 
@@ -824,7 +824,7 @@ pub(super) fn render_sidebar(
     let sep_style = if is_navigating {
         Style::default().fg(p.accent)
     } else {
-        Style::default().fg(p.surface_dim)
+        Style::default().fg(p.divider_color())
     };
 
     let sep_x = area.x + area.width.saturating_sub(1);
@@ -1064,7 +1064,10 @@ fn render_agent_detail(
 
     let sep_line = "─".repeat(area.width as usize);
     frame.render_widget(
-        Paragraph::new(Span::styled(&sep_line, Style::default().fg(p.surface_dim))),
+        Paragraph::new(Span::styled(
+            &sep_line,
+            Style::default().fg(p.divider_color()),
+        )),
         Rect::new(area.x, area.y, area.width, 1),
     );
 
