@@ -267,8 +267,8 @@ pub struct Keybinds {
     pub kill_worktree: ActionKeybinds,
     pub focus_attention: ActionKeybinds,
     pub focus_attention_previous: ActionKeybinds,
-    pub focus_attention_workspace: ActionKeybinds,
-    pub focus_attention_workspace_previous: ActionKeybinds,
+    pub focus_attention_project: ActionKeybinds,
+    pub focus_attention_project_previous: ActionKeybinds,
     pub open_worktree: ActionKeybinds,
     pub remove_worktree: ActionKeybinds,
     pub rename_workspace: ActionKeybinds,
@@ -452,13 +452,13 @@ impl Config {
                 "keys.focus_attention_previous",
                 &self.keys.focus_attention_previous
             ),
-            focus_attention_workspace: action!(
-                "keys.focus_attention_workspace",
-                &self.keys.focus_attention_workspace
+            focus_attention_project: action!(
+                "keys.focus_attention_project",
+                &self.keys.focus_attention_project
             ),
-            focus_attention_workspace_previous: action!(
-                "keys.focus_attention_workspace_previous",
-                &self.keys.focus_attention_workspace_previous
+            focus_attention_project_previous: action!(
+                "keys.focus_attention_project_previous",
+                &self.keys.focus_attention_project_previous
             ),
             open_worktree: action!("keys.open_worktree", &self.keys.open_worktree),
             remove_worktree: action!("keys.remove_worktree", &self.keys.remove_worktree),

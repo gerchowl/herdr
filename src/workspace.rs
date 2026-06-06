@@ -634,6 +634,20 @@ impl Workspace {
         self.cached_git_space.as_ref()
     }
 
+    /// Identity of this workspace's repo family: the canonical git common
+    /// dir, shared by the main checkout and every linked worktree. Sourced
+    /// from worktree membership first, then live git metadata.
+    pub fn repo_group_key(&self) -> Option<&str> {
+        self.worktree_space
+            .as_ref()
+            .map(|space| space.key.as_str())
+            .or_else(|| {
+                self.cached_git_space
+                    .as_ref()
+                    .map(|space| space.key.as_str())
+            })
+    }
+
     pub fn worktree_space(&self) -> Option<&WorktreeSpaceMembership> {
         self.worktree_space.as_ref()
     }
