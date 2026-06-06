@@ -273,6 +273,8 @@ pub struct KeysConfig {
     /// Focus the agent most in need of attention (blocked oldest-first, then
     /// unseen-done). Unset by default.
     pub focus_attention: BindingConfig,
+    /// Walk the attention queue backwards. Unset by default.
+    pub focus_attention_previous: BindingConfig,
     /// Open an existing Git worktree from the selected workspace. Unset by default.
     pub open_worktree: BindingConfig,
     /// Delete the selected managed worktree checkout after confirmation. Unset by default.
@@ -533,6 +535,7 @@ impl Default for KeysConfig {
             branch_session: BindingConfig::empty(),
             kill_worktree: BindingConfig::empty(),
             focus_attention: BindingConfig::empty(),
+            focus_attention_previous: BindingConfig::empty(),
             open_worktree: BindingConfig::empty(),
             remove_worktree: BindingConfig::empty(),
             rename_workspace: BindingConfig::one("prefix+shift+w"),

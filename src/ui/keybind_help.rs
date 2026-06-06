@@ -129,6 +129,10 @@ pub(super) fn keybind_help_groups(app: &AppState) -> Vec<HelpGroup> {
             keybind_label(&kb.focus_attention),
             "focus agent needing attention",
         ),
+        help_entry(
+            keybind_label(&kb.focus_attention_previous),
+            "attention queue backwards",
+        ),
         help_entry(indexed_label(&kb.focus_agent), "focus agent 1-9"),
         help_entry(keybind_label(&kb.new_tab), "new tab"),
         help_entry(keybind_label(&kb.rename_tab), "rename tab"),

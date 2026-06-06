@@ -266,6 +266,7 @@ pub struct Keybinds {
     pub branch_session: ActionKeybinds,
     pub kill_worktree: ActionKeybinds,
     pub focus_attention: ActionKeybinds,
+    pub focus_attention_previous: ActionKeybinds,
     pub open_worktree: ActionKeybinds,
     pub remove_worktree: ActionKeybinds,
     pub rename_workspace: ActionKeybinds,
@@ -445,6 +446,10 @@ impl Config {
             branch_session: action!("keys.branch_session", &self.keys.branch_session),
             kill_worktree: action!("keys.kill_worktree", &self.keys.kill_worktree),
             focus_attention: action!("keys.focus_attention", &self.keys.focus_attention),
+            focus_attention_previous: action!(
+                "keys.focus_attention_previous",
+                &self.keys.focus_attention_previous
+            ),
             open_worktree: action!("keys.open_worktree", &self.keys.open_worktree),
             remove_worktree: action!("keys.remove_worktree", &self.keys.remove_worktree),
             rename_workspace: action!("keys.rename_workspace", &self.keys.rename_workspace),

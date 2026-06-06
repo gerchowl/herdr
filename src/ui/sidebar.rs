@@ -1150,10 +1150,16 @@ fn render_agent_detail(
         } else {
             Style::default().fg(p.subtext0).add_modifier(Modifier::BOLD)
         };
-        let status_style = if is_active {
-            Style::default().fg(label_color)
-        } else {
+        // Status colors render at full strength regardless of selection —
+        // blocked/working/done are attention signals, not decoration. Only a
+        // settled idle (seen, nothing to report) stays toned down; the row
+        // highlight bar already marks the selected entry.
+        let settled_idle =
+            matches!(detail.state, AgentState::Idle | AgentState::Unknown) && detail.seen;
+        let status_style = if settled_idle && !is_active {
             Style::default().fg(label_color).add_modifier(Modifier::DIM)
+        } else {
+            Style::default().fg(label_color)
         };
         let agent_style = Style::default().fg(p.overlay0).add_modifier(Modifier::DIM);
 

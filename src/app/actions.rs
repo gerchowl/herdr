@@ -1078,6 +1078,14 @@ impl AppState {
     /// chimes once (all clear) and falls back to cycling the remaining
     /// agents like next_agent.
     pub(crate) fn focus_attention_agent(&mut self) {
+        self.focus_attention_agent_in_direction(true)
+    }
+
+    pub(crate) fn focus_attention_agent_previous(&mut self) {
+        self.focus_attention_agent_in_direction(false)
+    }
+
+    fn focus_attention_agent_in_direction(&mut self, forward: bool) {
         let mut attention: Vec<(usize, crate::layout::PaneId, u8, Option<std::time::Instant>)> =
             Vec::new();
         for (ws_idx, ws) in self.workspaces.iter().enumerate() {
@@ -1109,7 +1117,7 @@ impl AppState {
                 self.attention_all_clear_chimed = true;
                 self.pending_attention_chime = true;
             }
-            self.cycle_agent_entry(true);
+            self.cycle_agent_entry(forward);
             return;
         }
         self.attention_all_clear_chimed = false;
@@ -1121,7 +1129,8 @@ impl AppState {
         let target = match focused
             .and_then(|pane_id| attention.iter().position(|entry| entry.1 == pane_id))
         {
-            Some(idx) => attention[(idx + 1) % attention.len()],
+            Some(idx) if forward => attention[(idx + 1) % attention.len()],
+            Some(idx) => attention[(idx + attention.len() - 1) % attention.len()],
             None => attention[0],
         };
         if self.focus_pane_in_workspace(target.0, target.1) {
@@ -2658,6 +2667,28 @@ mod tests {
         state.focus_attention_agent();
         assert_eq!(state.active, Some(2), "then unseen done");
         assert!(!state.pending_attention_chime);
+    }
+
+    #[test]
+    fn focus_attention_previous_walks_queue_backwards() {
+        let mut state = app_with_workspaces(&["a", "b"]);
+        state.ensure_test_terminals();
+        state.active = Some(0);
+
+        let now = std::time::Instant::now();
+        for (ws, age) in [(0usize, 60u64), (1, 0)] {
+            let pane = state.workspaces[ws].tabs[0].root_pane;
+            let tid = state.workspaces[ws].terminal_id(pane).cloned().unwrap();
+            let terminal = state.terminals.get_mut(&tid).unwrap();
+            terminal.set_detected_state(Some(Agent::Claude), AgentState::Blocked);
+            terminal.state_changed_at = Some(now - std::time::Duration::from_secs(age));
+        }
+
+        // Forward from a (queue head) goes to b; previous returns to a.
+        state.focus_attention_agent();
+        assert_eq!(state.active, Some(1));
+        state.focus_attention_agent_previous();
+        assert_eq!(state.active, Some(0));
     }
 
     #[test]

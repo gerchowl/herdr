@@ -183,10 +183,11 @@ remove_worktree = "prefix+alt+d"
 branch_session = "prefix+shift+b"
 kill_worktree = "prefix+alt+k"
 focus_attention = "prefix+a"
+focus_attention_previous = "prefix+shift+a"
 next_tab = ["prefix+n", "ctrl+alt+]"]
 ```
 
-`focus_attention` jumps to the agent most in need of attention: blocked agents first (oldest state change first), then agents that finished while you were elsewhere (oldest first). Repeated presses walk the queue; focusing a done agent marks it seen and drains it. When nothing needs attention the press chimes once (the all-clear sound, customizable via `[ui.sound] all_clear_path`) and falls back to cycling agents like `next_agent`.
+`focus_attention` jumps to the agent most in need of attention: blocked agents first (oldest state change first), then agents that finished while you were elsewhere (oldest first). Repeated presses walk the queue; focusing a done agent marks it seen and drains it. When nothing needs attention the press chimes once (the all-clear sound, customizable via `[ui.sound] all_clear_path`) and falls back to cycling agents like `next_agent`. `focus_attention_previous` walks the same queue (or cycle) backwards.
 
 `kill_worktree` deletes a linked worktree checkout **and its local branch** — but the branch only when a merge gate passes: Herdr asks `gh pr view <branch>` for a merged PR, falling back to `git branch --merged <default-branch>`. The confirm dialog shows the evidence ("PR #12 merged" / "merged into master") or, when there is none, downgrades to a checkout-only delete with the branch kept. This is the one deliberate exception to Herdr's "branches are never deleted" rule, and it never fires without positive evidence. Also available as `Kill worktree & branch...` in the workspace context menu.
 
