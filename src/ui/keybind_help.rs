@@ -134,8 +134,8 @@ pub(super) fn keybind_help_groups(app: &AppState) -> Vec<HelpGroup> {
             "attention queue backwards",
         ),
         help_entry(
-            keybind_label(&kb.focus_attention_workspace),
-            "attention within workspace",
+            keybind_label(&kb.focus_attention_project),
+            "attention within project (repo + worktrees)",
         ),
         help_entry(indexed_label(&kb.focus_agent), "focus agent 1-9"),
         help_entry(keybind_label(&kb.new_tab), "new tab"),

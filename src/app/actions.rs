@@ -1085,24 +1085,56 @@ impl AppState {
         self.focus_attention_agent_in_direction(false, false)
     }
 
-    /// Workspace-scoped attention: same priority queue, restricted to the
-    /// active workspace's panes; the empty-queue fallback cycles that
-    /// workspace's agent panes. Never chimes — a scoped all-clear says
-    /// nothing about the other workspaces.
-    pub(crate) fn focus_attention_workspace(&mut self) {
+    /// Project-scoped attention: same priority queue, restricted to the
+    /// active workspace's repo family — the main checkout plus every
+    /// worktree workspace of the same git repo (matched by the canonical
+    /// git common dir). The empty-queue fallback cycles the family's agent
+    /// panes. Never chimes — a scoped all-clear says nothing about other
+    /// projects.
+    pub(crate) fn focus_attention_project(&mut self) {
         self.focus_attention_agent_in_direction(true, true)
     }
 
-    pub(crate) fn focus_attention_workspace_previous(&mut self) {
+    pub(crate) fn focus_attention_project_previous(&mut self) {
         self.focus_attention_agent_in_direction(false, true)
     }
 
-    fn focus_attention_agent_in_direction(&mut self, forward: bool, workspace_only: bool) {
+    /// Workspace indices in the active workspace's repo family; the active
+    /// workspace alone when it has no git identity.
+    fn project_scope_indices(&self) -> Vec<usize> {
+        let Some(active) = self.active else {
+            return Vec::new();
+        };
+        let scope_key = self
+            .workspaces
+            .get(active)
+            .and_then(crate::workspace::Workspace::repo_group_key)
+            .map(str::to_string);
+        match scope_key {
+            None => vec![active],
+            Some(key) => self
+                .workspaces
+                .iter()
+                .enumerate()
+                .filter(|(idx, ws)| *idx == active || ws.repo_group_key() == Some(key.as_str()))
+                .map(|(idx, _)| idx)
+                .collect(),
+        }
+    }
+
+    fn focus_attention_agent_in_direction(&mut self, forward: bool, project_only: bool) {
         let mut attention: Vec<(usize, crate::layout::PaneId, u8, Option<std::time::Instant>)> =
             Vec::new();
+        let project_scope = if project_only {
+            Some(self.project_scope_indices())
+        } else {
+            None
+        };
         for (ws_idx, ws) in self.workspaces.iter().enumerate() {
-            if workspace_only && Some(ws_idx) != self.active {
-                continue;
+            if let Some(scope) = &project_scope {
+                if !scope.contains(&ws_idx) {
+                    continue;
+                }
             }
             for detail in ws.pane_details(&self.terminals) {
                 let group = match (detail.state, detail.seen) {
@@ -1128,8 +1160,8 @@ impl AppState {
         });
 
         if attention.is_empty() {
-            if workspace_only {
-                self.cycle_pane_in_active_workspace(forward);
+            if let Some(scope) = project_scope {
+                self.cycle_agent_in_scope(&scope, forward);
             } else {
                 if !self.attention_all_clear_chimed {
                     self.attention_all_clear_chimed = true;
@@ -1139,7 +1171,7 @@ impl AppState {
             }
             return;
         }
-        if !workspace_only {
+        if !project_only {
             self.attention_all_clear_chimed = false;
         }
 
@@ -1187,32 +1219,36 @@ impl AppState {
         false
     }
 
-    /// Cycle through ALL panes of the active workspace (across its tabs).
-    /// pane_details would drop agent-less shell panes, which turns the
-    /// scoped-attention fallback into a no-op in single-agent workspaces —
-    /// cycling every pane degrades gracefully into a pane switcher instead.
-    fn cycle_pane_in_active_workspace(&mut self, forward: bool) {
-        let Some(ws_idx) = self.active else {
-            return;
-        };
-        let Some(ws) = self.workspaces.get(ws_idx) else {
-            return;
-        };
-        let panes: Vec<crate::layout::PaneId> = ws
-            .tabs
-            .iter()
-            .flat_map(|tab| tab.layout.pane_ids())
-            .collect();
+    /// Cycle through AGENT panes across the given workspaces. The unit is
+    /// agents, not panes — shells are skipped, and a single agent in scope
+    /// correctly has nowhere to go.
+    fn cycle_agent_in_scope(&mut self, scope: &[usize], forward: bool) {
+        let mut panes: Vec<(usize, crate::layout::PaneId)> = Vec::new();
+        for &ws_idx in scope {
+            if let Some(ws) = self.workspaces.get(ws_idx) {
+                panes.extend(
+                    ws.pane_details(&self.terminals)
+                        .into_iter()
+                        .map(|detail| (ws_idx, detail.pane_id)),
+                );
+            }
+        }
         if panes.is_empty() {
             return;
         }
-        let focused = ws.focused_pane_id();
-        let target = match focused.and_then(|pane| panes.iter().position(|p| *p == pane)) {
+        let focused = self
+            .active
+            .and_then(|idx| self.workspaces.get(idx))
+            .and_then(crate::workspace::Workspace::focused_pane_id)
+            .zip(self.active);
+        let current =
+            focused.and_then(|(pane, ws_idx)| panes.iter().position(|p| *p == (ws_idx, pane)));
+        let target = match current {
             Some(idx) if forward => panes[(idx + 1) % panes.len()],
             Some(idx) => panes[(idx + panes.len() - 1) % panes.len()],
             None => panes[0],
         };
-        self.focus_pane_in_workspace(ws_idx, target);
+        self.focus_pane_in_workspace(target.0, target.1);
     }
 
     fn cycle_agent_entry(&mut self, forward: bool) {
@@ -2804,20 +2840,114 @@ mod tests {
     }
 
     #[test]
-    fn focus_attention_workspace_cycles_shell_panes_when_queue_empty() {
-        let mut state = app_with_workspaces(&["a"]);
-        let first = state.workspaces[0].tabs[0].root_pane;
-        let second = state.workspaces[0].test_split(Direction::Horizontal);
+    fn focus_attention_project_spans_repo_family() {
+        let mut state = app_with_workspaces(&["main", "wt", "other"]);
         state.ensure_test_terminals();
         state.active = Some(0);
 
-        // Two plain shell panes (no agent labels): the fallback must still
-        // cycle instead of no-oping on the agent-filtered pane list.
-        assert_eq!(state.workspaces[0].focused_pane_id(), Some(second));
-        state.focus_attention_workspace();
-        assert_eq!(state.workspaces[0].focused_pane_id(), Some(first));
-        state.focus_attention_workspace();
-        assert_eq!(state.workspaces[0].focused_pane_id(), Some(second));
+        // main + wt share a repo key; other is a different project.
+        let space = |key: &str, linked: bool| crate::workspace::GitSpaceMetadata {
+            key: key.into(),
+            checkout_key: format!("{key}-co-{linked}"),
+            label: "repo".into(),
+            repo_root: "/repo".into(),
+            is_linked_worktree: linked,
+        };
+        state.workspaces[0].cached_git_space = Some(space("family", false));
+        state.workspaces[1].cached_git_space = Some(space("family", true));
+        state.workspaces[2].cached_git_space = Some(space("elsewhere", false));
+
+        for ws in 0..3 {
+            let pane = state.workspaces[ws].tabs[0].root_pane;
+            let tid = state.workspaces[ws].terminal_id(pane).cloned().unwrap();
+            state
+                .terminals
+                .get_mut(&tid)
+                .unwrap()
+                .set_detected_state(Some(Agent::Claude), AgentState::Working);
+        }
+
+        // Family cycle: main -> wt -> main; never 'other'.
+        state.focus_attention_project();
+        assert_eq!(state.active, Some(1));
+        state.focus_attention_project();
+        assert_eq!(state.active, Some(0));
+
+        // Blocked agent in the family wins over cycling.
+        let pane_wt = state.workspaces[1].tabs[0].root_pane;
+        let tid = state.workspaces[1].terminal_id(pane_wt).cloned().unwrap();
+        state
+            .terminals
+            .get_mut(&tid)
+            .unwrap()
+            .set_detected_state(Some(Agent::Claude), AgentState::Blocked);
+        state.focus_attention_project();
+        assert_eq!(state.active, Some(1));
+
+        // Blocked agent in ANOTHER project is invisible to the scoped queue.
+        state.active = Some(2);
+        let pane_other = state.workspaces[2].tabs[0].root_pane;
+        let tid = state.workspaces[2]
+            .terminal_id(pane_other)
+            .cloned()
+            .unwrap();
+        state
+            .terminals
+            .get_mut(&tid)
+            .unwrap()
+            .set_detected_state(Some(Agent::Claude), AgentState::Working);
+        state.focus_attention_project();
+        assert_eq!(state.active, Some(2), "single-agent project: nowhere to go");
+    }
+
+    #[test]
+    fn focus_attention_workspace_cycles_agents_and_skips_shells() {
+        let mut state = app_with_workspaces(&["a"]);
+        let shell = state.workspaces[0].tabs[0].root_pane;
+        let agent_one = state.workspaces[0].test_split(Direction::Horizontal);
+        let agent_two = state.workspaces[0].test_split(Direction::Vertical);
+        state.ensure_test_terminals();
+        state.active = Some(0);
+
+        for pane in [agent_one, agent_two] {
+            let tid = state.workspaces[0].terminal_id(pane).cloned().unwrap();
+            state
+                .terminals
+                .get_mut(&tid)
+                .unwrap()
+                .set_detected_state(Some(Agent::Claude), AgentState::Working);
+        }
+
+        // From agent_two the cycle moves between agents only — the shell
+        // pane is never a stop.
+        assert_eq!(state.workspaces[0].focused_pane_id(), Some(agent_two));
+        state.focus_attention_project();
+        assert_eq!(state.workspaces[0].focused_pane_id(), Some(agent_one));
+        state.focus_attention_project();
+        assert_eq!(state.workspaces[0].focused_pane_id(), Some(agent_two));
+        assert_ne!(state.workspaces[0].focused_pane_id(), Some(shell));
+    }
+
+    #[test]
+    fn focus_attention_workspace_noops_with_single_agent() {
+        let mut state = app_with_workspaces(&["a"]);
+        let agent = state.workspaces[0].test_split(Direction::Horizontal);
+        state.ensure_test_terminals();
+        state.active = Some(0);
+        let tid = state.workspaces[0].terminal_id(agent).cloned().unwrap();
+        state
+            .terminals
+            .get_mut(&tid)
+            .unwrap()
+            .set_detected_state(Some(Agent::Claude), AgentState::Working);
+
+        assert_eq!(state.workspaces[0].focused_pane_id(), Some(agent));
+        state.focus_attention_project();
+        assert_eq!(
+            state.workspaces[0].focused_pane_id(),
+            Some(agent),
+            "one agent in the space: nowhere to cycle"
+        );
     }
 
     #[test]
@@ -2835,7 +2965,7 @@ mod tests {
             .unwrap()
             .set_detected_state(Some(Agent::Claude), AgentState::Blocked);
 
-        state.focus_attention_workspace();
+        state.focus_attention_project();
 
         // Scoped: stays in b (cycles within it), ignores a's blocked agent,
         // and stays silent — a scoped all-clear says nothing globally.
