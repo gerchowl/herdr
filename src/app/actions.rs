@@ -1187,7 +1187,10 @@ impl AppState {
         false
     }
 
-    /// Cycle through the active workspace's panes in pane-detail order.
+    /// Cycle through ALL panes of the active workspace (across its tabs).
+    /// pane_details would drop agent-less shell panes, which turns the
+    /// scoped-attention fallback into a no-op in single-agent workspaces —
+    /// cycling every pane degrades gracefully into a pane switcher instead.
     fn cycle_pane_in_active_workspace(&mut self, forward: bool) {
         let Some(ws_idx) = self.active else {
             return;
@@ -1196,9 +1199,9 @@ impl AppState {
             return;
         };
         let panes: Vec<crate::layout::PaneId> = ws
-            .pane_details(&self.terminals)
-            .into_iter()
-            .map(|detail| detail.pane_id)
+            .tabs
+            .iter()
+            .flat_map(|tab| tab.layout.pane_ids())
             .collect();
         if panes.is_empty() {
             return;
@@ -2798,6 +2801,23 @@ mod tests {
         assert_eq!(state.active, Some(1));
         state.focus_attention_agent_previous();
         assert_eq!(state.active, Some(0));
+    }
+
+    #[test]
+    fn focus_attention_workspace_cycles_shell_panes_when_queue_empty() {
+        let mut state = app_with_workspaces(&["a"]);
+        let first = state.workspaces[0].tabs[0].root_pane;
+        let second = state.workspaces[0].test_split(Direction::Horizontal);
+        state.ensure_test_terminals();
+        state.active = Some(0);
+
+        // Two plain shell panes (no agent labels): the fallback must still
+        // cycle instead of no-oping on the agent-filtered pane list.
+        assert_eq!(state.workspaces[0].focused_pane_id(), Some(second));
+        state.focus_attention_workspace();
+        assert_eq!(state.workspaces[0].focused_pane_id(), Some(first));
+        state.focus_attention_workspace();
+        assert_eq!(state.workspaces[0].focused_pane_id(), Some(second));
     }
 
     #[test]
