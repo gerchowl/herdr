@@ -176,7 +176,9 @@ impl App {
         id: String,
         params: PaneReportAgentParams,
     ) -> String {
-        let Some((_ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+        let Some((_ws_idx, pane_id)) =
+            self.parse_pane_id_or_peer(&params.pane_id, self.current_api_peer_pid)
+        else {
             return pane_not_found(id, &params.pane_id);
         };
         let Some(agent_label) = normalize_reported_agent_label(&params.agent) else {
@@ -206,7 +208,9 @@ impl App {
         id: String,
         params: crate::api::schema::PaneReportPromptParams,
     ) -> String {
-        let Some((_ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+        let Some((_ws_idx, pane_id)) =
+            self.parse_pane_id_or_peer(&params.pane_id, self.current_api_peer_pid)
+        else {
             return pane_not_found(id, &params.pane_id);
         };
         if normalize_reported_agent_label(&params.agent).is_none() {
@@ -225,7 +229,9 @@ impl App {
         id: String,
         params: PaneReportAgentSessionParams,
     ) -> String {
-        let Some((_ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+        let Some((_ws_idx, pane_id)) =
+            self.parse_pane_id_or_peer(&params.pane_id, self.current_api_peer_pid)
+        else {
             return pane_not_found(id, &params.pane_id);
         };
         let Some(agent_label) = normalize_reported_agent_label(&params.agent) else {
@@ -252,7 +258,9 @@ impl App {
         id: String,
         params: PaneReportMetadataParams,
     ) -> String {
-        let Some((_ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+        let Some((_ws_idx, pane_id)) =
+            self.parse_pane_id_or_peer(&params.pane_id, self.current_api_peer_pid)
+        else {
             return pane_not_found(id, &params.pane_id);
         };
         let agent_label = match params.agent.as_deref() {
@@ -348,7 +356,9 @@ impl App {
         id: String,
         params: PaneClearAgentAuthorityParams,
     ) -> String {
-        let Some((_ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+        let Some((_ws_idx, pane_id)) =
+            self.parse_pane_id_or_peer(&params.pane_id, self.current_api_peer_pid)
+        else {
             return pane_not_found(id, &params.pane_id);
         };
         self.handle_internal_event(crate::events::AppEvent::HookAuthorityCleared {
@@ -365,7 +375,9 @@ impl App {
         id: String,
         params: PaneReleaseAgentParams,
     ) -> String {
-        let Some((_ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+        let Some((_ws_idx, pane_id)) =
+            self.parse_pane_id_or_peer(&params.pane_id, self.current_api_peer_pid)
+        else {
             return pane_not_found(id, &params.pane_id);
         };
         let Some(agent_label) = normalize_reported_agent_label(&params.agent) else {

@@ -87,6 +87,9 @@ pub struct App {
     pub state: AppState,
     pub(crate) terminal_runtimes: crate::terminal::TerminalRuntimeRegistry,
     pub event_tx: mpsc::Sender<AppEvent>,
+    /// Peer PID of the API request currently being handled; lets pane
+    /// reports resolve by process ancestry when env pane-ids are stale.
+    pub(crate) current_api_peer_pid: Option<u32>,
     pub(crate) event_rx: mpsc::Receiver<AppEvent>,
     pub(crate) api_rx: tokio::sync::mpsc::UnboundedReceiver<crate::api::ApiRequestMessage>,
     pub(crate) event_hub: crate::api::EventHub,
@@ -605,6 +608,7 @@ impl App {
             state,
             terminal_runtimes: restored_terminal_runtimes,
             event_tx,
+            current_api_peer_pid: None,
             event_rx,
             last_git_remote_status_refresh: Instant::now() - GIT_REMOTE_STATUS_REFRESH_INTERVAL,
             git_refresh_in_flight: false,

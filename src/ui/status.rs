@@ -264,6 +264,12 @@ pub(super) fn render_status_line(app: &crate::app::AppState, frame: &mut Frame, 
         return;
     };
 
+    if let Some(host) = stats.host.as_deref() {
+        spans.push(Span::styled(
+            host.to_string(),
+            Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+        ));
+    }
     if let Some(cpu) = stats.cpu_percent {
         push_metric(
             &mut spans,

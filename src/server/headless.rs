@@ -2230,8 +2230,12 @@ impl HeadlessServer {
                 .unwrap_or_else(|_| "{}".to_string())
             })
         } else {
-            self.app
-                .handle_api_request_after_internal_events_drained(msg.request)
+            self.app.current_api_peer_pid = msg.peer_pid;
+            let response = self
+                .app
+                .handle_api_request_after_internal_events_drained(msg.request);
+            self.app.current_api_peer_pid = None;
+            response
         };
         let _ = msg.respond_to.send(response);
 
@@ -3476,6 +3480,7 @@ mod tests {
                     method: api::schema::Method::ServerStop(api::schema::EmptyParams::default()),
                 },
                 respond_to,
+                peer_pid: None,
             })
         );
         let response = response_rx
@@ -6286,6 +6291,7 @@ next_tab = ""
                 }),
             },
             respond_to,
+            peer_pid: None,
         });
 
         assert!(changed);

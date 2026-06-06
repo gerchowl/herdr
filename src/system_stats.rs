@@ -7,6 +7,8 @@ use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct SystemStats {
+    /// Short hostname, shown as the first status-line element.
+    pub host: Option<String>,
     /// Global CPU utilization, 0..=100.
     pub cpu_percent: Option<f32>,
     /// Used / total memory in bytes.
@@ -74,6 +76,8 @@ pub fn spawn_sampler(
                 let gpu_percent = read_gpu_percent();
 
                 let stats = SystemStats {
+                    host: sysinfo::System::host_name()
+                        .map(|h| h.split('.').next().unwrap_or(&h).to_string()),
                     cpu_percent,
                     mem_used,
                     mem_total,

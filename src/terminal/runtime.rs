@@ -19,6 +19,11 @@ impl TerminalRuntime {
         self.0.shutdown();
     }
 
+    /// PID of the pane's direct child process, when alive.
+    pub fn child_pid(&self) -> Option<u32> {
+        self.0.child_pid()
+    }
+
     #[cfg(unix)]
     pub fn duplicate_handoff_fd(&self) -> std::io::Result<std::os::fd::RawFd> {
         self.0.duplicate_handoff_fd()
