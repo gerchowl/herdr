@@ -643,6 +643,15 @@ impl AgentDetectionPresence {
 
 /// PTY runtime for a pane. Owns the terminal, I/O channels, and background tasks.
 /// Dropping this shuts down all background tasks and closes the PTY.
+impl PaneRuntime {
+    /// PID of the pane's direct child (the shell or argv command), used to
+    /// resolve hook reports by process ancestry when env pane-ids are stale.
+    pub fn child_pid(&self) -> Option<u32> {
+        let pid = self.child_pid.load(Ordering::Acquire);
+        (pid > 0).then_some(pid)
+    }
+}
+
 pub struct PaneRuntime {
     pane_id: PaneId,
     terminal: Arc<PaneTerminal>,

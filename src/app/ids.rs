@@ -68,6 +68,77 @@ impl App {
         None
     }
 
+    /// Like parse_pane_id, but when the id is stale (e.g. HERDR_PANE_ID baked
+    /// into a pane environment that predates alias tracking) falls back to
+    /// resolving the API caller by process ancestry: peer pid -> parents ->
+    /// a pane's direct child pid.
+    pub(super) fn parse_pane_id_or_peer(
+        &self,
+        id: &str,
+        peer_pid: Option<u32>,
+    ) -> Option<(usize, crate::layout::PaneId)> {
+        if let Some(found) = self.parse_pane_id(id) {
+            return Some(found);
+        }
+        let peer = peer_pid?;
+        let resolved = self.resolve_pane_by_process_ancestry(peer);
+        if let Some((ws_idx, pane_id)) = resolved {
+            tracing::info!(
+                stale_id = id,
+                peer_pid = peer,
+                ws_idx,
+                resolved = pane_id.raw(),
+                "resolved stale pane id via process ancestry"
+            );
+        }
+        resolved
+    }
+
+    fn resolve_pane_by_process_ancestry(
+        &self,
+        peer: u32,
+    ) -> Option<(usize, crate::layout::PaneId)> {
+        // Collect the peer's ancestor chain (bounded; refreshes one pid at a time).
+        let mut system = sysinfo::System::new();
+        let mut ancestors = Vec::with_capacity(16);
+        let mut current = peer;
+        for _ in 0..16 {
+            ancestors.push(current);
+            system.refresh_processes(
+                sysinfo::ProcessesToUpdate::Some(&[sysinfo::Pid::from_u32(current)]),
+                true,
+            );
+            let Some(parent) = system
+                .process(sysinfo::Pid::from_u32(current))
+                .and_then(|process| process.parent())
+            else {
+                break;
+            };
+            current = parent.as_u32();
+            if current <= 1 {
+                break;
+            }
+        }
+
+        for (ws_idx, ws) in self.state.workspaces.iter().enumerate() {
+            for tab in &ws.tabs {
+                for (pane_id, pane) in &tab.panes {
+                    let Some(child) = self
+                        .terminal_runtimes
+                        .get(&pane.attached_terminal_id)
+                        .and_then(crate::terminal::TerminalRuntime::child_pid)
+                    else {
+                        continue;
+                    };
+                    if ancestors.contains(&child) {
+                        return Some((ws_idx, *pane_id));
+                    }
+                }
+            }
+        }
+        None
+    }
+
     pub(super) fn parse_pane_id(&self, id: &str) -> Option<(usize, crate::layout::PaneId)> {
         if let Some(rest) = id.strip_prefix("p_") {
             if let Some((ws_raw, pane_raw)) = rest.rsplit_once('_') {
