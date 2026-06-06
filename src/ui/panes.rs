@@ -435,6 +435,32 @@ fn render_pane_header(
             format!("\u{e0a0} {branch}"),
             Style::default().bg(p.surface_dim).fg(p.green),
         ));
+        if let Some((ahead, behind)) = ws.ahead_behind() {
+            if ahead > 0 {
+                spans.push(Span::styled(
+                    format!(" \u{2191}{ahead}"),
+                    Style::default().bg(p.surface_dim).fg(p.yellow),
+                ));
+            }
+            if behind > 0 {
+                spans.push(Span::styled(
+                    format!(" \u{2193}{behind}"),
+                    Style::default().bg(p.surface_dim).fg(p.peach),
+                ));
+            }
+        }
+        if let Some(pr) = ws.pr_state() {
+            let (glyph, color) = match pr.state {
+                crate::worktree::PrState::Open => ("\u{2299}", p.accent),
+                crate::worktree::PrState::Draft => ("\u{25d0}", p.overlay0),
+                crate::worktree::PrState::Merged => ("\u{2713}", p.mauve),
+                crate::worktree::PrState::Closed => ("\u{2717}", p.red),
+            };
+            spans.push(Span::styled(
+                format!(" #{} {glyph}", pr.number),
+                Style::default().bg(p.surface_dim).fg(color),
+            ));
+        }
     }
     buf.set_line(header.x, header.y, &Line::from(spans), header.width);
 
@@ -1081,10 +1107,7 @@ mod tests {
         assert_eq!(content, pane_inner);
 
         // Latched: context row + prompt rows reserved, content shifts down.
-        app.terminals
-            .get_mut(&terminal_id)
-            .unwrap()
-            .header_reserved = true;
+        app.terminals.get_mut(&terminal_id).unwrap().header_reserved = true;
         let (header, content) = carve_pane_header(&app, Some(&terminal_id), pane_inner);
         let header = header.expect("header should be reserved");
         assert_eq!(header.height, 4);

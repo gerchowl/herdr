@@ -319,7 +319,9 @@ fn restore_workspace(
     let worktree_space = restored_worktree_space_membership(snap.worktree_space.clone());
 
     (
+        #[allow(clippy::needless_update)]
         Some(Workspace {
+            pr_state: None,
             id: snap
                 .id
                 .clone()
