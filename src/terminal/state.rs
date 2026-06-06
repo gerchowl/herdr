@@ -61,6 +61,9 @@ pub struct TerminalState {
     fallback_visible_idle: bool,
     fallback_visible_working: bool,
     fallback_observed_at: Option<Instant>,
+    /// The last user prompt submitted to this pane's agent, reported by the
+    /// integration hook (Claude's UserPromptSubmit). Drives the prompt float.
+    pub last_prompt: Option<String>,
     stale_hook_idle_since: Option<Instant>,
     pub hook_authority: Option<HookAuthority>,
     pub agent_metadata: HashMap<String, AgentMetadata>,
@@ -87,6 +90,7 @@ impl TerminalState {
             fallback_visible_idle: false,
             fallback_visible_working: false,
             fallback_observed_at: None,
+            last_prompt: None,
             stale_hook_idle_since: None,
             hook_authority: None,
             agent_metadata: HashMap::new(),
