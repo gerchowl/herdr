@@ -228,6 +228,45 @@ pub(super) fn state_label_color(state: AgentState, seen: bool, p: &Palette) -> C
     }
 }
 
+/// Utilization color: green below 60%, yellow from 60%, red from 85%.
+/// Shared glyph language between the status line and the sidebar servers
+/// band so machine health reads the same everywhere.
+pub(super) fn utilization_style(percent: f32, p: &Palette) -> Style {
+    if percent >= 85.0 {
+        Style::default().fg(p.red)
+    } else if percent >= 60.0 {
+        Style::default().fg(p.yellow)
+    } else {
+        Style::default().fg(p.green)
+    }
+}
+
+/// Append one `label value` metric, `·`-separated from any prior spans.
+/// The label renders dim; the value carries the caller's style.
+pub(super) fn push_metric(
+    spans: &mut Vec<Span<'static>>,
+    label: &str,
+    value: String,
+    style: Style,
+    p: &Palette,
+) {
+    let dim = Style::default().fg(p.overlay0);
+    if !spans.is_empty() {
+        spans.push(Span::styled(" \u{b7} ".to_string(), dim));
+    }
+    spans.push(Span::styled(format!("{label} "), dim));
+    spans.push(Span::styled(value, style));
+}
+
+/// Memory utilization as a percentage, for [`utilization_style`].
+pub(super) fn mem_percent(used: u64, total: u64) -> f32 {
+    if total > 0 {
+        used as f32 / total as f32 * 100.0
+    } else {
+        0.0
+    }
+}
+
 /// One-line machine HUD: cpu · mem · disk · battery · net · gpu. Metrics the
 /// sampler could not read are omitted. Utilization colors shift at 60/85%.
 pub(super) fn render_status_line(app: &crate::app::AppState, frame: &mut Frame, area: Rect) {
@@ -237,24 +276,6 @@ pub(super) fn render_status_line(app: &crate::app::AppState, frame: &mut Frame, 
     let p = &app.palette;
     let dim = Style::default().fg(p.overlay0);
     let mut spans: Vec<Span> = Vec::new();
-    let sep = " \u{b7} ";
-
-    let utilization_style = |percent: f32| {
-        if percent >= 85.0 {
-            Style::default().fg(p.red)
-        } else if percent >= 60.0 {
-            Style::default().fg(p.yellow)
-        } else {
-            Style::default().fg(p.green)
-        }
-    };
-    let push_metric = |spans: &mut Vec<Span>, label: &str, value: String, style: Style| {
-        if !spans.is_empty() {
-            spans.push(Span::styled(sep.to_string(), dim));
-        }
-        spans.push(Span::styled(format!("{label} "), dim));
-        spans.push(Span::styled(value, style));
-    };
 
     let Some(stats) = app.system_stats.as_ref() else {
         frame.render_widget(
@@ -275,15 +296,11 @@ pub(super) fn render_status_line(app: &crate::app::AppState, frame: &mut Frame, 
             &mut spans,
             "cpu",
             format!("{cpu:.0}%"),
-            utilization_style(cpu),
+            utilization_style(cpu, p),
+            p,
         );
     }
     if let (Some(used), Some(total)) = (stats.mem_used, stats.mem_total) {
-        let percent = if total > 0 {
-            used as f32 / total as f32 * 100.0
-        } else {
-            0.0
-        };
         push_metric(
             &mut spans,
             "mem",
@@ -292,7 +309,8 @@ pub(super) fn render_status_line(app: &crate::app::AppState, frame: &mut Frame, 
                 crate::system_stats::human_bytes(used),
                 crate::system_stats::human_bytes(total)
             ),
-            utilization_style(percent),
+            utilization_style(mem_percent(used, total), p),
+            p,
         );
     }
     if let Some(free) = stats.disk_free {
@@ -301,6 +319,7 @@ pub(super) fn render_status_line(app: &crate::app::AppState, frame: &mut Frame, 
             "disk",
             format!("{} free", crate::system_stats::human_bytes(free)),
             Style::default().fg(p.text),
+            p,
         );
     }
     if let Some(percent) = stats.battery_percent {
@@ -313,7 +332,7 @@ pub(super) fn render_status_line(app: &crate::app::AppState, frame: &mut Frame, 
         } else {
             Style::default().fg(p.text)
         };
-        push_metric(&mut spans, icon, format!("{percent}%"), style);
+        push_metric(&mut spans, icon, format!("{percent}%"), style, p);
     }
     if let (Some(rx), Some(tx)) = (stats.net_rx_per_sec, stats.net_tx_per_sec) {
         push_metric(
@@ -325,6 +344,7 @@ pub(super) fn render_status_line(app: &crate::app::AppState, frame: &mut Frame, 
                 crate::system_stats::human_bytes(tx)
             ),
             Style::default().fg(p.teal),
+            p,
         );
     }
     if let Some(gpu) = stats.gpu_percent {
@@ -332,7 +352,8 @@ pub(super) fn render_status_line(app: &crate::app::AppState, frame: &mut Frame, 
             &mut spans,
             "gpu",
             format!("{gpu}%"),
-            utilization_style(gpu as f32),
+            utilization_style(gpu as f32, p),
+            p,
         );
     }
 

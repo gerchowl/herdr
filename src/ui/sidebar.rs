@@ -645,8 +645,13 @@ pub(crate) fn remote_entry_label(
 /// (extra peers still poll; the section just caps its height).
 const SERVERS_SECTION_MAX_ROWS: u16 = 8;
 
+/// Every server row (self and peers) renders as two lines: identity on the
+/// first, compact health on the second.
+const SERVER_ROW_LINES: u16 = 2;
+
 /// Height the `servers` section wants: 0 with no peers, else a header row
-/// plus one row per peer (capped), or just the header when collapsed.
+/// plus two lines per server — the local server renders first, then one
+/// row per peer (capped) — or just the header when collapsed.
 pub(crate) fn servers_section_height(app: &AppState) -> u16 {
     let peers = app.peer_summaries.len();
     if peers == 0 {
@@ -655,7 +660,10 @@ pub(crate) fn servers_section_height(app: &AppState) -> u16 {
     if app.servers_collapsed {
         return 1;
     }
-    1 + (peers as u16).min(SERVERS_SECTION_MAX_ROWS)
+    let rows = (peers as u16)
+        .saturating_add(1)
+        .min(SERVERS_SECTION_MAX_ROWS);
+    1 + rows * SERVER_ROW_LINES
 }
 
 /// Split the spaces-section rect into the `servers` band (top) and the
@@ -1128,8 +1136,20 @@ pub(super) fn render_sidebar(
     render_sidebar_toggle(app, frame, area, false, p);
 }
 
+/// Rect of the two-line server row at `slot` (0 = the local server, then
+/// one slot per peer) inside the band, or `None` when it does not fully fit.
+fn server_slot_rect(servers_area: Rect, slot: u16) -> Option<Rect> {
+    let y = servers_area
+        .y
+        .checked_add(1 + slot.checked_mul(SERVER_ROW_LINES)?)?;
+    (y + SERVER_ROW_LINES <= servers_area.y + servers_area.height)
+        .then(|| Rect::new(servers_area.x, y, servers_area.width, SERVER_ROW_LINES))
+}
+
 /// Compute hit areas for the `servers` section: the header rect (toggles
-/// collapse) and one rect per visible peer row (switches to that peer).
+/// collapse) and one two-line rect per visible peer row (switches to that
+/// peer). The local server occupies slot 0 but deliberately gets NO card —
+/// clicking yourself must never request a server switch.
 pub(crate) fn compute_server_section_areas(
     app: &AppState,
     area: Rect,
@@ -1144,22 +1164,12 @@ pub(crate) fn compute_server_section_areas(
     let header_rect = Rect::new(servers_area.x, servers_area.y, servers_area.width, 1);
     let mut cards = Vec::new();
     if !app.servers_collapsed {
-        let max_rows = servers_area.height.saturating_sub(1);
-        for (peer_idx, _) in app
-            .peer_summaries
-            .iter()
-            .enumerate()
-            .take(max_rows as usize)
-        {
-            cards.push(crate::app::state::ServerCardArea {
-                peer_idx,
-                rect: Rect::new(
-                    servers_area.x,
-                    servers_area.y + 1 + peer_idx as u16,
-                    servers_area.width,
-                    1,
-                ),
-            });
+        for (peer_idx, _) in app.peer_summaries.iter().enumerate() {
+            // Slot 0 is the self row; peers start at slot 1.
+            let Some(rect) = server_slot_rect(servers_area, peer_idx as u16 + 1) else {
+                break;
+            };
+            cards.push(crate::app::state::ServerCardArea { peer_idx, rect });
         }
     }
     (header_rect, cards)
@@ -1191,27 +1201,84 @@ fn render_servers_section(app: &AppState, frame: &mut Frame, area: Rect, is_navi
         return;
     }
 
+    // The local server anchors the band: slot 0, no hit-area.
+    if let Some(rect) = server_slot_rect(area, 0) {
+        render_server_rows(frame, rect, self_server_rows(app));
+    }
     let body_bottom = area.y + area.height;
     for card in &app.view.server_card_areas {
-        if card.rect.y >= body_bottom {
+        if card.rect.y + card.rect.height > body_bottom {
             break;
         }
         let Some(peer) = app.peer_summaries.get(card.peer_idx) else {
             continue;
         };
-        frame.render_widget(
-            Paragraph::new(server_row_line(peer, card.rect.width, p)),
-            card.rect,
-        );
+        render_server_rows(frame, card.rect, peer_server_rows(peer, p));
     }
 }
 
-/// One `servers` row: ● host  12ms  cpu 19% mem 13/16G  ·  3 agents.
-fn server_row_line<'a>(
-    peer: &'a crate::peers::PeerSummaryState,
-    width: u16,
+/// Paint a two-line server row into its slot rect, clamping each line.
+fn render_server_rows(frame: &mut Frame, rect: Rect, [title, health]: [Line<'static>; 2]) {
+    frame.render_widget(
+        Paragraph::new(clamp_line(title, rect.width)),
+        Rect::new(rect.x, rect.y, rect.width, 1),
+    );
+    frame.render_widget(
+        Paragraph::new(clamp_line(health, rect.width)),
+        Rect::new(rect.x, rect.y + 1, rect.width, 1),
+    );
+}
+
+/// Indentation that lines the health glyphs up under the server name.
+const SERVER_HEALTH_INDENT: &str = "   ";
+
+/// The local server's row: `● mba22 ✦` plus the status line's health glyphs
+/// fed from the same local `SystemStats` sample the HUD shows.
+fn self_server_rows(app: &AppState) -> [Line<'static>; 2] {
+    let p = &app.palette;
+    let title = Line::from(vec![
+        Span::styled(" ", Style::default()),
+        Span::styled("●", Style::default().fg(p.accent)),
+        Span::styled(" ", Style::default()),
+        Span::styled(
+            crate::app::short_host_name(),
+            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" ✦", Style::default().fg(p.accent)),
+    ]);
+
+    let mut health: Vec<Span<'static>> = Vec::new();
+    if let Some(stats) = app.system_stats.as_ref() {
+        health = server_health_spans(
+            stats.cpu_percent,
+            stats.mem_used,
+            stats.mem_total,
+            stats.disk_free,
+            p,
+        );
+    }
+    let (mut blocked, mut working) = (0usize, 0usize);
+    for ws in &app.workspaces {
+        for (state, _) in ws.pane_states(&app.terminals) {
+            match state {
+                AgentState::Blocked => blocked += 1,
+                AgentState::Working => working += 1,
+                _ => {}
+            }
+        }
+    }
+    push_rollup_spans(&mut health, blocked, working, p);
+    health.insert(0, Span::styled(SERVER_HEALTH_INDENT, Style::default()));
+    [title, Line::from(health)]
+}
+
+/// One peer's two `servers` lines:
+/// `● anvil  34ms` over `   cpu 71% · mem 48G/64G ❶`, or the compact
+/// `unreachable {age}` form when the peer is down.
+fn peer_server_rows(
+    peer: &crate::peers::PeerSummaryState,
     p: &crate::app::state::Palette,
-) -> Line<'a> {
+) -> [Line<'static>; 2] {
     use crate::peers::PeerReachability;
     let reach = peer.reachability();
     let (dot, dot_color) = match reach {
@@ -1220,7 +1287,7 @@ fn server_row_line<'a>(
         PeerReachability::Down => ("○", p.red),
     };
     let host = peer.host.clone().unwrap_or_else(|| peer.peer.clone());
-    let mut spans = vec![
+    let mut title = vec![
         Span::styled(" ", Style::default()),
         Span::styled(dot, Style::default().fg(dot_color)),
         Span::styled(" ", Style::default()),
@@ -1229,11 +1296,14 @@ fn server_row_line<'a>(
 
     if reach == PeerReachability::Down {
         let detail = match peer.last_ok {
-            Some(at) => format!("  unreachable {}", format_age(at.elapsed().as_secs())),
-            None => "  unreachable".to_string(),
+            Some(at) => format!("unreachable {}", format_age(at.elapsed().as_secs())),
+            None => "unreachable".to_string(),
         };
-        spans.push(Span::styled(detail, Style::default().fg(p.overlay0)));
-        return clamp_line(Line::from(spans), width);
+        let health = Line::from(vec![
+            Span::styled(SERVER_HEALTH_INDENT, Style::default()),
+            Span::styled(detail, Style::default().fg(p.overlay0)),
+        ]);
+        return [Line::from(title), health];
     }
 
     if let Some(ms) = peer.latency_ms {
@@ -1242,48 +1312,102 @@ fn server_row_line<'a>(
         } else {
             p.overlay0
         };
-        spans.push(Span::styled(
+        title.push(Span::styled(
             format!("  {ms}ms"),
             Style::default().fg(color),
         ));
     }
+
+    let mut health: Vec<Span<'static>> = Vec::new();
     if let Some(system) = peer.system.as_ref() {
-        if let Some(cpu) = system.cpu_percent {
-            spans.push(Span::styled(
-                format!("  cpu {cpu}%"),
-                Style::default().fg(p.overlay0),
-            ));
-        }
-        if let (Some(used), Some(total)) = (system.mem_used, system.mem_total) {
-            spans.push(Span::styled(
-                format!(" mem {}/{}", format_gib(used), format_gib(total)),
-                Style::default().fg(p.overlay0),
-            ));
-        }
+        health = server_health_spans(
+            system.cpu_percent.map(f32::from),
+            system.mem_used,
+            system.mem_total,
+            system.disk_free,
+            p,
+        );
     }
-    let agents = peer.workspaces.len();
-    if agents > 0 {
-        let blocked = peer
-            .workspaces
-            .iter()
-            .filter(|ws| ws.status == crate::api::schema::AgentStatus::Blocked)
-            .count();
-        let (text, color) = if blocked > 0 {
-            (format!("  {blocked} ● blocked"), p.red)
-        } else {
-            (format!("  {agents} agents"), p.overlay0)
-        };
-        spans.push(Span::styled(text, Style::default().fg(color)));
-    }
-    clamp_line(Line::from(spans), width)
+    let blocked = peer
+        .workspaces
+        .iter()
+        .filter(|ws| ws.status == crate::api::schema::AgentStatus::Blocked)
+        .count();
+    let working = peer
+        .workspaces
+        .iter()
+        .filter(|ws| ws.status == crate::api::schema::AgentStatus::Working)
+        .count();
+    push_rollup_spans(&mut health, blocked, working, p);
+    health.insert(0, Span::styled(SERVER_HEALTH_INDENT, Style::default()));
+    [Line::from(title), Line::from(health)]
 }
 
-fn format_gib(bytes: u64) -> String {
-    let gib = bytes as f64 / (1024.0 * 1024.0 * 1024.0);
-    if gib >= 10.0 {
-        format!("{gib:.0}G")
-    } else {
-        format!("{gib:.1}G")
+/// Compact machine health in the status line's glyph language:
+/// `cpu 42% · mem 13G/16G · disk 213G`, utilization-colored at 60/85%.
+fn server_health_spans(
+    cpu_percent: Option<f32>,
+    mem_used: Option<u64>,
+    mem_total: Option<u64>,
+    disk_free: Option<u64>,
+    p: &crate::app::state::Palette,
+) -> Vec<Span<'static>> {
+    use super::status::{mem_percent, push_metric, utilization_style};
+    let mut spans = Vec::new();
+    if let Some(cpu) = cpu_percent {
+        push_metric(
+            &mut spans,
+            "cpu",
+            format!("{cpu:.0}%"),
+            utilization_style(cpu, p),
+            p,
+        );
+    }
+    if let (Some(used), Some(total)) = (mem_used, mem_total) {
+        push_metric(
+            &mut spans,
+            "mem",
+            format!(
+                "{}/{}",
+                crate::system_stats::human_bytes(used),
+                crate::system_stats::human_bytes(total)
+            ),
+            utilization_style(mem_percent(used, total), p),
+            p,
+        );
+    }
+    if let Some(free) = disk_free {
+        push_metric(
+            &mut spans,
+            "disk",
+            crate::system_stats::human_bytes(free),
+            Style::default().fg(p.text),
+            p,
+        );
+    }
+    spans
+}
+
+/// Append the agent rollup as collapsed-group-style traffic lights:
+/// circled blocked count (red) then working count (yellow), zeros omitted.
+fn push_rollup_spans(
+    spans: &mut Vec<Span<'static>>,
+    blocked: usize,
+    working: usize,
+    p: &crate::app::state::Palette,
+) {
+    for (count, state) in [
+        (blocked, AgentState::Blocked),
+        (working, AgentState::Working),
+    ] {
+        if count == 0 {
+            continue;
+        }
+        spans.push(Span::styled(" ", Style::default()));
+        spans.push(Span::styled(
+            circled_count(count),
+            Style::default().fg(state_label_color(state, true, p)),
+        ));
     }
 }
 
@@ -1824,13 +1948,14 @@ mod tests {
             peer_with_workspaces("anvil", vec![]),
             peer_with_workspaces("sage", vec![]),
         ];
-        assert_eq!(servers_section_height(&app), 3); // header + 2 rows
+        // Header + two lines each for the self row and both peers.
+        assert_eq!(servers_section_height(&app), 7);
         app.servers_collapsed = true;
         assert_eq!(servers_section_height(&app), 1); // header only
     }
 
     #[test]
-    fn compute_server_section_areas_lays_out_header_and_rows() {
+    fn compute_server_section_areas_lays_out_self_slot_then_two_line_peer_rows() {
         let mut app = crate::app::state::AppState::test_new();
         app.peer_summaries = vec![
             peer_with_workspaces("anvil", vec![]),
@@ -1840,8 +1965,19 @@ mod tests {
         let (header, cards) = compute_server_section_areas(&app, area);
         assert_ne!(header, Rect::default());
         assert_eq!(cards.len(), 2);
+        // Slot 0 (the two lines under the header) belongs to the local
+        // server and has NO hit-area, so clicking it can never request a
+        // SwitchServer; the first peer card starts below it.
         assert_eq!(cards[0].peer_idx, 0);
-        assert_eq!(cards[1].rect.y, cards[0].rect.y + 1);
+        assert_eq!(cards[0].rect.y, header.y + 1 + SERVER_ROW_LINES);
+        assert!(cards
+            .iter()
+            .all(|card| card.rect.y > header.y + SERVER_ROW_LINES));
+        // Each peer row spans two lines and stacks below the previous one.
+        assert_eq!(cards[0].rect.height, SERVER_ROW_LINES);
+        assert_eq!(cards[1].peer_idx, 1);
+        assert_eq!(cards[1].rect.y, cards[0].rect.y + SERVER_ROW_LINES);
+        assert_eq!(cards[1].rect.height, SERVER_ROW_LINES);
 
         app.servers_collapsed = true;
         let (header, cards) = compute_server_section_areas(&app, area);
@@ -1850,7 +1986,27 @@ mod tests {
     }
 
     #[test]
-    fn server_row_line_shows_health_for_live_peer() {
+    fn self_server_rows_show_local_identity_and_glyph_health() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.system_stats = Some(crate::system_stats::SystemStats {
+            cpu_percent: Some(42.0),
+            mem_used: Some(13 * 1024 * 1024 * 1024),
+            mem_total: Some(16 * 1024 * 1024 * 1024),
+            disk_free: Some(213 * 1024 * 1024 * 1024),
+            ..Default::default()
+        });
+        let [title, health] = self_server_rows(&app);
+        let title = line_text(&title);
+        let health = line_text(&health);
+        assert!(title.contains(&crate::app::short_host_name()), "{title}");
+        assert!(title.contains('\u{2726}'), "{title}"); // ✦ current marker
+        assert!(health.contains("cpu 42%"), "{health}");
+        assert!(health.contains("mem 13G/16G"), "{health}");
+        assert!(health.contains("disk 213G"), "{health}");
+    }
+
+    #[test]
+    fn peer_server_rows_split_identity_and_glyph_health() {
         let p = crate::app::state::AppState::test_new().palette;
         let mut peer = peer_with_workspaces(
             "anvil",
@@ -1869,26 +2025,33 @@ mod tests {
             mem_total: Some(64 * 1024 * 1024 * 1024),
             disk_free: None,
         });
-        let text = line_text(&server_row_line(&peer, 60, &p));
-        assert!(text.contains("anvil"), "{text}");
-        assert!(text.contains("34ms"), "{text}");
-        assert!(text.contains("cpu 71%"), "{text}");
-        assert!(text.contains("mem 48G/64G"), "{text}");
-        assert!(
-            text.contains("blocked") || text.contains("agents"),
-            "{text}"
-        );
+        let [title, health] = peer_server_rows(&peer, &p);
+        let title = line_text(&title);
+        let health = line_text(&health);
+        assert!(title.contains("anvil"), "{title}");
+        assert!(title.contains("34ms"), "{title}");
+        // The second line speaks the status line's glyph language and rolls
+        // the one working agent up as a circled count.
+        assert!(health.contains("cpu 71%"), "{health}");
+        assert!(health.contains("mem 48G/64G"), "{health}");
+        assert!(health.contains('\u{2776}'), "{health}"); // ❶ working
+        assert!(!health.contains("anvil"), "{health}");
     }
 
     #[test]
-    fn server_row_line_marks_unreachable_peer() {
+    fn peer_server_rows_mark_unreachable_peer_compactly() {
         let p = crate::app::state::AppState::test_new().palette;
         let mut peer = peer_with_workspaces("ksb", vec![]);
         peer.last_ok = None;
         peer.error = Some("connect timed out".into());
-        let text = line_text(&server_row_line(&peer, 40, &p));
-        assert!(text.contains("ksb"), "{text}");
-        assert!(text.contains("unreachable"), "{text}");
+        let [title, health] = peer_server_rows(&peer, &p);
+        assert!(line_text(&title).contains("ksb"));
+        assert!(line_text(&health).trim_start().starts_with("unreachable"));
+
+        // A peer that was reachable once shows the outage age.
+        peer.last_ok = std::time::Instant::now().checked_sub(std::time::Duration::from_secs(300));
+        let [_, health] = peer_server_rows(&peer, &p);
+        assert!(line_text(&health).contains("unreachable 5m"));
     }
 
     fn workspace_with_project_key(name: &str, project_key: &str) -> Workspace {

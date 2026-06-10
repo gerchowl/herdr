@@ -503,8 +503,9 @@ impl AppState {
                         return None;
                     }
 
-                    // Servers section: header toggles collapse, a peer row
-                    // switches to that peer's first workspace.
+                    // Servers section: header toggles collapse, a (two-line)
+                    // peer row switches to that peer's first workspace. The
+                    // self row has no card, so clicking it is a no-op.
                     let header = self.view.servers_header_rect;
                     if header != ratatui::layout::Rect::default()
                         && mouse.row == header.y
@@ -515,12 +516,9 @@ impl AppState {
                         self.mark_session_dirty();
                         return None;
                     }
-                    if let Some(card) = self
-                        .view
-                        .server_card_areas
-                        .iter()
-                        .find(|card| mouse.row == card.rect.y)
-                    {
+                    if let Some(card) = self.view.server_card_areas.iter().find(|card| {
+                        mouse.row >= card.rect.y && mouse.row < card.rect.y + card.rect.height
+                    }) {
                         self.request_peer_switch = Some((card.peer_idx, 0));
                         return None;
                     }
@@ -1833,6 +1831,45 @@ mod tests {
         detect::{Agent, AgentState},
         workspace::Workspace,
     };
+
+    #[tokio::test]
+    async fn server_band_click_hits_both_peer_lines_but_never_the_self_row() {
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = vec![Workspace::test_new("test")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        let mut peer = crate::peers::PeerSummaryState::new(&crate::config::PeerConfig {
+            name: "anvil".into(),
+            ..Default::default()
+        });
+        peer.last_ok = Some(std::time::Instant::now());
+        app.state.peer_summaries = vec![peer];
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 80, 30));
+
+        // The self row (the two lines under the header) has no hit-area:
+        // clicking yourself must never request a server switch.
+        let header = app.state.view.servers_header_rect;
+        assert_ne!(header, Rect::default());
+        for row in [header.y + 1, header.y + 2] {
+            app.handle_mouse(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                header.x + 2,
+                row,
+            ));
+            assert_eq!(app.state.request_peer_switch, None);
+        }
+
+        // Both lines of the peer's two-line card map to that peer.
+        let card = app.state.view.server_card_areas[0].clone();
+        assert_eq!(card.rect.height, 2);
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            card.rect.x + 2,
+            card.rect.y + 1,
+        ));
+        assert_eq!(app.state.request_peer_switch, Some((0, 0)));
+    }
 
     #[tokio::test]
     async fn terminal_wheel_uses_configured_mouse_scroll_lines() {

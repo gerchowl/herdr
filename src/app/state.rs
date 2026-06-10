@@ -648,8 +648,10 @@ pub struct WorkspaceCardArea {
     pub indented: bool,
 }
 
-/// Hit area of a peer row in the `servers` section. Clicking one switches
-/// to that peer's first workspace; clicking the header toggles the section.
+/// Hit area of a two-line peer row in the `servers` section. Clicking one
+/// switches to that peer's first workspace; clicking the header toggles the
+/// section. The local server's row deliberately has no card: clicking
+/// yourself never requests a server switch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerCardArea {
     /// Index into `state.peer_summaries`.

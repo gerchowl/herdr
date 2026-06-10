@@ -719,6 +719,59 @@ mod tests {
     }
 
     #[test]
+    fn servers_band_renders_self_row_first_with_two_line_peers() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = Mode::Terminal;
+        let mut peer = crate::peers::PeerSummaryState::new(&crate::config::PeerConfig {
+            name: "anvil".into(),
+            ..Default::default()
+        });
+        peer.host = Some("anvil".into());
+        peer.last_ok = Some(std::time::Instant::now());
+        peer.latency_ms = Some(34);
+        app.peer_summaries = vec![peer];
+        app.system_stats = Some(crate::system_stats::SystemStats {
+            cpu_percent: Some(42.0),
+            ..Default::default()
+        });
+
+        let area = Rect::new(0, 0, 80, 30);
+        compute_view(&mut app, area);
+
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+
+        let header = app.view.servers_header_rect;
+        assert_ne!(header, Rect::default());
+        assert!(buffer_row_text(buffer, header, header.y).contains("servers"));
+
+        // The local server anchors the band: first row, marked as current,
+        // with the status line's health glyphs on its second line.
+        let self_title = buffer_row_text(buffer, header, header.y + 1);
+        assert!(
+            self_title.contains(&crate::app::short_host_name()),
+            "{self_title}"
+        );
+        assert!(self_title.contains('\u{2726}'), "{self_title}"); // ✦
+        let self_health = buffer_row_text(buffer, header, header.y + 2);
+        assert!(self_health.contains("cpu 42%"), "{self_health}");
+
+        // The peer renders below on its two-line hit-area; the self rows
+        // above it carry no card, so clicking them stays a no-op.
+        let card = &app.view.server_card_areas[0];
+        assert_eq!(card.rect.y, header.y + 3);
+        assert_eq!(card.rect.height, 2);
+        let peer_title = buffer_row_text(buffer, card.rect, card.rect.y);
+        assert!(peer_title.contains("anvil"), "{peer_title}");
+        assert!(peer_title.contains("34ms"), "{peer_title}");
+    }
+
+    #[test]
     fn expanded_sidebar_workspace_rows_show_state_before_name_without_numbers() {
         let mut app = crate::app::state::AppState::test_new();
         let mut ws = Workspace::test_new("one");
