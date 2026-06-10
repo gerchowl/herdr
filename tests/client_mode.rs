@@ -396,7 +396,7 @@ fn client_input_forwarded_to_pane() {
     assert!(error.is_none(), "{:?}", error);
 
     // Send an Input message containing "echo hello\n".
-    // ClientMessage::Input is variant 1: { data: Vec<u8> }
+    // ClientMessage::Input is variant 1: { data: Vec<u8> }  // guardrails-ok
     let input_data = b"echo hello\n".to_vec();
     let input_payload = {
         let mut buf = encode_varint_u32(1); // variant 1 = Input

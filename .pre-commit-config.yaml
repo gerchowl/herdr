@@ -1,0 +1,76 @@
+# guardrails — curated gate set, run by `prek` (pre-commit compatible).
+# Tools come from the guardrails devShell (flake input). Run all gates with:
+#   prek run --all-files
+# Or stage + commit normally to fire the hooks.
+repos:
+  - repo: local
+    hooks:
+      - id: no-fake-impl
+        name: no fake/placeholder implementations
+        entry: guardrails-no-fake-impl
+        language: system
+        pass_filenames: true
+        # Kitty's graphics protocol uses "placeholder" as the official term
+        # for the Unicode codepoint 0x10EEEE. These files implement that
+        # protocol; the word is terminology, not a stub marker. vendor/ is
+        # upstream code we don't maintain.
+        exclude: |
+          (?x)^(
+            vendor/|
+            src/(ghostty/|pane/terminal\.rs$)
+          )
+      - id: no-debug-leftovers
+        name: no debug-print leftovers (use the tracing facade)
+        entry: guardrails-no-debug-leftovers
+        language: system
+        pass_filenames: true
+        # CLI subcommand handlers, update/remote/server-bootstrap code, the
+        # cargo build script, helper scripts, and integration tests all
+        # legitimately print to stdout/stderr — it's their job, not debug spew.
+        # vendor/ is upstream code not maintained here. Library code in the
+        # rest of src/ still gates normally.
+        exclude: |
+          (?x)^(
+            build\.rs|
+            scripts/|
+            tests/|
+            vendor/|
+            src/(
+              cli\.rs|
+              cli/|
+              update\.rs|
+              remote\.rs|
+              server/headless\.rs|
+              client/mod\.rs|
+              integration/mod\.rs
+            )
+          )
+      - id: no-commented-code
+        name: no commented-out code
+        entry: guardrails-no-commented-code
+        language: system
+        pass_filenames: true
+        exclude: ^vendor/
+      - id: gitleaks
+        name: secrets scan
+        entry: gitleaks protect --staged --redact -v
+        language: system
+        pass_filenames: false
+      - id: rustfmt
+        name: rustfmt
+        entry: cargo fmt --all -- --check
+        language: system
+        files: \.rs$
+        pass_filenames: false
+      - id: clippy
+        name: clippy (-D warnings)
+        entry: cargo clippy --all-targets --all-features -- -D warnings
+        language: system
+        files: \.rs$
+        pass_filenames: false
+      - id: cargo-deny
+        name: cargo-deny (licenses + advisories)
+        entry: cargo deny check
+        language: system
+        files: Cargo\.(toml|lock)$
+        pass_filenames: false

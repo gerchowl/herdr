@@ -83,7 +83,7 @@ fn has_qodercli_spinner_row(content: &str) -> bool {
 /// * The `ask-user` tool's interactive prompt. "Asking User" is the dialog's
 ///   stable BaseTabDialog title and covers every form (single-select,
 ///   multi-select, free-form input, review tab). The "Enter your response"
-///   placeholder and "Review your answers:" review heading are kept as
+///   prompt text and "Review your answers:" review heading are kept as
 ///   defensive fallbacks in case the title row scrolls off-screen.
 /// * The interactive shell waiting hint emitted by qodercli when an agent
 ///   spawns a shell that is now parked for user keystrokes.

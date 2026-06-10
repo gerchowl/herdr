@@ -15,7 +15,10 @@ use crate::api::schema::{
 };
 use crate::api::subscriptions::ActiveSubscription;
 use crate::api::wait::wait_for_output;
-use crate::api::{request_changes_ui, socket_path, ApiRequestMessage, ApiRequestSender, EventHub};
+use crate::api::{
+    method_name as api_method_name, request_changes_ui, socket_path, ApiRequestMessage,
+    ApiRequestSender, EventHub,
+};
 use crate::ipc::{remove_socket_file_if_owned, socket_file_identity, SocketFileIdentity};
 
 const SOCKET_PERMISSION_MODE: u32 = 0o600;
@@ -178,6 +181,8 @@ fn handle_connection(
                 event_hub,
                 running,
             );
+            // Subscriptions are long-lived; their roundtrip duration reflects
+            // stream lifetime, not request latency, so skip the slow-path log.
             match &result {
                 Ok(()) => crate::logging::api_request_completed(
                     &request_id,
@@ -201,6 +206,8 @@ fn handle_connection(
                     "client_disconnected",
                     changes_ui,
                 );
+                // PaneWaitForOutput latency is dominated by client-controlled
+                // timeouts (api.wait.*), so duration here would be misleading.
                 return Ok(());
             };
             let result = write_text_line_allow_disconnect(&mut stream, &response);
@@ -218,6 +225,7 @@ fn handle_connection(
             result
         }
         method_body => {
+            let watch = crate::logging::Stopwatch::start();
             let response = handle_request(
                 Request {
                     id: request_id.clone(),
@@ -227,17 +235,23 @@ fn handle_connection(
                 capabilities,
             );
             let result = write_text_line_allow_disconnect(&mut stream, &response);
-            match &result {
-                Ok(()) => crate::logging::api_request_completed(
-                    &request_id,
-                    method,
-                    api_response_outcome(&response),
-                    changes_ui,
-                ),
-                Err(err) => {
-                    crate::logging::api_request_failed(&request_id, method, &err.to_string())
+            let outcome = match &result {
+                Ok(()) => {
+                    let outcome = api_response_outcome(&response);
+                    crate::logging::api_request_completed(&request_id, method, outcome, changes_ui);
+                    outcome
                 }
-            }
+                Err(err) => {
+                    crate::logging::api_request_failed(&request_id, method, &err.to_string());
+                    "error"
+                }
+            };
+            crate::logging::api_server_roundtrip_observed(
+                &request_id,
+                method,
+                outcome,
+                watch.elapsed(),
+            );
             result
         }
     }
@@ -262,57 +276,6 @@ fn handle_request(
                 .to_string()
         }),
         _ => dispatch_to_app(request, api_tx),
-    }
-}
-
-fn api_method_name(method: &Method) -> &'static str {
-    match method {
-        Method::Ping(_) => "ping",
-        Method::ServerStop(_) => "server.stop",
-        Method::ServerLiveHandoff(_) => "server.live_handoff",
-        Method::ServerReloadConfig(_) => "server.reload_config",
-        Method::WorkspaceCreate(_) => "workspace.create",
-        Method::WorkspaceList(_) => "workspace.list",
-        Method::WorkspaceGet(_) => "workspace.get",
-        Method::WorkspaceFocus(_) => "workspace.focus",
-        Method::WorkspaceRename(_) => "workspace.rename",
-        Method::WorkspaceClose(_) => "workspace.close",
-        Method::WorktreeList(_) => "worktree.list",
-        Method::WorktreeCreate(_) => "worktree.create",
-        Method::WorktreeOpen(_) => "worktree.open",
-        Method::WorktreeRemove(_) => "worktree.remove",
-        Method::TabCreate(_) => "tab.create",
-        Method::TabList(_) => "tab.list",
-        Method::TabGet(_) => "tab.get",
-        Method::TabFocus(_) => "tab.focus",
-        Method::TabRename(_) => "tab.rename",
-        Method::TabClose(_) => "tab.close",
-        Method::AgentList(_) => "agent.list",
-        Method::AgentGet(_) => "agent.get",
-        Method::AgentRead(_) => "agent.read",
-        Method::AgentSend(_) => "agent.send",
-        Method::AgentRename(_) => "agent.rename",
-        Method::AgentFocus(_) => "agent.focus",
-        Method::AgentStart(_) => "agent.start",
-        Method::PaneSplit(_) => "pane.split",
-        Method::PaneList(_) => "pane.list",
-        Method::PaneGet(_) => "pane.get",
-        Method::PaneRename(_) => "pane.rename",
-        Method::PaneSendText(_) => "pane.send_text",
-        Method::PaneSendKeys(_) => "pane.send_keys",
-        Method::PaneSendInput(_) => "pane.send_input",
-        Method::PaneRead(_) => "pane.read",
-        Method::PaneReportAgent(_) => "pane.report_agent",
-        Method::PaneReportAgentSession(_) => "pane.report_agent_session",
-        Method::PaneReportMetadata(_) => "pane.report_metadata",
-        Method::PaneClearAgentAuthority(_) => "pane.clear_agent_authority",
-        Method::PaneReleaseAgent(_) => "pane.release_agent",
-        Method::PaneClose(_) => "pane.close",
-        Method::EventsSubscribe(_) => "events.subscribe",
-        Method::EventsWait(_) => "events.wait",
-        Method::PaneWaitForOutput(_) => "pane.wait_for_output",
-        Method::IntegrationInstall(_) => "integration.install",
-        Method::IntegrationUninstall(_) => "integration.uninstall",
     }
 }
 

@@ -116,8 +116,8 @@ impl TileLayout {
     /// Split the focused pane. Returns the new pane's id.
     pub fn split_focused(&mut self, direction: Direction) -> PaneId {
         let new_id = PaneId::alloc();
-        let placeholder = PaneId::from_raw(0);
-        let old = std::mem::replace(&mut self.root, Node::Pane(placeholder));
+        let tombstone = PaneId::from_raw(0);
+        let old = std::mem::replace(&mut self.root, Node::Pane(tombstone));
         self.root = split_at(old, self.focus, direction, new_id);
         self.focus = new_id;
         new_id
@@ -136,8 +136,8 @@ impl TileLayout {
         } else {
             ids[pos - 1]
         };
-        let placeholder = PaneId::from_raw(0);
-        let old = std::mem::replace(&mut self.root, Node::Pane(placeholder));
+        let tombstone = PaneId::from_raw(0);
+        let old = std::mem::replace(&mut self.root, Node::Pane(tombstone));
         if let Some(new_root) = remove_pane(old, target) {
             self.root = new_root;
             self.focus = new_focus;

@@ -2,12 +2,29 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use tracing_subscriber::fmt::writer::MakeWriter;
 use tracing_subscriber::EnvFilter;
 
 const DEFAULT_MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
 const DEFAULT_RETAINED_LOG_FILES: usize = 0;
+
+/// Threshold above which a render frame is considered slow and worth logging at WARN.
+/// At 60 FPS a frame is ~16 ms; double that is a visible hitch.
+pub(crate) const SLOW_RENDER_THRESHOLD: Duration = Duration::from_millis(33);
+/// Threshold above which an input batch is considered slow (keystroke -> state update).
+/// Anything over 50 ms is perceptible as input lag.
+pub(crate) const SLOW_INPUT_THRESHOLD: Duration = Duration::from_millis(50);
+/// Threshold above which a PTY byte-processing call is considered slow.
+/// PTY chunks are small (≤8 KiB) so the parser should be fast.
+pub(crate) const SLOW_PTY_THRESHOLD: Duration = Duration::from_millis(20);
+/// Threshold above which an API roundtrip is considered slow.
+pub(crate) const SLOW_API_THRESHOLD: Duration = Duration::from_millis(100);
+/// Threshold above which a single iteration of the main app loop is considered
+/// slow. Captures stalls in drain/scheduling work that isn't covered by the
+/// per-subsystem timers (render, input, api, pty).
+pub(crate) const SLOW_LOOP_ITER_THRESHOLD: Duration = Duration::from_millis(40);
 
 pub(crate) fn init_file_logging(file_name: &str) {
     let Ok(make_writer) = RotatingFileMakeWriter::new(
@@ -408,6 +425,220 @@ pub(crate) fn integration_action(
     );
 }
 
+/// Lightweight scoped timer for hot-path latency tracking.
+///
+/// Construct at the start of a section, call `.elapsed()` at the end and pass to
+/// one of the `*_frame_observed` / `*_observed` helpers below. The helpers only
+/// emit log records when latency exceeds the relevant slow-path threshold, so
+/// the steady state is silent.
+pub(crate) struct Stopwatch {
+    start: Instant,
+}
+
+impl Stopwatch {
+    pub(crate) fn start() -> Self {
+        Self {
+            start: Instant::now(),
+        }
+    }
+
+    pub(crate) fn elapsed(&self) -> Duration {
+        self.start.elapsed()
+    }
+}
+
+/// Emit a render-frame latency event. Below threshold logs at TRACE; above at WARN.
+/// `pane_count` and `full_redraw` are context for triage.
+pub(crate) fn render_frame_observed(elapsed: Duration, pane_count: usize, full_redraw: bool) {
+    let duration_ms = duration_ms(elapsed);
+    let event = "render.frame";
+    let subsystem = "render";
+    if elapsed >= SLOW_RENDER_THRESHOLD {
+        tracing::warn!(
+            event,
+            subsystem,
+            outcome = "slow",
+            duration_ms,
+            pane_count,
+            full_redraw,
+            threshold_ms = SLOW_RENDER_THRESHOLD.as_millis() as u64,
+            "render frame exceeded threshold"
+        );
+    } else {
+        tracing::trace!(
+            event,
+            subsystem,
+            outcome = "ok",
+            duration_ms,
+            pane_count,
+            full_redraw,
+            "render frame"
+        );
+    }
+}
+
+/// Emit a main-loop iteration latency event. Covers the catch-all path
+/// (event drain + scheduled tasks + select) that the per-subsystem timers
+/// don't see — e.g., a slow `drain_api_requests` that doesn't fire a request
+/// roundtrip, or a backed-up scheduled-task chain.
+pub(crate) fn loop_iter_observed(elapsed: Duration, cause: &'static str) {
+    let duration_ms = duration_ms(elapsed);
+    let event = "app.loop_iter";
+    let subsystem = "app";
+    if elapsed >= SLOW_LOOP_ITER_THRESHOLD {
+        tracing::warn!(
+            event,
+            subsystem,
+            outcome = "slow",
+            duration_ms,
+            cause,
+            threshold_ms = SLOW_LOOP_ITER_THRESHOLD.as_millis() as u64,
+            "main loop iteration exceeded threshold"
+        );
+    } else {
+        tracing::trace!(
+            event,
+            subsystem,
+            outcome = "ok",
+            duration_ms,
+            cause,
+            "main loop iteration"
+        );
+    }
+}
+
+/// Emit a raw-input batch latency event. Silent under threshold; WARN above it.
+pub(crate) fn input_batch_observed(elapsed: Duration, events: usize) {
+    let duration_ms = duration_ms(elapsed);
+    let event = "input.batch";
+    let subsystem = "input";
+    if elapsed >= SLOW_INPUT_THRESHOLD {
+        tracing::warn!(
+            event,
+            subsystem,
+            outcome = "slow",
+            duration_ms,
+            events,
+            threshold_ms = SLOW_INPUT_THRESHOLD.as_millis() as u64,
+            "input batch exceeded threshold"
+        );
+    } else {
+        tracing::trace!(
+            event,
+            subsystem,
+            outcome = "ok",
+            duration_ms,
+            events,
+            "input batch"
+        );
+    }
+}
+
+/// Emit a PTY byte-processing latency event. Silent under threshold; WARN above it.
+pub(crate) fn pty_process_observed(elapsed: Duration, pane_id: u32, bytes: usize) {
+    let duration_ms = duration_ms(elapsed);
+    let event = "pty.process";
+    let subsystem = "pty";
+    if elapsed >= SLOW_PTY_THRESHOLD {
+        tracing::warn!(
+            event,
+            subsystem,
+            outcome = "slow",
+            duration_ms,
+            pane_id,
+            bytes,
+            threshold_ms = SLOW_PTY_THRESHOLD.as_millis() as u64,
+            "pty byte processing exceeded threshold"
+        );
+    } else {
+        tracing::trace!(
+            event,
+            subsystem,
+            outcome = "ok",
+            duration_ms,
+            pane_id,
+            bytes,
+            "pty byte processing"
+        );
+    }
+}
+
+/// Emit an API server-side roundtrip latency event. Always emits at TRACE for
+/// timing tape; bumps to WARN when slow.
+pub(crate) fn api_server_roundtrip_observed(
+    request_id: &str,
+    method: &'static str,
+    outcome: &'static str,
+    elapsed: Duration,
+) {
+    let duration_ms = duration_ms(elapsed);
+    let event = "api.request.duration";
+    let subsystem = "api";
+    if elapsed >= SLOW_API_THRESHOLD {
+        tracing::warn!(
+            event,
+            subsystem,
+            outcome = "slow",
+            request_id,
+            method,
+            response_outcome = outcome,
+            duration_ms,
+            threshold_ms = SLOW_API_THRESHOLD.as_millis() as u64,
+            "api server roundtrip exceeded threshold"
+        );
+    } else {
+        tracing::trace!(
+            event,
+            subsystem,
+            outcome,
+            request_id,
+            method,
+            duration_ms,
+            "api server roundtrip"
+        );
+    }
+}
+
+/// Emit an API client-side roundtrip latency event. The client view includes
+/// socket connect + write + read, so it reflects network/IPC overhead in
+/// addition to server processing time.
+pub(crate) fn api_client_roundtrip_observed(
+    method: &'static str,
+    outcome: &'static str,
+    elapsed: Duration,
+) {
+    let duration_ms = duration_ms(elapsed);
+    let event = "api.client.roundtrip";
+    let subsystem = "api";
+    if elapsed >= SLOW_API_THRESHOLD {
+        tracing::warn!(
+            event,
+            subsystem,
+            outcome = "slow",
+            method,
+            response_outcome = outcome,
+            duration_ms,
+            threshold_ms = SLOW_API_THRESHOLD.as_millis() as u64,
+            "api client roundtrip exceeded threshold"
+        );
+    } else {
+        tracing::trace!(
+            event,
+            subsystem,
+            outcome,
+            method,
+            duration_ms,
+            "api client roundtrip"
+        );
+    }
+}
+
+fn duration_ms(elapsed: Duration) -> u64 {
+    // Saturating cast: Duration::as_millis returns u128; latencies that would
+    // overflow u64 are pathological and clamp is fine for logging.
+    u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+}
+
 struct RotatingFileMakeWriter {
     state: Arc<Mutex<RotatingFileState>>,
 }
@@ -594,6 +825,33 @@ mod tests {
                 .as_nanos()
         );
         std::env::temp_dir().join(unique).join("herdr.log")
+    }
+
+    #[test]
+    fn duration_ms_clamps_overflow() {
+        assert_eq!(duration_ms(Duration::from_millis(0)), 0);
+        assert_eq!(duration_ms(Duration::from_millis(42)), 42);
+        assert_eq!(duration_ms(Duration::from_secs(1)), 1000);
+        assert_eq!(duration_ms(Duration::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn slow_thresholds_are_sensible() {
+        // Sanity: tighter paths must have tighter thresholds.
+        assert!(SLOW_PTY_THRESHOLD < SLOW_RENDER_THRESHOLD);
+        assert!(SLOW_RENDER_THRESHOLD < SLOW_INPUT_THRESHOLD);
+        assert!(SLOW_INPUT_THRESHOLD < SLOW_API_THRESHOLD);
+        // The loop-iter budget should sit between render and input — it covers
+        // a superset of render work but still trips on perceptible stalls.
+        assert!(SLOW_RENDER_THRESHOLD <= SLOW_LOOP_ITER_THRESHOLD);
+        assert!(SLOW_LOOP_ITER_THRESHOLD <= SLOW_INPUT_THRESHOLD);
+    }
+
+    #[test]
+    fn stopwatch_measures_elapsed_time() {
+        let watch = Stopwatch::start();
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(watch.elapsed() >= Duration::from_millis(5));
     }
 
     #[test]

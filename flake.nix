@@ -3,10 +3,11 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    guardrails.url = "github:gerchowl/guardrails";
   };
 
   outputs =
-    { self, nixpkgs }:
+    { self, nixpkgs, guardrails }:
     let
       lib = nixpkgs.lib;
       systems = [
@@ -48,27 +49,36 @@
         system:
         let
           pkgs = pkgsFor system;
+          guardrailsToolbelt = guardrails.lib.${system}.toolbelt;
         in
         {
           default = pkgs.mkShell {
             name = "herdr-dev";
-            packages = with pkgs; [
-              cargo
-              cargo-nextest
-              clippy
-              cmake
-              just
-              ninja
-              pkg-config
-              rustc
-              rustfmt
-              zig_0_15
-            ];
+            packages =
+              (with pkgs; [
+                cargo
+                cargo-nextest
+                clippy
+                cmake
+                just
+                ninja
+                pkg-config
+                rustc
+                rustfmt
+                zig_0_15
+              ])
+              ++ guardrailsToolbelt;
 
             env = {
               LIBGHOSTTY_VT_OPTIMIZE = "Debug";
               LIBGHOSTTY_VT_SIMD = "true";
             };
+
+            shellHook = ''
+              if [ -f .pre-commit-config.yaml ] && [ -d .git ]; then
+                prek install >/dev/null 2>&1 || true
+              fi
+            '';
           };
         }
       );

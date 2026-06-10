@@ -73,11 +73,16 @@ impl App {
         &mut self,
         first: crate::raw_input::RawInputEvent,
     ) -> bool {
+        let watch = crate::logging::Stopwatch::start();
+        let mut events = 1usize;
         let mut changed = self.handle_raw_input_event(first).await;
 
         while let Some(rx) = self.input_rx.as_mut() {
             match rx.try_recv() {
-                Ok(event) => changed |= self.handle_raw_input_event(event).await,
+                Ok(event) => {
+                    events += 1;
+                    changed |= self.handle_raw_input_event(event).await;
+                }
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
                 Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
                     self.input_rx = None;
@@ -86,6 +91,7 @@ impl App {
             }
         }
 
+        crate::logging::input_batch_observed(watch.elapsed(), events);
         changed
     }
 

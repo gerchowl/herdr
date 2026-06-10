@@ -2568,8 +2568,8 @@ Allow once or always?\n\
     }
 
     #[test]
-    fn qodercli_blocked_on_askuser_enter_response_placeholder() {
-        // qodercli's ask-user tool renders an input box with this placeholder
+    fn qodercli_blocked_on_askuser_enter_response_prompt() {
+        // qodercli's ask-user tool renders an input box with this prompt
         // when waiting for the user to type a response.
         let screen = "\
 What kind of project are you working on?\n\
@@ -2600,7 +2600,7 @@ Stack        \u{2192} (not answered)\n";
 
     #[test]
     fn qodercli_blocked_on_askuser_single_choice_dialog() {
-        // Single-select ask-user has no "Enter your response" placeholder and
+        // Single-select ask-user has no "Enter your response" prompt and
         // no "Review your answers:" heading. The BaseTabDialog title
         // "Asking User" is the only stable signal across every ask-user form.
         let screen = "\
