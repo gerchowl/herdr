@@ -558,6 +558,7 @@ impl App {
                 config.ui.prompt_float_lines,
             ),
             auto_collapse_groups: config.ui.auto_collapse_groups,
+            tab_mode: config.ui.tab_mode,
             pane_header: config.ui.pane_header,
             status_line: config.ui.status_line,
             system_stats: None,
@@ -1251,6 +1252,7 @@ impl App {
                 self.state.prompt_float_lines =
                     crate::config::validated_prompt_float_lines(config.ui.prompt_float_lines);
                 self.state.auto_collapse_groups = config.ui.auto_collapse_groups;
+                self.state.tab_mode = config.ui.tab_mode;
                 self.state.pane_header = config.ui.pane_header;
                 self.state.status_line = config.ui.status_line;
                 self.state.agent_aliases = config.ui.agent_aliases.clone();

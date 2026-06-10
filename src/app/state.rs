@@ -1474,6 +1474,8 @@ pub struct AppState {
     pub prompt_float_lines: u16,
     /// Auto-collapse every sidebar worktree group except the focused one.
     pub auto_collapse_groups: bool,
+    /// What `new_tab` creates: a tab, or a sibling workspace (spike #25).
+    pub tab_mode: crate::config::TabModeConfig,
     /// Reserve the agent pane header strip.
     pub pane_header: bool,
     /// Show the global machine status line.
@@ -1846,6 +1848,7 @@ impl AppState {
             sidebar_pane_gap: crate::config::DEFAULT_SIDEBAR_PANE_GAP,
             prompt_float_lines: crate::config::DEFAULT_PROMPT_FLOAT_LINES,
             auto_collapse_groups: false,
+            tab_mode: crate::config::TabModeConfig::Tabs,
             pane_header: true,
             status_line: true,
             system_stats: None,
