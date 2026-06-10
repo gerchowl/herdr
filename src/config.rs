@@ -21,7 +21,7 @@ pub use self::{
         validated_prompt_float_lines, validated_sidebar_bounds, validated_sidebar_pane_gap,
         validated_sidebar_row_gap, AgentPanelScopeConfig, Config, ConfigReloadReport,
         ConfigReloadStatus, KeysConfig, NewTerminalCwdConfig, PeerConfig, ShellModeConfig,
-        ToastConfig, ToastDelivery, UpdateChannelConfig,
+        TabModeConfig, ToastConfig, ToastDelivery, UpdateChannelConfig,
     },
     sound::SoundConfig,
     theme::{parse_color, CustomThemeColors, ThemeConfig},

@@ -159,6 +159,19 @@ pub enum ShellModeConfig {
     NonLogin,
 }
 
+/// What `new_tab` creates (spike gerchowl/herdr#25). In `workspace` mode the
+/// workspace is the unit: "new tab" spawns a SIBLING WORKSPACE in the same
+/// space group (membership cloned, cwd pinned to the checkout) instead of a
+/// tab. The tab model itself is untouched — existing tabs keep working and
+/// existing sessions restore unchanged.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TabModeConfig {
+    #[default]
+    Tabs,
+    Workspace,
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct TerminalConfig {
@@ -482,6 +495,10 @@ pub struct UiConfig {
     pub confirm_close: bool,
     /// Ask for a tab name before creating a new tab. Default: true.
     pub prompt_new_tab_name: bool,
+    /// What `new_tab` creates: "tabs" (a tab, today's behavior) or
+    /// "workspace" (a sibling workspace in the same space group — the
+    /// workspace-as-unit model, spike #25). Default: "tabs".
+    pub tab_mode: TabModeConfig,
     /// Show agent labels in split pane borders when no manual pane label is set. Default: false.
     pub show_agent_labels_on_pane_borders: bool,
     /// Agent sidebar scope. Saved values are "current" or "all". Default: "all".
@@ -683,6 +700,7 @@ impl Default for UiConfig {
             mouse_scroll_lines: None,
             confirm_close: true,
             prompt_new_tab_name: true,
+            tab_mode: TabModeConfig::default(),
             show_agent_labels_on_pane_borders: false,
             agent_panel_scope: AgentPanelScopeConfig::All,
             agent_aliases: std::collections::HashMap::new(),
@@ -775,6 +793,21 @@ shell_mode = "non_login"
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.terminal.default_shell, "nu");
         assert_eq!(config.terminal.shell_mode, ShellModeConfig::NonLogin);
+    }
+
+    #[test]
+    fn tab_mode_defaults_tabs_and_parses_workspace() {
+        let default_config = Config::default();
+        assert_eq!(default_config.ui.tab_mode, TabModeConfig::Tabs);
+
+        let config: Config = toml::from_str(
+            r#"
+[ui]
+tab_mode = "workspace"
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.ui.tab_mode, TabModeConfig::Workspace);
     }
 
     #[test]
