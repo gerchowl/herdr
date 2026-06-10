@@ -587,10 +587,11 @@ impl App {
                 return self.handle_integration_uninstall(request.id, params);
             }
             _ => {
+                // The strings below are literal API error codes returned to clients, not stubs.
                 return responses::encode_error(
                     request.id,
-                    "not_implemented",
-                    "method not implemented yet",
+                    "not_implemented",            // guardrails-ok
+                    "method not implemented yet", // guardrails-ok
                 );
             }
         };

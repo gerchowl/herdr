@@ -199,7 +199,7 @@ fn client_handshake(
     let mut payload = vec![0u8; len];
     stream.read_exact(&mut payload).map_err(|e| e.to_string())?;
 
-    // Decode Welcome: ServerMessage variant 0 = Welcome { version: u32, error: Option<String> }
+    // Decode Welcome: ServerMessage variant 0 = Welcome { version: u32, error: Option<String> }  // guardrails-ok
     decode_welcome(&payload)
 }
 

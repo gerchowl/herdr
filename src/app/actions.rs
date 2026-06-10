@@ -2514,7 +2514,7 @@ mod tests {
             ("render_status_line(app, area)", "app", "app"),
             ("render_status_line(app, area)", "area", "area"),
             ("if !enabled {", "enabled", "enabled"),
-            ("println!(\"hi\")", "println", "println"),
+            ("println!(\"hi\")", "println", "println"), // guardrails-ok
             ("( master)$", "master", "master"),
             ("regex foo$", "foo", "foo$"),
         ];

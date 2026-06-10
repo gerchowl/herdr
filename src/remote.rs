@@ -1646,8 +1646,8 @@ fn local_forward_socket_path(target: &str, session_name: &str) -> PathBuf {
     // readable name past sun_path's 104-byte ceiling. Fall back to a hashed
     // short name in TMPDIR, then to /tmp as a last resort when TMPDIR itself
     // is longer than the budget. The hash covers the full unsanitized
-    // target/session so uniqueness does not depend on the prefix truncation;
-    // the prefix is kept only for debuggability.
+    // target/session so uniqueness does not depend on the prefix truncation,
+    // which is kept only for debuggability.
     let target_prefix: String = target_clean.chars().take(8).collect();
     let hash = short_socket_hash(target, session_name);
     let short_name = format!("herdr-r-{pid}-{target_prefix}-{hash}.sock");

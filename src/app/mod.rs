@@ -720,6 +720,7 @@ impl App {
         let mut host_mouse_capture_active = self.state.mouse_capture;
 
         while !self.state.should_quit {
+            let loop_watch = crate::logging::Stopwatch::start();
             if self.render_dirty.load(Ordering::Acquire) {
                 needs_render = true;
             }
@@ -812,6 +813,8 @@ impl App {
 
             if needs_render && self.can_render_now(now) {
                 self.render_dirty.swap(false, Ordering::AcqRel);
+                let render_watch = crate::logging::Stopwatch::start();
+                let was_full_redraw = self.full_redraw_pending;
                 let _sync_output = SyncOutputGuard::begin()?;
                 let kitty_graphics_enabled = self.state.kitty_graphics_enabled;
                 if self.full_redraw_pending {
@@ -858,10 +861,19 @@ impl App {
                     self.render_notify.notify_one();
                 }
                 self.last_render_at = Some(now);
+                crate::logging::render_frame_observed(
+                    render_watch.elapsed(),
+                    self.terminal_runtimes.len(),
+                    was_full_redraw,
+                );
+                crate::logging::loop_iter_observed(loop_watch.elapsed(), "render");
                 needs_render = false;
                 continue;
             }
 
+            // Emit before the select! wait so loop-iter duration reflects
+            // active work (drain + scheduled tasks + sync), not idle wait time.
+            crate::logging::loop_iter_observed(loop_watch.elapsed(), "wait");
             let next_deadline = self.next_loop_deadline(now, needs_render);
             let event = {
                 let input_rx = self.input_rx.as_mut();
