@@ -406,12 +406,13 @@ fn render_pane_header(
         buf[(x, divider_y)].set_style(divider_style);
     }
 
-    // Context line: project · worktree · branch.
+    // Context line: owner/project · worktree · branch.
     let mut spans: Vec<Span> = vec![Span::styled(" ", bar_bg)];
-    let project = ws
+    let project_label = ws
         .worktree_space()
         .map(|space| space.label.clone())
         .unwrap_or_else(|| ws.display_name());
+    let project = owner_qualified_project(ws.repo_group_key(), &project_label);
     spans.push(Span::styled(
         project,
         Style::default().fg(p.text).add_modifier(Modifier::BOLD),
@@ -556,6 +557,26 @@ fn render_pane_header(
             style,
         );
     }
+}
+
+/// "owner/label" when the space key is a normalized origin URL
+/// ("github.com/owner/repo") — surfaces the org|person the repo belongs to in
+/// the header. `dir:`-fallback keys and origin-less repos keep the bare label.
+fn owner_qualified_project(key: Option<&str>, label: &str) -> String {
+    let Some(key) = key else {
+        return label.to_string();
+    };
+    if key.starts_with("dir:") {
+        return label.to_string();
+    }
+    let mut segments = key.split('/');
+    let (Some(_host), Some(owner)) = (segments.next(), segments.next()) else {
+        return label.to_string();
+    };
+    if owner.is_empty() || segments.next().is_none() {
+        return label.to_string();
+    }
+    format!("{owner}/{label}")
 }
 
 struct PromptFloatLine {
@@ -840,6 +861,25 @@ mod tests {
     use crate::selection::Selection;
     use crate::terminal::TerminalRuntime;
     use crate::workspace::Workspace;
+
+    #[test]
+    fn owner_qualified_project_parses_origin_keys() {
+        assert_eq!(
+            owner_qualified_project(Some("github.com/gerchowl/herdr"), "herdr"),
+            "gerchowl/herdr"
+        );
+        // gitlab nested groups: top-level org qualifies
+        assert_eq!(
+            owner_qualified_project(Some("gitlab.com/group/sub/repo"), "repo"),
+            "group/repo"
+        );
+        // origin-less / dir-fallback / missing keys keep the bare label
+        assert_eq!(owner_qualified_project(Some("dir:notes"), "notes"), "notes");
+        assert_eq!(owner_qualified_project(None, "scratch"), "scratch");
+        // host-only or host/owner (no repo segment) stays bare
+        assert_eq!(owner_qualified_project(Some("github.com"), "x"), "x");
+        assert_eq!(owner_qualified_project(Some("github.com/solo"), "x"), "x");
+    }
 
     #[test]
     fn pane_border_title_trims_and_truncates() {
