@@ -1422,7 +1422,7 @@ fn peer_server_rows(
             p.overlay0
         };
         title.push(Span::styled(
-            format!("  {ms}ms"),
+            format!("  \u{f04c5} {ms}ms"), // nf-md-speedometer
             Style::default().fg(color),
         ));
     }
@@ -1466,7 +1466,7 @@ fn server_health_spans(
     if let Some(cpu) = cpu_percent {
         push_metric(
             &mut spans,
-            "cpu",
+            "\u{f0ee0}", // nf-md-cpu_64_bit
             format!("{cpu:.0}%"),
             utilization_style(cpu, p),
             p,
@@ -1475,7 +1475,7 @@ fn server_health_spans(
     if let (Some(used), Some(total)) = (mem_used, mem_total) {
         push_metric(
             &mut spans,
-            "mem",
+            "\u{f035b}", // nf-md-memory
             format!(
                 "{}/{}",
                 crate::system_stats::human_bytes(used),
@@ -1488,7 +1488,7 @@ fn server_health_spans(
     if let Some(free) = disk_free {
         push_metric(
             &mut spans,
-            "disk",
+            "\u{f02ca}", // nf-md-harddisk
             crate::system_stats::human_bytes(free),
             Style::default().fg(p.text),
             p,
@@ -2216,9 +2216,9 @@ mod tests {
         let health = line_text(&health);
         assert!(title.contains(&crate::app::short_host_name()), "{title}");
         assert!(title.contains('\u{2726}'), "{title}"); // ✦ current marker
-        assert!(health.contains("cpu 42%"), "{health}");
-        assert!(health.contains("mem 13G/16G"), "{health}");
-        assert!(health.contains("disk 213G"), "{health}");
+        assert!(health.contains("\u{f0ee0} 42%"), "{health}");
+        assert!(health.contains("\u{f035b} 13G/16G"), "{health}");
+        assert!(health.contains("\u{f02ca} 213G"), "{health}");
     }
 
     #[test]
@@ -2248,8 +2248,8 @@ mod tests {
         assert!(title.contains("34ms"), "{title}");
         // The second line speaks the status line's glyph language and rolls
         // the one working agent up as a circled count.
-        assert!(health.contains("cpu 71%"), "{health}");
-        assert!(health.contains("mem 48G/64G"), "{health}");
+        assert!(health.contains("\u{f0ee0} 71%"), "{health}");
+        assert!(health.contains("\u{f035b} 48G/64G"), "{health}");
         assert!(health.contains('\u{2776}'), "{health}"); // ❶ working
         assert!(!health.contains("anvil"), "{health}");
     }

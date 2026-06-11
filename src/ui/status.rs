@@ -294,7 +294,7 @@ pub(super) fn render_status_line(app: &crate::app::AppState, frame: &mut Frame, 
     if let Some(cpu) = stats.cpu_percent {
         push_metric(
             &mut spans,
-            "cpu",
+            "\u{f0ee0}", // nf-md-cpu_64_bit
             format!("{cpu:.0}%"),
             utilization_style(cpu, p),
             p,
@@ -303,7 +303,7 @@ pub(super) fn render_status_line(app: &crate::app::AppState, frame: &mut Frame, 
     if let (Some(used), Some(total)) = (stats.mem_used, stats.mem_total) {
         push_metric(
             &mut spans,
-            "mem",
+            "\u{f035b}", // nf-md-memory
             format!(
                 "{}/{}",
                 crate::system_stats::human_bytes(used),
@@ -316,16 +316,23 @@ pub(super) fn render_status_line(app: &crate::app::AppState, frame: &mut Frame, 
     if let Some(free) = stats.disk_free {
         push_metric(
             &mut spans,
-            "disk",
+            "\u{f02ca}", // nf-md-harddisk
             format!("{} free", crate::system_stats::human_bytes(free)),
             Style::default().fg(p.text),
             p,
         );
     }
     if let Some(percent) = stats.battery_percent {
+        // nf-md-battery_charging, else level glyph by quintile
         let icon = match stats.battery_charging {
-            Some(true) => "\u{26a1}",
-            _ => "\u{1f50b}",
+            Some(true) => "\u{f0084}",
+            _ => match percent {
+                0..=20 => "\u{f007a}",
+                21..=40 => "\u{f007c}",
+                41..=60 => "\u{f007e}",
+                61..=80 => "\u{f0080}",
+                _ => "\u{f0079}",
+            },
         };
         let style = if percent <= 15 {
             Style::default().fg(p.red)
@@ -337,7 +344,7 @@ pub(super) fn render_status_line(app: &crate::app::AppState, frame: &mut Frame, 
     if let (Some(rx), Some(tx)) = (stats.net_rx_per_sec, stats.net_tx_per_sec) {
         push_metric(
             &mut spans,
-            "net",
+            "\u{f06f3}", // nf-md-network
             format!(
                 "\u{25bc}{} \u{25b2}{}",
                 crate::system_stats::human_bytes(rx),
@@ -350,7 +357,7 @@ pub(super) fn render_status_line(app: &crate::app::AppState, frame: &mut Frame, 
     if let Some(gpu) = stats.gpu_percent {
         push_metric(
             &mut spans,
-            "gpu",
+            "\u{f08ae}", // nf-md-expansion_card
             format!("{gpu}%"),
             utilization_style(gpu as f32, p),
             p,
