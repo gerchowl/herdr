@@ -197,10 +197,16 @@ fn frame_rows(frame: &FrameWire) -> Vec<String> {
         .collect()
 }
 
-/// Read frames until one contains `needle`; return its 0-based row index.
-/// Like `wait_for_frame_row` but only matches a row whose `needle` is
-/// preceded by leading whitespace — i.e. an INDENTED spaces-list member row,
-/// not the flush-left servers-band row.
+/// Read frames until one contains `needle` on a row that is INDENTED as a
+/// group MEMBER (>= 2 leading spaces), then return its 0-based row index.
+///
+/// Since the restyle's uniform `<server>:<target>` grammar (#62) the LOCAL
+/// section-head row also reads `host:branch` (e.g. ` ○ mba22:main`), so a bare
+/// `starts_with(whitespace)` no longer distinguishes it from the folded REMOTE
+/// member (`   ○ mba22:main`). The remote row folds UNDER the group as an
+/// indented member, carrying the deeper 3-space member indent — this matches on
+/// that member-level indent so the click lands on the remote card, not the
+/// local head.
 fn wait_for_indented_peer_row(
     stream: &mut UnixStream,
     needle: &str,
@@ -214,10 +220,10 @@ fn wait_for_indented_peer_row(
             if let Some(frame) = decode_frame_payload(&payload) {
                 let rows = frame_rows(&frame);
                 last_screen = rows.join("\n");
-                if let Some(row) = rows
-                    .iter()
-                    .position(|r| r.contains(needle) && r.starts_with(char::is_whitespace))
-                {
+                if let Some(row) = rows.iter().position(|r| {
+                    let indent = r.len() - r.trim_start_matches(' ').len();
+                    indent >= 2 && r.contains(needle)
+                }) {
                     return Ok(row);
                 }
             }
@@ -408,7 +414,9 @@ fn peer_summary_folds_into_sidebar_and_click_switches_server() {
     // servers section header renders once the peer summary lands.
     wait_for_frame_row(&mut stream, "servers", Duration::from_secs(45))
         .expect("servers section should appear once the peer is polled");
-    let row = wait_for_frame_row(&mut stream, "proj · ", Duration::from_secs(45))
+    // The remote-only project leader carries the #27 owner/repo identity
+    // (#62): `peer-fed-test/proj · <host>:<branch>`, truncated to the sidebar.
+    let row = wait_for_frame_row(&mut stream, "peer-fed-test/proj", Duration::from_secs(45))
         .expect("peer workspace should fold into the sidebar");
 
     // --- Click the remote row (SGR mouse, 1-based coordinates).
@@ -503,15 +511,16 @@ fn folded_remote_member_row_click_switches_server() {
 
     wait_for_frame_row(&mut stream, "servers", Duration::from_secs(45))
         .expect("servers section should appear once the peer is polled");
-    // The folded member row reads `   · <host>:<branch>` — INDENTED under
-    // the local `shared` block (leading spaces, `host:branch` shape),
-    // distinct from the band row (`<host>   0 0 0…`, no indent) and the local
-    // member row (`   ⟨git⟩ main`, no colon). It appears once the peer's
-    // workspace summary lands (second poll). NOTE: in this single-host test
+    // The folded member row reads `   <icon> <host>:<branch>` — INDENTED under
+    // the local `shared` block as a group member (>= 2 leading spaces). Since
+    // the #62 uniform grammar the LOCAL head row also reads `host:branch`
+    // (` ○ mba22:main`), so we key on the deeper MEMBER indent, not just any
+    // leading whitespace, to land on the remote card. It appears once the
+    // peer's workspace summary lands (second poll). NOTE: in this single-host
     // harness the peer reports the same `mba22` hostname as the local server,
     // so we key on the indented `host:branch` shape, not the literal name.
     let row = wait_for_indented_peer_row(&mut stream, ":main", Duration::from_secs(60))
-        .expect("peer workspace should fold into the local project block as an indented row");
+        .expect("peer workspace should fold into the local project block as an indented member");
 
     let col = 4u16;
     let sgr_row = (row as u16) + 1;
@@ -602,7 +611,8 @@ fn switch_snapshot_renders_home_row_on_spoke_and_home_switches_back() {
     let mut stream = UnixStream::connect(&client_socket_a).expect("client socket should connect");
     let (_, error) = client_handshake(&mut stream, 17, 90, 45).expect("handshake should complete");
     assert!(error.is_none(), "handshake rejected: {error:?}");
-    let row = wait_for_frame_row(&mut stream, "proj · ", Duration::from_secs(45))
+    // Owner/repo identity on the remote-only project leader (#62/#27).
+    let row = wait_for_frame_row(&mut stream, "peer-fed-home/proj", Duration::from_secs(45))
         .expect("peer workspace should fold into the sidebar");
     let sgr_row = (row as u16) + 1;
     send_input(&mut stream, format!("\x1b[<0;4;{sgr_row}M").as_bytes()).expect("mouse press");
