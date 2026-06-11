@@ -444,9 +444,14 @@ fn switch_snapshot_renders_home_row_on_spoke_and_home_switches_back() {
     let client_socket_a = base.join("herdr-a-client.sock");
     wait_for_file(&client_socket_a, Duration::from_secs(10));
 
-    // --- Leap off the hub: click peerb's folded remote row.
+    // --- Leap off the hub: click peerb's folded remote row. 45 rows: with
+    // the pinned menu band (#41) and the half-height servers band (two
+    // config peers = three 2-line slots), a 30-row frame leaves the spaces
+    // body too short for the trailing remote-only project row — it falls
+    // below the fold and only a scrollbar shows. Taller frame keeps the
+    // whole list on screen; the folding itself is covered by unit tests.
     let mut stream = UnixStream::connect(&client_socket_a).expect("client socket should connect");
-    let (_, error) = client_handshake(&mut stream, 14, 90, 30).expect("handshake should complete");
+    let (_, error) = client_handshake(&mut stream, 14, 90, 45).expect("handshake should complete");
     assert!(error.is_none(), "handshake rejected: {error:?}");
     let row = wait_for_frame_row(&mut stream, "proj · ", Duration::from_secs(45))
         .expect("peer workspace should fold into the sidebar");
@@ -476,7 +481,7 @@ fn switch_snapshot_renders_home_row_on_spoke_and_home_switches_back() {
     wait_for_file(&client_socket_b, Duration::from_secs(10));
     let mut stream_b =
         UnixStream::connect(&client_socket_b).expect("spoke client socket should connect");
-    let (_, error) = client_handshake_with_fleet(&mut stream_b, 14, 90, 30, &fleet_bytes)
+    let (_, error) = client_handshake_with_fleet(&mut stream_b, 14, 90, 45, &fleet_bytes)
         .expect("spoke handshake should complete");
     assert!(error.is_none(), "spoke handshake rejected: {error:?}");
 
