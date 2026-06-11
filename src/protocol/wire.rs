@@ -13,7 +13,17 @@ use serde::{Deserialize, Serialize};
 // ---------------------------------------------------------------------------
 
 /// Current protocol version. Bumped when wire format changes incompatibly.
-pub const PROTOCOL_VERSION: u32 = 13;
+///
+/// v14: `Hello` and `SwitchServer` carry an optional client-side fleet
+/// snapshot (hub-and-spoke down-gossip). Bincode is positional with no
+/// unknown-field tolerance, so the additive fields require a deliberate bump.
+pub const PROTOCOL_VERSION: u32 = 14;
+
+/// Reserved `SwitchServer` target: the client's launcher interprets it as
+/// "re-attach to the local server" (the way home from a spoke), reusing the
+/// existing switch exit path instead of a dedicated message. Not a valid SSH
+/// destination by construction.
+pub const HOME_SWITCH_TARGET: &str = "<home>";
 
 /// Maximum allowed frame payload size (2 MB). Frames larger than this are
 /// rejected to prevent denial-of-service via oversized length prefixes.
@@ -61,6 +71,130 @@ pub enum ClientLaunchMode {
     TerminalAttach,
 }
 
+/// Fleet snapshot carried by a switching client (hub-and-spoke down-gossip):
+/// the origin (home) host label plus the peer summaries the previous server
+/// held at switch time. The receiving server renders these as render-only
+/// rows in its servers band — it never polls them.
+///
+/// Nested leaps pass the snapshot through unchanged (minus the hop target);
+/// `origin` always names the ORIGINAL home, never an intermediate hop.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetSnapshot {
+    /// Short host name of the original origin (where the client launched).
+    pub origin: String,
+    /// Peer summaries captured from the server the client is leaving.
+    pub peers: Vec<FleetPeer>,
+}
+
+/// One peer entry of a [`FleetSnapshot`]: the wire shape of the hub's cached
+/// `PeerSummaryState`, with the unserializable `Instant` freshness replaced
+/// by an age in seconds at capture time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetPeer {
+    /// Peer name from the hub's config (display fallback).
+    pub name: String,
+    /// SSH destination for switch-on-select.
+    pub ssh_target: String,
+    /// Hostname the peer reported about itself.
+    pub host: Option<String>,
+    /// herdr version the peer reported.
+    pub version: Option<String>,
+    /// Machine health from the hub's last successful poll.
+    pub system: Option<FleetSystem>,
+    /// Round-trip latency of the hub's last successful poll.
+    pub latency_ms: Option<u64>,
+    /// Workspace summaries from the hub's last successful poll.
+    pub workspaces: Vec<FleetWorkspace>,
+    /// Seconds since the hub's last successful poll, at capture time.
+    /// `None` = the hub never reached this peer.
+    pub age_secs: Option<u64>,
+    /// Last poll error the hub saw, if any.
+    pub error: Option<String>,
+}
+
+/// Bincode-safe mirror of `api::schema::PeerSystemSummary`. The schema type
+/// carries `skip_serializing_if` for its JSON API shape, which a
+/// non-self-describing format like bincode cannot round-trip.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetSystem {
+    pub cpu_percent: Option<u8>,
+    pub mem_used: Option<u64>,
+    pub mem_total: Option<u64>,
+    pub disk_free: Option<u64>,
+}
+
+impl From<crate::api::schema::PeerSystemSummary> for FleetSystem {
+    fn from(system: crate::api::schema::PeerSystemSummary) -> Self {
+        Self {
+            cpu_percent: system.cpu_percent,
+            mem_used: system.mem_used,
+            mem_total: system.mem_total,
+            disk_free: system.disk_free,
+        }
+    }
+}
+
+impl From<FleetSystem> for crate::api::schema::PeerSystemSummary {
+    fn from(system: FleetSystem) -> Self {
+        Self {
+            cpu_percent: system.cpu_percent,
+            mem_used: system.mem_used,
+            mem_total: system.mem_total,
+            disk_free: system.disk_free,
+        }
+    }
+}
+
+/// Bincode-safe mirror of `api::schema::PeerWorkspaceSummary` (see
+/// [`FleetSystem`] for why the schema type cannot ride the wire directly).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetWorkspace {
+    pub id: String,
+    pub workspace: String,
+    pub project_key: Option<String>,
+    pub project_label: Option<String>,
+    pub branch: Option<String>,
+    pub is_linked_worktree: bool,
+    pub agent: Option<String>,
+    pub status: crate::api::schema::AgentStatus,
+    pub status_age_secs: Option<u64>,
+    pub activity: Option<String>,
+}
+
+impl From<crate::api::schema::PeerWorkspaceSummary> for FleetWorkspace {
+    fn from(ws: crate::api::schema::PeerWorkspaceSummary) -> Self {
+        Self {
+            id: ws.id,
+            workspace: ws.workspace,
+            project_key: ws.project_key,
+            project_label: ws.project_label,
+            branch: ws.branch,
+            is_linked_worktree: ws.is_linked_worktree,
+            agent: ws.agent,
+            status: ws.status,
+            status_age_secs: ws.status_age_secs,
+            activity: ws.activity,
+        }
+    }
+}
+
+impl From<FleetWorkspace> for crate::api::schema::PeerWorkspaceSummary {
+    fn from(ws: FleetWorkspace) -> Self {
+        Self {
+            id: ws.id,
+            workspace: ws.workspace,
+            project_key: ws.project_key,
+            project_label: ws.project_label,
+            branch: ws.branch,
+            is_linked_worktree: ws.is_linked_worktree,
+            agent: ws.agent,
+            status: ws.status,
+            status_age_secs: ws.status_age_secs,
+            activity: ws.activity,
+        }
+    }
+}
+
 /// Messages sent from the client to the server over the client protocol socket.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClientMessage {
@@ -82,6 +216,9 @@ pub enum ClientMessage {
         keybindings: ClientKeybindings,
         /// Whether this connection will render the full app or attach directly to a pane terminal.
         launch_mode: ClientLaunchMode,
+        /// Fleet snapshot carried from the server the client switched away
+        /// from. `None` for locally-attached clients (no origin, no home row).
+        fleet: Option<FleetSnapshot>,
     },
 
     /// Raw input bytes read from the client's stdin.
@@ -394,8 +531,14 @@ pub enum ServerMessage {
     /// reattach to this SSH target (`herdr --remote <ssh_target>`). The
     /// client records the target for its launcher and exits like a detach.
     SwitchServer {
-        /// SSH destination of the peer server.
+        /// SSH destination of the peer server, or [`HOME_SWITCH_TARGET`]
+        /// to re-attach to the client's local server.
         ssh_target: String,
+        /// Fleet snapshot for the next attach leg: the emitting server's
+        /// received snapshot passed through unchanged (nested leap), or a
+        /// fresh stamp of its own peer summaries (leap from the hub).
+        /// `None` when switching home.
+        fleet: Option<FleetSnapshot>,
     },
 }
 
@@ -671,6 +814,7 @@ mod tests {
             requested_encoding: RenderEncoding::SemanticFrame,
             keybindings: ClientKeybindings::Server,
             launch_mode: ClientLaunchMode::App,
+            fleet: None,
         };
         let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
         let (decoded, _): (ClientMessage, _) =
@@ -765,6 +909,73 @@ mod tests {
         };
         let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
         let (decoded, _): (ClientMessage, _) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+        assert_eq!(msg, decoded);
+    }
+
+    fn sample_fleet_snapshot() -> FleetSnapshot {
+        FleetSnapshot {
+            origin: "mba22".to_owned(),
+            peers: vec![FleetPeer {
+                name: "anvil".to_owned(),
+                ssh_target: "lars@anvil".to_owned(),
+                host: Some("anvil".to_owned()),
+                version: Some("0.9.0".to_owned()),
+                system: Some(FleetSystem {
+                    cpu_percent: Some(42),
+                    mem_used: Some(13 << 30),
+                    mem_total: Some(16 << 30),
+                    disk_free: None,
+                }),
+                latency_ms: Some(34),
+                workspaces: vec![FleetWorkspace {
+                    id: "ws_3".to_owned(),
+                    workspace: "proj".to_owned(),
+                    project_key: Some("git:github.com/x/proj".to_owned()),
+                    project_label: Some("proj".to_owned()),
+                    branch: Some("main".to_owned()),
+                    is_linked_worktree: false,
+                    agent: Some("cc".to_owned()),
+                    status: crate::api::schema::AgentStatus::Working,
+                    status_age_secs: Some(12),
+                    // Deliberately None: the schema twin of this field is
+                    // `skip_serializing_if`-guarded, which is exactly what
+                    // the wire mirrors exist to avoid.
+                    activity: None,
+                }],
+                age_secs: Some(5),
+                error: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn client_hello_with_fleet_snapshot_roundtrip() {
+        let msg = ClientMessage::Hello {
+            version: PROTOCOL_VERSION,
+            cols: 80,
+            rows: 24,
+            cell_width_px: 8,
+            cell_height_px: 16,
+            requested_encoding: RenderEncoding::TerminalAnsi,
+            keybindings: ClientKeybindings::Server,
+            launch_mode: ClientLaunchMode::App,
+            fleet: Some(sample_fleet_snapshot()),
+        };
+        let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
+        let (decoded, _): (ClientMessage, _) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+        assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn server_switch_server_with_fleet_snapshot_roundtrip() {
+        let msg = ServerMessage::SwitchServer {
+            ssh_target: "lars@sage".to_owned(),
+            fleet: Some(sample_fleet_snapshot()),
+        };
+        let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
+        let (decoded, _): (ServerMessage, _) =
             bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
         assert_eq!(msg, decoded);
     }
@@ -973,6 +1184,7 @@ mod tests {
             requested_encoding: RenderEncoding::SemanticFrame,
             keybindings: ClientKeybindings::Server,
             launch_mode: ClientLaunchMode::App,
+            fleet: None,
         };
         let mut buf = Vec::new();
         write_message(&mut buf, &msg).unwrap();
@@ -1047,6 +1259,7 @@ mod tests {
                     requested_encoding: RenderEncoding::SemanticFrame,
                     keybindings: ClientKeybindings::Server,
                     launch_mode: ClientLaunchMode::App,
+                    fleet: None,
                 },
                 1 => ClientMessage::Input {
                     data: vec![(i % 256) as u8; (i as usize % 50) + 1],
@@ -1483,6 +1696,7 @@ mod tests {
             requested_encoding: RenderEncoding::SemanticFrame,
             keybindings: ClientKeybindings::Server,
             launch_mode: ClientLaunchMode::App,
+            fleet: None,
         };
         let mut buf = Vec::new();
         write_message(&mut buf, &msg).unwrap();
@@ -1518,6 +1732,7 @@ mod tests {
                 requested_encoding: RenderEncoding::SemanticFrame,
                 keybindings: ClientKeybindings::Server,
                 launch_mode: ClientLaunchMode::App,
+                fleet: None,
             },
             ClientMessage::Input {
                 data: b"hello world".to_vec(),

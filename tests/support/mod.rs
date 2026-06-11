@@ -225,6 +225,20 @@ pub fn client_handshake(
     cols: u16,
     rows: u16,
 ) -> Result<(u32, Option<String>), String> {
+    // fleet: Option<FleetSnapshot> = None (single 0 byte).
+    client_handshake_with_fleet(stream, version, cols, rows, &[0])
+}
+
+/// Handshake whose Hello carries pre-encoded `fleet: Option<FleetSnapshot>`
+/// bytes — e.g. spliced verbatim from a received SwitchServer payload, the
+/// same bytes a switching client would forward.
+pub fn client_handshake_with_fleet(
+    stream: &mut UnixStream,
+    version: u32,
+    cols: u16,
+    rows: u16,
+    fleet_option_bytes: &[u8],
+) -> Result<(u32, Option<String>), String> {
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .map_err(|e| e.to_string())?;
@@ -240,6 +254,7 @@ pub fn client_handshake(
             &encode_varint_u32(0),  // RenderEncoding::SemanticFrame
             &encode_varint_u32(0),  // ClientKeybindings::Server
             &encode_varint_u32(0),  // ClientLaunchMode::App
+            fleet_option_bytes,
         ],
     );
     let framed = frame_message(&hello_payload);

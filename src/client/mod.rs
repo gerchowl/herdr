@@ -198,24 +198,52 @@ impl ClientState {
 /// and the launcher chains into `herdr --remote <target>`.
 pub const SWITCH_FILE_ENV_VAR: &str = "HERDR_SWITCH_FILE";
 
+/// Payload the client records in the launcher's switch file: the next attach
+/// target plus the fleet snapshot the next leg carries into its handshake
+/// (hub-and-spoke down-gossip). Same-binary launcher and client share the
+/// format, so no cross-version concerns.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct RecordedSwitch {
+    /// SSH destination of the next leg, or [`protocol::HOME_SWITCH_TARGET`]
+    /// for "re-attach local".
+    pub target: String,
+    /// Fleet snapshot from the server the client is leaving.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fleet: Option<protocol::FleetSnapshot>,
+}
+
 /// Record a server-switch target for the launcher. Returns false when no
 /// launcher registered a switch file (nothing to chain into).
-fn record_switch_target(ssh_target: &str) -> bool {
+fn record_switch_target(ssh_target: &str, fleet: Option<&protocol::FleetSnapshot>) -> bool {
     let Ok(path) = std::env::var(SWITCH_FILE_ENV_VAR) else {
         return false;
     };
     if path.is_empty() {
         return false;
     }
-    std::fs::write(&path, ssh_target).is_ok()
+    let payload = RecordedSwitch {
+        target: ssh_target.to_string(),
+        fleet: fleet.cloned(),
+    };
+    let Ok(json) = serde_json::to_string(&payload) else {
+        return false;
+    };
+    std::fs::write(&path, json).is_ok()
 }
 
 /// Read and clear a recorded switch target, if any.
-pub fn take_switch_target(path: &std::path::Path) -> Option<String> {
-    let target = std::fs::read_to_string(path).ok()?;
-    let target = target.trim().to_string();
+pub fn take_switch_target(path: &std::path::Path) -> Option<RecordedSwitch> {
+    let contents = std::fs::read_to_string(path).ok()?;
     let _ = std::fs::remove_file(path);
-    (!target.is_empty()).then_some(target)
+    if let Ok(switch) = serde_json::from_str::<RecordedSwitch>(&contents) {
+        return (!switch.target.is_empty()).then_some(switch);
+    }
+    // Bare-target fallback (defensive; the writer is always this binary).
+    let target = contents.trim().to_string();
+    (!target.is_empty()).then_some(RecordedSwitch {
+        target,
+        fleet: None,
+    })
 }
 
 /// Errors that can occur during client operation.
@@ -423,6 +451,19 @@ fn requested_render_encoding() -> RenderEncoding {
     }
 }
 
+/// Fleet snapshot handed to this client process by the remote launcher
+/// (hub-and-spoke down-gossip). Locally-attached clients have none.
+fn carried_fleet_snapshot() -> Option<protocol::FleetSnapshot> {
+    let raw = std::env::var(crate::remote::FLEET_SNAPSHOT_ENV_VAR).ok()?;
+    match serde_json::from_str(&raw) {
+        Ok(fleet) => Some(fleet),
+        Err(err) => {
+            warn!(err = %err, "ignoring malformed fleet snapshot from launcher");
+            None
+        }
+    }
+}
+
 fn requested_keybindings() -> ClientKeybindings {
     match std::env::var(crate::remote::REMOTE_KEYBINDINGS_ENV_VAR)
         .ok()
@@ -468,6 +509,7 @@ fn do_handshake(
         } else {
             ClientLaunchMode::App
         },
+        fleet: carried_fleet_snapshot(),
     };
     protocol::write_message(stream, &hello)
         .map_err(|e| ClientError::ConnectionFailed(io::Error::other(e.to_string())))?;
@@ -890,11 +932,11 @@ async fn run_client_loop(
                 ServerMessage::ServerShutdown { reason } => {
                     return Err(ClientError::ServerShutdown { reason });
                 }
-                ServerMessage::SwitchServer { ssh_target } => {
+                ServerMessage::SwitchServer { ssh_target, fleet } => {
                     // Record the target for the launcher's attach loop, then
                     // exit exactly like a detach. The outermost herdr process
                     // reads the file and starts the next leg.
-                    if record_switch_target(&ssh_target) {
+                    if record_switch_target(&ssh_target, fleet.as_ref()) {
                         return Err(ClientError::ServerShutdown {
                             reason: Some("switching".to_string()),
                         });
@@ -1305,6 +1347,56 @@ mod tests {
     use super::*;
     use std::ffi::OsString;
     use std::sync::{Mutex, OnceLock};
+
+    #[test]
+    fn recorded_switch_roundtrips_with_and_without_fleet() {
+        let dir = std::env::temp_dir().join(format!("herdr-switch-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("switch");
+
+        // A switch with a carried snapshot survives the file round-trip.
+        let fleet = protocol::FleetSnapshot {
+            origin: "mba22".to_string(),
+            peers: vec![protocol::FleetPeer {
+                name: "anvil".to_string(),
+                ssh_target: "lars@anvil".to_string(),
+                host: Some("anvil".to_string()),
+                version: None,
+                system: None,
+                latency_ms: Some(12),
+                workspaces: Vec::new(),
+                age_secs: Some(7),
+                error: None,
+            }],
+        };
+        let recorded = RecordedSwitch {
+            target: "lars@sage".to_string(),
+            fleet: Some(fleet),
+        };
+        std::fs::write(&path, serde_json::to_string(&recorded).unwrap()).unwrap();
+        let taken = take_switch_target(&path).expect("switch recorded");
+        assert_eq!(taken, recorded);
+        // take_* clears the file so a leg never re-runs an old switch.
+        assert!(!path.exists());
+
+        // The home sentinel travels as a plain target without a fleet.
+        let home = RecordedSwitch {
+            target: protocol::HOME_SWITCH_TARGET.to_string(),
+            fleet: None,
+        };
+        std::fs::write(&path, serde_json::to_string(&home).unwrap()).unwrap();
+        let taken = take_switch_target(&path).expect("home switch recorded");
+        assert_eq!(taken.target, protocol::HOME_SWITCH_TARGET);
+        assert!(taken.fleet.is_none());
+
+        // Defensive bare-target fallback.
+        std::fs::write(&path, "lars@anvil\n").unwrap();
+        let taken = take_switch_target(&path).expect("bare target parsed");
+        assert_eq!(taken.target, "lars@anvil");
+        assert!(taken.fleet.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();

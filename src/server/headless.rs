@@ -491,13 +491,20 @@ impl HeadlessServer {
                 }
             }
 
-            if let Some((peer_idx, ws_idx)) = self.app.state.request_peer_switch.take() {
-                if let Some((ssh_target, peer_label)) =
-                    self.app.prepare_peer_switch(peer_idx, ws_idx)
-                {
-                    self.app
-                        .show_action_notice(format!("switching to {peer_label}…"));
-                    self.send_to_foreground_client(ServerMessage::SwitchServer { ssh_target });
+            if let Some(request) = self.app.state.request_peer_switch.take() {
+                let was_home = request == crate::app::state::PeerSwitchRequest::Home;
+                match self.app.prepare_switch_server(request) {
+                    Some(prepared) => {
+                        self.app
+                            .show_action_notice(format!("switching to {}…", prepared.label));
+                        self.send_to_foreground_client(ServerMessage::SwitchServer {
+                            ssh_target: prepared.ssh_target,
+                            fleet: prepared.fleet,
+                        });
+                    }
+                    // switch_home with no carried origin: already home.
+                    None if was_home => self.app.show_action_notice("already home"),
+                    None => {}
                 }
                 needs_render = true;
             }
@@ -1857,6 +1864,7 @@ impl HeadlessServer {
                 writer,
                 render_encoding,
                 direct_attach_requested,
+                fleet,
             } => {
                 if self.handoff_in_progress {
                     if let Ok(message) =
@@ -1902,6 +1910,12 @@ impl HeadlessServer {
                 );
                 if !direct_attach_requested {
                     self.foreground_client_id = Some(client_id);
+                    // Refresh-on-every-leap semantics: each app attach
+                    // replaces the carried fleet snapshot — including
+                    // clearing it when a local (origin-less) client
+                    // attaches, so no stale home row survives.
+                    self.app.state.fleet_snapshot =
+                        fleet.map(crate::peers::FleetSnapshotState::from_wire);
                 }
                 if first_app_client {
                     self.app.mark_git_status_refresh_due(Instant::now());
@@ -3591,6 +3605,92 @@ mod tests {
     }
 
     #[test]
+    fn app_client_attach_sets_and_clears_carried_fleet_snapshot() {
+        let mut server = test_headless_server();
+        let (writer_a, _control_a, _render_a) = test_client_writer();
+        let (writer_b, _control_b, _render_b) = test_client_writer();
+
+        let fleet = protocol::FleetSnapshot {
+            origin: "mba22".to_string(),
+            peers: vec![protocol::FleetPeer {
+                name: "anvil".to_string(),
+                ssh_target: "lars@anvil".to_string(),
+                host: Some("anvil".to_string()),
+                version: None,
+                system: None,
+                latency_ms: Some(21),
+                workspaces: Vec::new(),
+                age_secs: Some(4),
+                error: None,
+            }],
+        };
+        assert!(server.handle_server_event(ServerEvent::ClientConnected {
+            client_id: 1,
+            cols: 80,
+            rows: 24,
+            cell_width_px: 0,
+            cell_height_px: 0,
+            render_encoding: RenderEncoding::SemanticFrame,
+            keybindings: None,
+            direct_attach_requested: false,
+            fleet: Some(fleet),
+            writer: writer_a,
+        }));
+        let snapshot = server
+            .app
+            .state
+            .fleet_snapshot
+            .as_ref()
+            .expect("carried snapshot stored for the sidebar");
+        assert_eq!(snapshot.origin, "mba22");
+        assert_eq!(snapshot.peers.len(), 1);
+        assert_eq!(snapshot.peers[0].ssh_target, "lars@anvil");
+
+        // A later origin-less app attach clears it: no stale home row.
+        assert!(server.handle_server_event(ServerEvent::ClientConnected {
+            client_id: 2,
+            cols: 80,
+            rows: 24,
+            cell_width_px: 0,
+            cell_height_px: 0,
+            render_encoding: RenderEncoding::SemanticFrame,
+            keybindings: None,
+            direct_attach_requested: false,
+            fleet: None,
+            writer: writer_b,
+        }));
+        assert!(server.app.state.fleet_snapshot.is_none());
+    }
+
+    #[test]
+    fn terminal_attach_client_never_touches_the_fleet_snapshot() {
+        let mut server = test_headless_server();
+        let (writer_a, _control_a, _render_a) = test_client_writer();
+        server.app.state.fleet_snapshot = Some(crate::peers::FleetSnapshotState {
+            origin: "mba22".to_string(),
+            peers: Vec::new(),
+            received_at: Instant::now(),
+        });
+
+        assert!(server.handle_server_event(ServerEvent::ClientConnected {
+            client_id: 7,
+            cols: 80,
+            rows: 24,
+            cell_width_px: 0,
+            cell_height_px: 0,
+            render_encoding: RenderEncoding::TerminalAnsi,
+            keybindings: None,
+            direct_attach_requested: true,
+            fleet: None,
+            writer: writer_a,
+        }));
+        assert!(
+            server.app.state.fleet_snapshot.is_some(),
+            "direct terminal attaches are not app legs and must not clear the snapshot"
+        );
+    }
+
+    #[test]
     fn foreground_client_applies_client_keybindings() {
         let mut server = test_headless_server();
         let local_config: crate::config::Config = toml::from_str(
@@ -3614,6 +3714,7 @@ new_tab = "prefix+t"
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: Some(Box::new(local_keybindings)),
             direct_attach_requested: false,
+            fleet: None,
             writer: writer_a,
         }));
         assert_eq!(
@@ -3638,6 +3739,7 @@ new_tab = "prefix+t"
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: None,
             direct_attach_requested: false,
+            fleet: None,
             writer: writer_b,
         }));
         assert_eq!(
@@ -3678,6 +3780,7 @@ new_tab = "prefix+t"
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: Some(Box::new(local_keybindings)),
             direct_attach_requested: false,
+            fleet: None,
             writer: writer_a,
         }));
         assert_eq!(server.app.state.config_diagnostic, without_keybindings);
@@ -3691,6 +3794,7 @@ new_tab = "prefix+t"
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: None,
             direct_attach_requested: false,
+            fleet: None,
             writer: writer_b,
         }));
         assert_eq!(
@@ -3734,6 +3838,7 @@ next_tab = ""
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: Some(Box::new(local_keybindings)),
             direct_attach_requested: false,
+            fleet: None,
             writer,
         }));
         server.app.state.mode = crate::app::Mode::Settings;
@@ -3808,6 +3913,7 @@ next_tab = ""
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: Some(Box::new(local_config.live_keybinds().unwrap())),
             direct_attach_requested: false,
+            fleet: None,
             writer: writer_a,
         }));
         server.app.state.mode = crate::app::Mode::Settings;
@@ -3828,6 +3934,7 @@ next_tab = ""
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: None,
             direct_attach_requested: false,
+            fleet: None,
             writer: writer_b,
         }));
         assert_eq!(
@@ -3861,6 +3968,7 @@ next_tab = ""
             render_encoding: RenderEncoding::TerminalAnsi,
             keybindings: None,
             direct_attach_requested: true,
+            fleet: None,
             writer,
         }));
         assert!(server.clients.contains_key(&7));
@@ -3900,6 +4008,7 @@ next_tab = ""
             render_encoding,
             keybindings: None,
             direct_attach_requested: false,
+            fleet: None,
             writer,
         }));
 
@@ -3934,6 +4043,7 @@ next_tab = ""
             render_encoding: RenderEncoding::TerminalAnsi,
             keybindings: None,
             direct_attach_requested: true,
+            fleet: None,
             writer,
         }));
 
@@ -3967,6 +4077,7 @@ next_tab = ""
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: None,
             direct_attach_requested: false,
+            fleet: None,
             writer,
         }));
         assert!(server.has_app_client());
@@ -4012,6 +4123,7 @@ next_tab = ""
             render_encoding: RenderEncoding::TerminalAnsi,
             keybindings: None,
             direct_attach_requested: true,
+            fleet: None,
             writer,
         }));
         assert!(
@@ -5237,6 +5349,7 @@ next_tab = ""
             render_encoding: RenderEncoding::TerminalAnsi,
             keybindings: None,
             direct_attach_requested: true,
+            fleet: None,
             writer,
         }));
         assert!(

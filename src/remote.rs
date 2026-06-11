@@ -27,6 +27,11 @@ pub(crate) const REATTACH_COMMAND_ENV_VAR: &str = "HERDR_REATTACH_COMMAND";
 
 pub(crate) const REMOTE_KEYBINDINGS_ENV_VAR: &str = "HERDR_REMOTE_KEYBINDINGS";
 
+/// JSON-encoded `protocol::FleetSnapshot` the launcher hands to the spawned
+/// client process; the client forwards it in its `Hello` (hub-and-spoke
+/// down-gossip). Set per-child, never exported to the launcher's own env.
+pub(crate) const FLEET_SNAPSHOT_ENV_VAR: &str = "HERDR_FLEET_SNAPSHOT";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RemoteKeybindings {
     Local,
@@ -55,6 +60,10 @@ pub(crate) struct RemoteLaunch {
     pub(crate) target: String,
     pub(crate) keybindings: RemoteKeybindings,
     pub(crate) live_handoff: bool,
+    /// Fleet snapshot carried from the server the client switched away from
+    /// (`None` for CLI-launched legs; a fresh origin-only snapshot is
+    /// stamped at launch so the remote end always knows the way home).
+    pub(crate) fleet: Option<crate::protocol::FleetSnapshot>,
 }
 
 pub(crate) fn extract_remote_args(
@@ -130,6 +139,7 @@ pub(crate) fn extract_remote_args(
         target,
         keybindings,
         live_handoff,
+        fleet: None,
     });
     if remote.is_none() && keybindings_seen {
         return Err("--remote-keybindings requires --remote".to_string());
@@ -186,7 +196,19 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
         manage_ssh_config,
     )?;
 
-    run_client_process(&local_socket, &reattach_command, remote.keybindings)
+    // Every remote leg carries a fleet snapshot: the one handed over by the
+    // previous server (pass-through — keeps the ORIGINAL origin on nested
+    // leaps), or a fresh origin-only stamp for CLI-launched legs so the
+    // remote end always renders the way home.
+    let fleet = remote
+        .fleet
+        .clone()
+        .unwrap_or_else(|| crate::protocol::FleetSnapshot {
+            origin: crate::app::short_host_name(),
+            peers: Vec::new(),
+        });
+
+    run_client_process(&local_socket, &reattach_command, remote.keybindings, &fleet)
 }
 
 pub(crate) fn run_remote_client_bridge() -> io::Result<()> {
@@ -1602,8 +1624,10 @@ fn run_client_process(
     local_socket: &Path,
     reattach_command: &str,
     keybindings: RemoteKeybindings,
+    fleet: &crate::protocol::FleetSnapshot,
 ) -> io::Result<()> {
     let exe = std::env::current_exe()?;
+    let fleet_json = serde_json::to_string(fleet).map_err(io::Error::other)?;
     let status = Command::new(exe)
         .arg("client")
         .env(
@@ -1613,6 +1637,7 @@ fn run_client_process(
         .env("HERDR_RENDER_ENCODING", "terminal-ansi")
         .env(REATTACH_COMMAND_ENV_VAR, reattach_command)
         .env(REMOTE_KEYBINDINGS_ENV_VAR, keybindings.as_str())
+        .env(FLEET_SNAPSHOT_ENV_VAR, fleet_json)
         .env_remove(crate::api::SOCKET_PATH_ENV_VAR)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())

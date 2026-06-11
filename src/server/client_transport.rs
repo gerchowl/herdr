@@ -58,6 +58,9 @@ pub(crate) enum ServerEvent {
         render_encoding: RenderEncoding,
         keybindings: Option<Box<crate::config::LiveKeybindConfig>>,
         direct_attach_requested: bool,
+        /// Fleet snapshot carried in the client's Hello (hub-and-spoke
+        /// down-gossip); `None` for locally-attached clients.
+        fleet: Option<protocol::FleetSnapshot>,
         writer: ClientWriter,
     },
     /// A client sent an input message.
@@ -168,6 +171,7 @@ pub(crate) fn handle_client_handshake(
         render_encoding,
         keybindings,
         direct_attach_requested,
+        fleet,
     ) = match hello {
         ClientMessage::Hello {
             version,
@@ -178,6 +182,7 @@ pub(crate) fn handle_client_handshake(
             requested_encoding,
             keybindings,
             launch_mode,
+            fleet,
         } => {
             // Version check.
             match protocol::check_client_version(version) {
@@ -217,6 +222,7 @@ pub(crate) fn handle_client_handshake(
                 requested_encoding,
                 keybindings,
                 launch_mode == ClientLaunchMode::TerminalAttach,
+                fleet,
             )
         }
         _ => {
@@ -261,6 +267,7 @@ pub(crate) fn handle_client_handshake(
         render_encoding,
         keybindings,
         direct_attach_requested,
+        fleet,
         writer,
     });
 
@@ -588,6 +595,7 @@ new_tab = "ctrl+notakey"
                 requested_encoding: RenderEncoding::TerminalAnsi,
                 keybindings: ClientKeybindings::Server,
                 launch_mode: ClientLaunchMode::App,
+                fleet: None,
             },
         )
         .expect("write hello");
@@ -620,6 +628,7 @@ new_tab = "ctrl+notakey"
                 render_encoding,
                 keybindings,
                 direct_attach_requested,
+                fleet,
                 writer,
             } => {
                 assert_eq!(client_id, 42);
@@ -628,6 +637,7 @@ new_tab = "ctrl+notakey"
                 assert_eq!(render_encoding, RenderEncoding::TerminalAnsi);
                 assert!(keybindings.is_none());
                 assert!(!direct_attach_requested);
+                assert!(fleet.is_none());
                 drop(writer);
             }
             other => panic!("expected ClientConnected, got {other:?}"),
@@ -662,6 +672,7 @@ new_tab = "ctrl+notakey"
                 requested_encoding: RenderEncoding::TerminalAnsi,
                 keybindings: ClientKeybindings::Server,
                 launch_mode: ClientLaunchMode::TerminalAttach,
+                fleet: None,
             },
         )
         .expect("write hello");

@@ -355,16 +355,22 @@ fn run_attach_legs(first: AttachLeg) -> io::Result<()> {
         };
 
         match client::take_switch_target(&switch_file) {
-            Some(target) => {
+            // The reserved home target re-attaches locally: the way home
+            // from a spoke is client knowledge, not server-side ssh config.
+            Some(switch) if switch.target == protocol::HOME_SWITCH_TARGET => {
+                leg = AttachLeg::Local;
+            }
+            Some(switch) => {
                 let keybindings = match &leg {
                     AttachLeg::Remote(launch) => launch.keybindings,
                     // Match the CLI's --remote-keybindings default.
                     AttachLeg::Local => remote::RemoteKeybindings::Local,
                 };
                 leg = AttachLeg::Remote(remote::RemoteLaunch {
-                    target,
+                    target: switch.target,
                     keybindings,
                     live_handoff: false,
+                    fleet: switch.fleet,
                 });
             }
             None => return result,

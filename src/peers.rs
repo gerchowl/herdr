@@ -81,6 +81,81 @@ pub enum PeerReachability {
     Down,
 }
 
+/// Fleet snapshot received at attach (hub-and-spoke down-gossip, issue #36):
+/// the origin (home) host label plus render-only peer rows carried from the
+/// server the client switched away from. These entries are NEVER polled —
+/// their freshness only decays, which the existing staleness rendering shows.
+#[derive(Debug, Clone)]
+pub struct FleetSnapshotState {
+    /// Short host name of the original origin (the client's home).
+    pub origin: String,
+    /// Carried peer summaries, converted into the poller's cache shape so
+    /// the sidebar reuses the existing peer-row machinery.
+    pub peers: Vec<PeerSummaryState>,
+    /// When this snapshot arrived (home-row staleness display).
+    pub received_at: Instant,
+}
+
+impl FleetSnapshotState {
+    pub fn from_wire(snapshot: crate::protocol::FleetSnapshot) -> Self {
+        Self {
+            origin: snapshot.origin,
+            peers: snapshot.peers.into_iter().map(peer_from_wire).collect(),
+            received_at: Instant::now(),
+        }
+    }
+
+    /// Re-encode for the next leap, excluding the hop target itself (it
+    /// becomes the self row on the receiving end). Ages are recomputed so
+    /// time spent on this server keeps counting against freshness.
+    pub fn to_wire(&self, exclude_ssh_target: &str) -> crate::protocol::FleetSnapshot {
+        crate::protocol::FleetSnapshot {
+            origin: self.origin.clone(),
+            peers: self
+                .peers
+                .iter()
+                .filter(|peer| peer.ssh_target != exclude_ssh_target)
+                .map(peer_to_wire)
+                .collect(),
+        }
+    }
+}
+
+/// Wire shape of one cached peer summary (`Instant` freshness → age in
+/// seconds at capture time).
+pub fn peer_to_wire(peer: &PeerSummaryState) -> crate::protocol::FleetPeer {
+    crate::protocol::FleetPeer {
+        name: peer.peer.clone(),
+        ssh_target: peer.ssh_target.clone(),
+        host: peer.host.clone(),
+        version: peer.version.clone(),
+        system: peer.system.clone().map(Into::into),
+        latency_ms: peer.latency_ms,
+        workspaces: peer.workspaces.iter().cloned().map(Into::into).collect(),
+        age_secs: peer.last_ok.map(|at| at.elapsed().as_secs()),
+        error: peer.error.clone(),
+    }
+}
+
+/// Rehydrate a carried peer entry into the poller's cache shape. The age is
+/// mapped back onto a synthetic `last_ok` instant so `is_stale`/`reachability`
+/// keep working — and keep decaying — without any reverse polling.
+pub fn peer_from_wire(peer: crate::protocol::FleetPeer) -> PeerSummaryState {
+    PeerSummaryState {
+        peer: peer.name,
+        ssh_target: peer.ssh_target,
+        host: peer.host,
+        version: peer.version,
+        system: peer.system.map(Into::into),
+        latency_ms: peer.latency_ms,
+        workspaces: peer.workspaces.into_iter().map(Into::into).collect(),
+        last_ok: peer
+            .age_secs
+            .and_then(|secs| Instant::now().checked_sub(std::time::Duration::from_secs(secs))),
+        error: peer.error,
+    }
+}
+
 /// Parsed summary payload from one peer (everything its `peers.summary` carries).
 #[derive(Debug, Clone, PartialEq)]
 pub struct PeerSummaryPayload {
@@ -197,6 +272,90 @@ fn parse_summary_response(stdout: &str, latency_ms: u64) -> Result<PeerSummaryPa
 mod tests {
     use super::*;
     use crate::api::schema::AgentStatus;
+
+    fn summary_state(name: &str, ssh_target: &str, age_secs: Option<u64>) -> PeerSummaryState {
+        PeerSummaryState {
+            peer: name.to_string(),
+            ssh_target: ssh_target.to_string(),
+            host: Some(format!("{name}-host")),
+            version: Some("0.9.0".to_string()),
+            system: Some(crate::api::schema::PeerSystemSummary {
+                cpu_percent: Some(42),
+                mem_used: Some(13 << 30),
+                mem_total: Some(16 << 30),
+                disk_free: None,
+            }),
+            latency_ms: Some(34),
+            workspaces: vec![crate::api::schema::PeerWorkspaceSummary {
+                id: "ws_3".to_string(),
+                workspace: "proj".to_string(),
+                project_key: Some("github.com/x/proj".to_string()),
+                project_label: Some("proj".to_string()),
+                branch: Some("main".to_string()),
+                is_linked_worktree: false,
+                agent: Some("cc".to_string()),
+                status: AgentStatus::Working,
+                status_age_secs: Some(12),
+                activity: None,
+            }],
+            last_ok: age_secs
+                .and_then(|secs| Instant::now().checked_sub(std::time::Duration::from_secs(secs))),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn fleet_peer_wire_roundtrip_preserves_summary_and_freshness() {
+        let state = summary_state("anvil", "lars@anvil", Some(5));
+        let wire = peer_to_wire(&state);
+        assert_eq!(wire.age_secs, Some(5));
+
+        let back = peer_from_wire(wire);
+        assert_eq!(back.peer, state.peer);
+        assert_eq!(back.ssh_target, state.ssh_target);
+        assert_eq!(back.host, state.host);
+        assert_eq!(back.version, state.version);
+        assert_eq!(back.system, state.system);
+        assert_eq!(back.latency_ms, state.latency_ms);
+        assert_eq!(back.workspaces, state.workspaces);
+        assert_eq!(back.error, state.error);
+        // The age maps back onto a synthetic last_ok so reachability keeps
+        // working — a 5s-old summary is still Live...
+        let age = back.last_ok.expect("freshness carried").elapsed().as_secs();
+        assert!((5..8).contains(&age), "age {age} should stay ~5s");
+        assert_eq!(back.reachability(), PeerReachability::Live);
+
+        // ...while an old one decays to Down with no polling involved.
+        let stale = peer_from_wire(peer_to_wire(&summary_state(
+            "sage",
+            "lars@sage",
+            Some(PEER_STALE_AFTER_SECS + 30),
+        )));
+        assert_eq!(stale.reachability(), PeerReachability::Down);
+
+        // Never-reached peers stay never-reached.
+        let never = peer_from_wire(peer_to_wire(&summary_state("ksb", "lars@ksb", None)));
+        assert!(never.last_ok.is_none());
+    }
+
+    #[test]
+    fn fleet_snapshot_to_wire_keeps_origin_and_excludes_hop_target() {
+        let snapshot = FleetSnapshotState {
+            origin: "mba22".to_string(),
+            peers: vec![
+                summary_state("anvil", "lars@anvil", Some(3)),
+                summary_state("sage", "lars@sage", Some(9)),
+            ],
+            received_at: Instant::now(),
+        };
+
+        let wire = snapshot.to_wire("lars@sage");
+        // Pass-through: the ORIGINAL origin survives nested leaps.
+        assert_eq!(wire.origin, "mba22");
+        // The hop target becomes the self row on the receiving end.
+        assert_eq!(wire.peers.len(), 1);
+        assert_eq!(wire.peers[0].ssh_target, "lars@anvil");
+    }
 
     #[test]
     fn parse_summary_response_reads_envelope() {
