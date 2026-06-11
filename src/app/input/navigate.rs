@@ -529,6 +529,7 @@ pub(crate) enum NavigateAction {
     ToggleSidebar,
     ToggleCollapseAll,
     TogglePromptExpand,
+    SwitchHome,
     CyclePaneNext,
     CyclePanePrevious,
     LastPane,
@@ -650,6 +651,7 @@ fn action_for_key(
         (&kb.toggle_sidebar, NavigateAction::ToggleSidebar),
         (&kb.toggle_collapse_all, NavigateAction::ToggleCollapseAll),
         (&kb.toggle_prompt_expand, NavigateAction::TogglePromptExpand),
+        (&kb.switch_home, NavigateAction::SwitchHome),
         (&kb.reload_config, NavigateAction::ReloadConfig),
         (
             &kb.open_notification_target,
@@ -877,6 +879,12 @@ pub(super) fn execute_navigate_action_in_context(
         }
         NavigateAction::ToggleCollapseAll => {
             state.toggle_all_space_groups();
+            leave_navigate_mode(state);
+        }
+        NavigateAction::SwitchHome => {
+            // Same chokepoint as selecting the sidebar home row; the
+            // consuming loop answers "already home" when no origin exists.
+            state.request_peer_switch = Some(crate::app::state::PeerSwitchRequest::Home);
             leave_navigate_mode(state);
         }
         NavigateAction::TogglePromptExpand => {
@@ -1956,6 +1964,20 @@ last_pane = "prefix+tab"
         assert!(!state.creating_new_tab);
         assert!(!state.request_new_tab);
         assert!(state.workspaces.is_empty());
+    }
+
+    #[test]
+    fn switch_home_requests_home_switch_through_the_shared_chokepoint() {
+        let mut state = state_with_workspaces(&["main"]);
+        state.mode = Mode::Navigate;
+
+        execute_navigate_action(&mut state, NavigateAction::SwitchHome);
+
+        assert_eq!(
+            state.request_peer_switch,
+            Some(crate::app::state::PeerSwitchRequest::Home)
+        );
+        assert_eq!(state.mode, Mode::Terminal);
     }
 
     #[test]

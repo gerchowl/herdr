@@ -283,6 +283,11 @@ pub struct KeysConfig {
     /// Collapse every sidebar worktree group at once; pressed again, expand
     /// them all. Unset by default.
     pub toggle_collapse_all: BindingConfig,
+    /// Switch the attached client back to its home server (the host it
+    /// originally launched from) without touching the sidebar. Only acts
+    /// when the client carried an origin, i.e. it attached via a server
+    /// switch or --remote. Unset by default.
+    pub switch_home: BindingConfig,
     /// Toggle the full last-prompt view in the focused pane's header (keyboard
     /// twin of clicking the header). Unset by default.
     pub toggle_prompt_expand: BindingConfig,
@@ -621,6 +626,7 @@ impl Default for KeysConfig {
             new_worktree: BindingConfig::one("prefix+shift+g"),
             branch_session: BindingConfig::empty(),
             toggle_collapse_all: BindingConfig::empty(),
+            switch_home: BindingConfig::empty(),
             toggle_prompt_expand: BindingConfig::empty(),
             toggle_float: BindingConfig::empty(),
             kill_worktree: BindingConfig::empty(),

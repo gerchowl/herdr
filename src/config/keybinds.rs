@@ -265,6 +265,7 @@ pub struct Keybinds {
     pub new_worktree: ActionKeybinds,
     pub branch_session: ActionKeybinds,
     pub toggle_collapse_all: ActionKeybinds,
+    pub switch_home: ActionKeybinds,
     pub toggle_prompt_expand: ActionKeybinds,
     pub toggle_float: ActionKeybinds,
     pub kill_worktree: ActionKeybinds,
@@ -453,6 +454,7 @@ impl Config {
                 "keys.toggle_collapse_all",
                 &self.keys.toggle_collapse_all
             ),
+            switch_home: action!("keys.switch_home", &self.keys.switch_home),
             toggle_prompt_expand: action!(
                 "keys.toggle_prompt_expand",
                 &self.keys.toggle_prompt_expand

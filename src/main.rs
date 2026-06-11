@@ -119,6 +119,7 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # help = "prefix+?"
 # settings = "prefix+s"
 # detach = "prefix+q"
+# switch_home = ""  # optional, unset by default; leap back to the launching host
 # reload_config = "prefix+shift+r"
 # open_notification_target = "prefix+o"
 # workspace_picker = "prefix+w"
