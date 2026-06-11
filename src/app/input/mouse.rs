@@ -35,6 +35,9 @@ impl AppState {
         if self.mode != Mode::Terminal {
             return;
         }
+        if self.handle_float_mouse(terminal_runtimes, mouse) {
+            return;
+        }
         let Some(info) = self.pane_at(mouse.column, mouse.row).cloned() else {
             return;
         };
@@ -53,6 +56,85 @@ impl AppState {
                 self.forward_pane_mouse_motion(terminal_runtimes, &info, mouse);
             }
         }
+    }
+
+    /// Route a mouse event into the active workspace's visible float when
+    /// its coordinates fall inside the float's overlay rect. Returns true
+    /// when the event was consumed — including border hits, which are
+    /// swallowed so they never reach the panes underneath. Events outside
+    /// the overlay (and gestures anchored outside it) return false and
+    /// follow the normal pane path.
+    pub(crate) fn handle_float_mouse(
+        &mut self,
+        terminal_runtimes: &TerminalRuntimeRegistry,
+        mouse: MouseEvent,
+    ) -> bool {
+        if self.mode != Mode::Terminal {
+            return false;
+        }
+        // A selection or drag gesture anchored outside the float keeps the
+        // normal path, so dragging across the overlay cannot hijack it.
+        if (self.selection.is_some() || self.drag.is_some())
+            && matches!(mouse.kind, MouseEventKind::Drag(_) | MouseEventKind::Up(_))
+        {
+            return false;
+        }
+        let Some(float) = self.visible_float_for_active_workspace() else {
+            return false;
+        };
+        let Some(outer) = crate::ui::float_overlay_rect(self.view.terminal_area) else {
+            return false;
+        };
+        if !rect_contains(outer, mouse.column, mouse.row) {
+            return false;
+        }
+        let pane_id = float.pane_id;
+        let terminal_id = float.terminal_id.clone();
+
+        if matches!(mouse.kind, MouseEventKind::Down(_)) {
+            self.selection = None;
+            self.selection_autoscroll = None;
+        }
+
+        let Some(rt) = terminal_runtimes.get(&terminal_id) else {
+            return true;
+        };
+        let Some(inner) = crate::ui::float_overlay_inner_rect(self.view.terminal_area) else {
+            return true;
+        };
+        if !rect_contains(inner, mouse.column, mouse.row) {
+            // Border hit: consumed by the overlay chrome.
+            return true;
+        }
+        let column = mouse.column - inner.x;
+        let row = mouse.row - inner.y;
+
+        match mouse.kind {
+            MouseEventKind::ScrollUp
+            | MouseEventKind::ScrollDown
+            | MouseEventKind::ScrollLeft
+            | MouseEventKind::ScrollRight => {
+                // Shift+wheel is the same deterministic host-scrollback
+                // escape hatch layout panes have; otherwise honor the float
+                // app's wheel routing before falling back to host scroll.
+                let shift_held = mouse.modifiers.contains(KeyModifiers::SHIFT);
+                if !shift_held && forward_runtime_wheel(rt, pane_id, column, row, mouse) {
+                    return true;
+                }
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => rt.scroll_up(self.mouse_scroll_lines),
+                    MouseEventKind::ScrollDown => rt.scroll_down(self.mouse_scroll_lines),
+                    _ => {}
+                }
+            }
+            MouseEventKind::Down(_) | MouseEventKind::Up(_) | MouseEventKind::Drag(_) => {
+                forward_runtime_mouse_button(rt, pane_id, column, row, mouse);
+            }
+            MouseEventKind::Moved => {
+                forward_runtime_mouse_motion(rt, pane_id, column, row, mouse);
+            }
+        }
+        true
     }
 
     pub(super) fn handle_mouse(
@@ -1389,43 +1471,44 @@ impl AppState {
         }
     }
 
-    /// Page the focused pane's host scrollback (Shift+PageUp/Down). `dir` is
-    /// -1 for up (into history) / +1 for down (toward live). A page is the
-    /// pane's visible height minus one row of overlap. Returns false when
-    /// there is no focused pane to scroll.
+    /// Page the host scrollback of the terminal-input owner — the visible
+    /// float when one is up, otherwise the focused layout pane — for
+    /// Shift+PageUp/Down. `dir` is -1 for up (into history) / +1 for down
+    /// (toward live). A page is the visible height minus one row of overlap.
+    /// Returns false when there is nothing to scroll.
     pub(crate) fn scroll_focused_pane_page(
         &self,
         terminal_runtimes: &TerminalRuntimeRegistry,
         dir: i8,
     ) -> bool {
-        let Some((pane_id, page)) = self.focused_pane_scroll_page(terminal_runtimes) else {
+        let Some((rt, page)) = self.host_scrollback_target(terminal_runtimes) else {
             return false;
         };
         if dir < 0 {
-            self.scroll_pane_up(terminal_runtimes, pane_id, page);
+            rt.scroll_up(page);
         } else {
-            self.scroll_pane_down(terminal_runtimes, pane_id, page);
+            rt.scroll_down(page);
         }
         true
     }
 
-    /// Jump the focused pane's host scrollback to the top of history
-    /// (Shift+Home) or back to the live bottom (Shift+End).
+    /// Jump the host scrollback of the terminal-input owner to the top of
+    /// history (Shift+Home) or back to the live bottom (Shift+End).
     pub(crate) fn scroll_focused_pane_edge(
         &self,
         terminal_runtimes: &TerminalRuntimeRegistry,
         to_top: bool,
     ) -> bool {
-        let Some(pane_id) = self.focused_pane_id_for_scroll() else {
+        let Some((rt, _)) = self.host_scrollback_target(terminal_runtimes) else {
             return false;
         };
         let offset = if to_top {
-            self.pane_scroll_metrics(terminal_runtimes, pane_id)
+            rt.scroll_metrics()
                 .map_or(0, |metrics| metrics.max_offset_from_bottom)
         } else {
             0
         };
-        self.set_pane_scroll_offset(terminal_runtimes, pane_id, offset);
+        rt.set_scroll_offset_from_bottom(offset);
         true
     }
 
@@ -1435,23 +1518,35 @@ impl AppState {
             .and_then(|ws| ws.focused_pane_id())
     }
 
-    fn focused_pane_scroll_page(
-        &self,
-        terminal_runtimes: &TerminalRuntimeRegistry,
-    ) -> Option<(crate::layout::PaneId, usize)> {
-        let pane_id = self.focused_pane_id_for_scroll()?;
-        // Prefer the live viewport height; fall back to the laid-out pane rect.
-        let page = self
-            .pane_scroll_metrics(terminal_runtimes, pane_id)
-            .map(|metrics| metrics.viewport_rows)
-            .or_else(|| {
+    /// The runtime whose HOST scrollback the Shift-modified scrollback keys
+    /// target, plus its page size. Prefers the live viewport height from the
+    /// runtime's metrics, falling back to the laid-out rect height.
+    fn host_scrollback_target<'a>(
+        &'a self,
+        terminal_runtimes: &'a TerminalRuntimeRegistry,
+    ) -> Option<(&'a crate::terminal::TerminalRuntime, usize)> {
+        let (rt, rect_rows) = if let Some(float) = self.visible_float_for_active_workspace() {
+            (
+                terminal_runtimes.get(&float.terminal_id)?,
+                crate::ui::float_overlay_inner_rect(self.view.terminal_area)
+                    .map(|inner| usize::from(inner.height)),
+            )
+        } else {
+            let pane_id = self.focused_pane_id_for_scroll()?;
+            (
+                self.runtime_for_pane_in_workspace(terminal_runtimes, self.active?, pane_id)?,
                 self.pane_info_by_id(pane_id)
-                    .map(|info| info.inner_rect.height as usize)
-            })
+                    .map(|info| usize::from(info.inner_rect.height)),
+            )
+        };
+        let page = rt
+            .scroll_metrics()
+            .map(|metrics| metrics.viewport_rows)
+            .or(rect_rows)
             .unwrap_or(1)
             .saturating_sub(1)
             .max(1);
-        Some((pane_id, page))
+        Some((rt, page))
     }
 
     pub(crate) fn pane_scroll_metrics(
@@ -1609,14 +1704,7 @@ impl AppState {
         };
         let column = mouse.column.saturating_sub(info.inner_rect.x);
         let row = mouse.row.saturating_sub(info.inner_rect.y);
-        let Some(bytes) = rt.encode_mouse_button(mouse.kind, column, row, mouse.modifiers) else {
-            return false;
-        };
-        rt.scroll_reset();
-        if let Err(err) = rt.try_send_bytes(Bytes::from(bytes)) {
-            warn!(pane = info.id.raw(), err = %err, kind = ?mouse.kind, "failed to forward mouse button event");
-        }
-        true
+        forward_runtime_mouse_button(rt, info.id, column, row, mouse)
     }
 
     pub(super) fn forward_pane_mouse_motion(
@@ -1634,13 +1722,7 @@ impl AppState {
         };
         let column = mouse.column.saturating_sub(info.inner_rect.x);
         let row = mouse.row.saturating_sub(info.inner_rect.y);
-        let Some(bytes) = rt.encode_mouse_motion(mouse.kind, column, row, mouse.modifiers) else {
-            return false;
-        };
-        if let Err(err) = rt.try_send_bytes(Bytes::from(bytes)) {
-            warn!(pane = info.id.raw(), err = %err, kind = ?mouse.kind, "failed to forward mouse motion event");
-        }
-        true
+        forward_runtime_mouse_motion(rt, info.id, column, row, mouse)
     }
 
     fn forward_pane_reported_wheel(
@@ -1688,33 +1770,9 @@ impl AppState {
         else {
             return false;
         };
-        match rt.wheel_routing() {
-            Some(crate::pane::WheelRouting::HostScroll) | None => false,
-            Some(crate::pane::WheelRouting::MouseReport) => {
-                rt.scroll_reset();
-                let column = mouse.column.saturating_sub(info.inner_rect.x);
-                let row = mouse.row.saturating_sub(info.inner_rect.y);
-                let Some(bytes) = rt.encode_mouse_wheel(mouse.kind, column, row, mouse.modifiers)
-                else {
-                    warn!(pane = info.id.raw(), kind = ?mouse.kind, "failed to encode mouse wheel event");
-                    return true;
-                };
-                if let Err(err) = rt.try_send_bytes(Bytes::from(bytes)) {
-                    warn!(pane = info.id.raw(), err = %err, "failed to forward mouse wheel event");
-                }
-                true
-            }
-            Some(crate::pane::WheelRouting::AlternateScroll) => {
-                rt.scroll_reset();
-                let Some(bytes) = rt.encode_alternate_scroll(mouse.kind) else {
-                    return true;
-                };
-                if let Err(err) = rt.try_send_bytes(Bytes::from(bytes)) {
-                    warn!(pane = info.id.raw(), err = %err, "failed to forward alternate-scroll key");
-                }
-                true
-            }
-        }
+        let column = mouse.column.saturating_sub(info.inner_rect.x);
+        let row = mouse.row.saturating_sub(info.inner_rect.y);
+        forward_runtime_wheel(rt, info.id, column, row, mouse)
     }
 
     pub(super) fn set_pane_scroll_offset(
@@ -1812,6 +1870,82 @@ fn rect_contains(rect: Rect, col: u16, row: u16) -> bool {
         && row < rect.y + rect.height
 }
 
+/// Encode and send a mouse button/drag event into a runtime. `column`/`row`
+/// are already relative to the target's inner rect; `pane` is used only for
+/// diagnostics. Returns false when the runtime does not report this event.
+fn forward_runtime_mouse_button(
+    rt: &crate::terminal::TerminalRuntime,
+    pane: crate::layout::PaneId,
+    column: u16,
+    row: u16,
+    mouse: MouseEvent,
+) -> bool {
+    let Some(bytes) = rt.encode_mouse_button(mouse.kind, column, row, mouse.modifiers) else {
+        return false;
+    };
+    rt.scroll_reset();
+    if let Err(err) = rt.try_send_bytes(Bytes::from(bytes)) {
+        warn!(pane = pane.raw(), err = %err, kind = ?mouse.kind, "failed to forward mouse button event");
+    }
+    true
+}
+
+/// Encode and send a mouse motion event into a runtime (coordinates relative
+/// to the target's inner rect). Returns false when the runtime does not
+/// report motion.
+fn forward_runtime_mouse_motion(
+    rt: &crate::terminal::TerminalRuntime,
+    pane: crate::layout::PaneId,
+    column: u16,
+    row: u16,
+    mouse: MouseEvent,
+) -> bool {
+    let Some(bytes) = rt.encode_mouse_motion(mouse.kind, column, row, mouse.modifiers) else {
+        return false;
+    };
+    if let Err(err) = rt.try_send_bytes(Bytes::from(bytes)) {
+        warn!(pane = pane.raw(), err = %err, kind = ?mouse.kind, "failed to forward mouse motion event");
+    }
+    true
+}
+
+/// Forward a wheel event into a runtime according to its wheel routing
+/// (mouse-report or alternate-scroll). Returns false for host-scroll routing
+/// so the caller can scroll the host scrollback instead.
+fn forward_runtime_wheel(
+    rt: &crate::terminal::TerminalRuntime,
+    pane: crate::layout::PaneId,
+    column: u16,
+    row: u16,
+    mouse: MouseEvent,
+) -> bool {
+    match rt.wheel_routing() {
+        Some(crate::pane::WheelRouting::HostScroll) | None => false,
+        Some(crate::pane::WheelRouting::MouseReport) => {
+            rt.scroll_reset();
+            let Some(bytes) = rt.encode_mouse_wheel(mouse.kind, column, row, mouse.modifiers)
+            else {
+                warn!(pane = pane.raw(), kind = ?mouse.kind, "failed to encode mouse wheel event");
+                return true;
+            };
+            if let Err(err) = rt.try_send_bytes(Bytes::from(bytes)) {
+                warn!(pane = pane.raw(), err = %err, "failed to forward mouse wheel event");
+            }
+            true
+        }
+        Some(crate::pane::WheelRouting::AlternateScroll) => {
+            rt.scroll_reset();
+            let Some(bytes) = rt.encode_alternate_scroll(mouse.kind) else {
+                return true;
+            };
+            if let Err(err) = rt.try_send_bytes(Bytes::from(bytes)) {
+                warn!(pane = pane.raw(), err = %err, "failed to forward alternate-scroll key");
+            }
+            true
+        }
+    }
+}
+
 fn apply_scroll(scroll: &mut usize, delta: i16, max_scroll: usize) {
     if delta.is_negative() {
         *scroll = scroll.saturating_sub(delta.unsigned_abs() as usize);
@@ -1826,8 +1960,8 @@ mod tests {
     use ratatui::layout::{Direction, Rect};
 
     use super::super::{
-        app_for_mouse_test, capture_snapshot, handle_context_menu_key, mouse, numbered_lines_bytes,
-        root_layout_ratio,
+        app_for_mouse_test, app_with_visible_float, capture_snapshot, handle_context_menu_key,
+        mouse, numbered_lines_bytes, root_layout_ratio,
     };
     use super::*;
     use crate::{
@@ -3278,5 +3412,134 @@ mod tests {
         };
 
         assert_eq!(wheel_routing(input_state), WheelRouting::HostScroll);
+    }
+
+    /// The float's terminal id, for fetching its runtime out of the registry.
+    fn float_terminal_id(app: &crate::app::App) -> crate::terminal::TerminalId {
+        app.state
+            .floats
+            .values()
+            .next()
+            .expect("visible float registered")
+            .terminal_id
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn mouse_inside_float_rect_routes_to_float_and_outside_to_panes() {
+        let (mut app, mut pane_rx, mut float_rx, _) = app_with_visible_float();
+        let float_tid = float_terminal_id(&app);
+        // Both apps report mouse so byte routing is observable on both sides.
+        app.terminal_runtimes
+            .get(&float_tid)
+            .unwrap()
+            .test_process_pty_bytes(b"\x1b[?1002h\x1b[?1006h");
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        app.state.workspaces[0].tabs[0]
+            .runtimes
+            .get(&pane_id)
+            .unwrap()
+            .test_process_pty_bytes(b"\x1b[?1002h\x1b[?1006h");
+
+        let inner = crate::ui::float_overlay_inner_rect(app.state.view.terminal_area)
+            .expect("float inner rect");
+
+        // Click inside the float's screen: SGR-encoded against the overlay's
+        // inner rect, into the float runtime only.
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            inner.x + 2,
+            inner.y + 3,
+        ));
+        app.handle_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            inner.x + 2,
+            inner.y + 3,
+        ));
+        assert_eq!(
+            float_rx.try_recv().expect("float mouse down"),
+            Bytes::from_static(b"\x1b[<0;3;4M")
+        );
+        assert_eq!(
+            float_rx.try_recv().expect("float mouse up"),
+            Bytes::from_static(b"\x1b[<0;3;4m")
+        );
+        assert!(pane_rx.try_recv().is_err(), "pane saw nothing");
+
+        // Wheel inside the float follows the float app's mouse reporting.
+        app.handle_mouse(mouse(MouseEventKind::ScrollUp, inner.x + 2, inner.y + 3));
+        assert_eq!(
+            float_rx.try_recv().expect("float wheel"),
+            Bytes::from_static(b"\x1b[<64;3;4M")
+        );
+
+        // Click outside the overlay: the layout pane underneath still gets it.
+        let pane_inner = app.state.view.pane_infos[0].inner_rect;
+        let outer = crate::ui::float_overlay_rect(app.state.view.terminal_area).unwrap();
+        assert!(
+            pane_inner.x < outer.x,
+            "test layout must expose pane cells left of the overlay"
+        );
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            pane_inner.x,
+            pane_inner.y,
+        ));
+        assert_eq!(
+            pane_rx.try_recv().expect("pane mouse down"),
+            Bytes::from_static(b"\x1b[<0;1;1M")
+        );
+        assert!(float_rx.try_recv().is_err(), "float saw nothing");
+    }
+
+    #[tokio::test]
+    async fn float_border_clicks_are_swallowed_and_never_reach_the_pane_underneath() {
+        let (mut app, mut pane_rx, mut float_rx, _) = app_with_visible_float();
+        let outer = crate::ui::float_overlay_rect(app.state.view.terminal_area).unwrap();
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            outer.x,
+            outer.y,
+        ));
+
+        assert!(float_rx.try_recv().is_err(), "border click sends no bytes");
+        assert!(pane_rx.try_recv().is_err(), "pane underneath saw nothing");
+        assert!(
+            app.state.selection.is_none(),
+            "border click must not anchor a pane selection"
+        );
+    }
+
+    #[tokio::test]
+    async fn wheel_inside_float_scrolls_the_float_host_scrollback() {
+        let (mut app, _pane_rx, _float_rx, _) = app_with_visible_float();
+        let float_tid = float_terminal_id(&app);
+        // Swap in a float runtime with scrollback history (mouse reporting
+        // off, so the wheel falls back to host scroll).
+        let (float_rt, mut float_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                60,
+                12,
+                16 * 1024,
+                &numbered_lines_bytes(64),
+                4,
+            );
+        app.terminal_runtimes.insert(float_tid.clone(), float_rt);
+        app.state.mouse_scroll_lines = 5;
+
+        let inner = crate::ui::float_overlay_inner_rect(app.state.view.terminal_area).unwrap();
+        app.handle_mouse(mouse(MouseEventKind::ScrollUp, inner.x + 1, inner.y + 1));
+
+        let metrics = app
+            .terminal_runtimes
+            .get(&float_tid)
+            .and_then(crate::terminal::TerminalRuntime::scroll_metrics)
+            .expect("float scroll metrics");
+        assert_eq!(metrics.offset_from_bottom, 5);
+        assert!(
+            float_rx.try_recv().is_err(),
+            "host scroll forwards nothing to the float PTY"
+        );
     }
 }

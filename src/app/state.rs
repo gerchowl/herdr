@@ -1647,10 +1647,21 @@ impl AppState {
     ) -> bool {
         self.mode == Mode::Terminal
             && self
-                .active
-                .and_then(|idx| self.focused_runtime_in_workspace(terminal_runtimes, idx))
+                .terminal_input_runtime_from(terminal_runtimes)
                 .and_then(crate::terminal::TerminalRuntime::input_state)
                 .is_some_and(crate::pane::InputState::mouse_reporting_enabled)
+    }
+
+    /// The runtime that owns terminal-mode input for the active workspace:
+    /// the visible float when one is up, otherwise the focused layout pane.
+    pub(crate) fn terminal_input_runtime_from<'a>(
+        &'a self,
+        terminal_runtimes: &'a crate::terminal::TerminalRuntimeRegistry,
+    ) -> Option<&'a crate::terminal::TerminalRuntime> {
+        if let Some(float) = self.visible_float_for_active_workspace() {
+            return terminal_runtimes.get(&float.terminal_id);
+        }
+        self.focused_runtime_in_workspace(terminal_runtimes, self.active?)
     }
 
     pub(crate) fn should_capture_host_mouse_from(

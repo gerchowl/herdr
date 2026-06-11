@@ -25,7 +25,7 @@ use self::dialogs::{
     render_confirm_close_overlay, render_new_linked_worktree_overlay,
     render_open_existing_worktree_overlay, render_remove_worktree_overlay, render_rename_overlay,
 };
-pub(crate) use self::float::float_overlay_inner_rect;
+pub(crate) use self::float::{float_overlay_inner_rect, float_overlay_rect};
 use self::float::{render_float_overlay, resize_float_runtime};
 use self::keybind_help::render_keybind_help_overlay;
 use self::menus::{
