@@ -636,6 +636,10 @@ pub(super) fn apply_context_menu_action(
             state.request_remove_linked_worktree = Some(ws_idx);
             leave_modal(state);
         }
+        (ContextMenuKind::GitWorkspace { ws_idx, .. }, Some("Kill worktree & branch...")) => {
+            state.request_kill_worktree = Some(ws_idx);
+            leave_modal(state);
+        }
         (ContextMenuKind::GitWorkspace { ws_idx, .. }, Some("Open worktree...")) => {
             state.request_open_existing_worktree = Some(ws_idx);
             leave_modal(state);

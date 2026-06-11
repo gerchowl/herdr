@@ -24,7 +24,7 @@ use self::git::git_ahead_behind;
 pub use self::{
     git::{
         derive_label_from_cwd, git_branch, git_space_metadata, git_status_cache_key,
-        GitSpaceMetadata, GitStatusCacheEntry,
+        project_key_for_common_dir, GitSpaceMetadata, GitStatusCacheEntry,
     },
     tab::Tab,
 };
@@ -93,6 +93,8 @@ pub struct Workspace {
     pub(crate) cached_git_branch: Option<String>,
     /// Cached ahead/behind counts for the workspace repo's current branch upstream.
     pub(crate) cached_git_ahead_behind: Option<(usize, usize)>,
+    /// GitHub PR state for the current branch (background gh poller).
+    pub(crate) pr_state: Option<crate::worktree::PrStateInfo>,
     /// Cached derived Git repo metadata for worktree actions and status display.
     pub(crate) cached_git_space: Option<GitSpaceMetadata>,
     /// Explicit Herdr-managed worktree grouping provenance.
@@ -223,6 +225,7 @@ impl Workspace {
                 identity_cwd: initial_cwd.clone(),
                 cached_git_branch: git_branch(&initial_cwd),
                 cached_git_ahead_behind: None,
+                pr_state: None,
                 cached_git_space: None,
                 worktree_space: None,
                 public_pane_numbers,
@@ -615,6 +618,14 @@ impl Workspace {
         self.cached_git_branch.clone()
     }
 
+    pub fn ahead_behind(&self) -> Option<(usize, usize)> {
+        self.cached_git_ahead_behind
+    }
+
+    pub fn pr_state(&self) -> Option<crate::worktree::PrStateInfo> {
+        self.pr_state
+    }
+
     pub fn git_ahead_behind(&self) -> Option<(usize, usize)> {
         self.cached_git_ahead_behind
     }
@@ -623,8 +634,31 @@ impl Workspace {
         self.cached_git_space.as_ref()
     }
 
+    /// Identity of this workspace's repo family: the canonical git common
+    /// dir, shared by the main checkout and every linked worktree. Sourced
+    /// from worktree membership first, then live git metadata.
+    pub fn repo_group_key(&self) -> Option<&str> {
+        self.worktree_space
+            .as_ref()
+            .map(|space| space.key.as_str())
+            .or_else(|| {
+                self.cached_git_space
+                    .as_ref()
+                    .map(|space| space.key.as_str())
+            })
+    }
+
     pub fn worktree_space(&self) -> Option<&WorktreeSpaceMembership> {
         self.worktree_space.as_ref()
+    }
+
+    /// Machine-independent project identity (normalized origin URL or
+    /// "dir:<name>" fallback) used to fold checkouts of the same project
+    /// across federated peer servers. See [[peers]] config.
+    pub fn project_key(&self) -> Option<&str> {
+        self.cached_git_space
+            .as_ref()
+            .map(|space| space.project_key.as_str())
     }
 
     #[cfg(test)]
@@ -751,6 +785,7 @@ impl Workspace {
             identity_cwd: identity_cwd.clone(),
             cached_git_branch: git_branch(&identity_cwd),
             cached_git_ahead_behind: None,
+            pr_state: None,
             cached_git_space: None,
             worktree_space: None,
             public_pane_numbers,

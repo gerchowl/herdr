@@ -105,10 +105,18 @@ pub(super) fn keybind_help_groups(app: &AppState) -> Vec<HelpGroup> {
         help_entry(keybind_label(&kb.goto), "session navigator"),
         help_entry(keybind_label(&kb.new_workspace), "new workspace"),
         help_entry(keybind_label(&kb.new_worktree), "new worktree"),
+        help_entry(
+            keybind_label(&kb.branch_session),
+            "branch session into worktree",
+        ),
         help_entry(keybind_label(&kb.open_worktree), "open worktree"),
         help_entry(
             keybind_label(&kb.remove_worktree),
             "delete worktree checkout",
+        ),
+        help_entry(
+            keybind_label(&kb.kill_worktree),
+            "kill worktree & branch (PR-merged gate)",
         ),
         help_entry(keybind_label(&kb.rename_workspace), "rename workspace"),
         help_entry(keybind_label(&kb.close_workspace), "close workspace"),
@@ -117,6 +125,18 @@ pub(super) fn keybind_help_groups(app: &AppState) -> Vec<HelpGroup> {
         help_entry(indexed_label(&kb.switch_workspace), "switch workspace 1-9"),
         help_entry(keybind_label(&kb.previous_agent), "previous agent"),
         help_entry(keybind_label(&kb.next_agent), "next agent"),
+        help_entry(
+            keybind_label(&kb.focus_attention),
+            "focus agent needing attention",
+        ),
+        help_entry(
+            keybind_label(&kb.focus_attention_previous),
+            "attention queue backwards",
+        ),
+        help_entry(
+            keybind_label(&kb.focus_attention_project),
+            "attention within project (repo + worktrees)",
+        ),
         help_entry(indexed_label(&kb.focus_agent), "focus agent 1-9"),
         help_entry(keybind_label(&kb.new_tab), "new tab"),
         help_entry(keybind_label(&kb.rename_tab), "rename tab"),
@@ -135,6 +155,7 @@ pub(super) fn keybind_help_groups(app: &AppState) -> Vec<HelpGroup> {
         help_entry(keybind_label(&kb.edit_scrollback), "edit scrollback"),
         help_entry(keybind_label(&kb.copy_mode), "copy mode"),
         help_entry(keybind_label(&kb.zoom), "zoom pane"),
+        help_entry(keybind_label(&kb.toggle_float), "toggle floating pane"),
         help_entry(keybind_label(&kb.resize_mode), "resize mode"),
         help_entry(keybind_label(&kb.toggle_sidebar), "toggle sidebar"),
         help_entry(keybind_label(&kb.focus_pane_left), "focus pane left"),

@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Direction, Rect};
 use tracing::warn;
 
@@ -503,6 +503,28 @@ impl AppState {
                         return None;
                     }
 
+                    // Servers section: header toggles collapse, a peer row
+                    // switches to that peer's first workspace.
+                    let header = self.view.servers_header_rect;
+                    if header != ratatui::layout::Rect::default()
+                        && mouse.row == header.y
+                        && mouse.column >= header.x
+                        && mouse.column < header.x + header.width
+                    {
+                        self.servers_collapsed = !self.servers_collapsed;
+                        self.mark_session_dirty();
+                        return None;
+                    }
+                    if let Some(card) = self
+                        .view
+                        .server_card_areas
+                        .iter()
+                        .find(|card| mouse.row == card.rect.y)
+                    {
+                        self.request_peer_switch = Some((card.peer_idx, 0));
+                        return None;
+                    }
+
                     let cards = if self.view.workspace_card_areas.is_empty() {
                         crate::ui::compute_workspace_card_areas(self, self.view.sidebar_rect)
                     } else {
@@ -532,6 +554,17 @@ impl AppState {
                             start_col: mouse.column,
                             start_row: mouse.row,
                         });
+                        return None;
+                    }
+
+                    // Remote (federated peer) rows: request a server switch.
+                    if let Some(card) = self
+                        .view
+                        .remote_card_areas
+                        .iter()
+                        .find(|card| mouse.row == card.rect.y)
+                    {
+                        self.request_peer_switch = Some((card.peer_idx, card.ws_idx));
                         return None;
                     }
 
@@ -590,6 +623,22 @@ impl AppState {
                         col,
                         self.pane_scroll_metrics(terminal_runtimes, info.id),
                     ));
+                } else if let Some(info) = self.view.pane_infos.iter().find(|p| {
+                    p.header_rect.is_some_and(|h| {
+                        mouse.column >= h.x
+                            && mouse.column < h.x + h.width
+                            && mouse.row > h.y
+                            && mouse.row < h.y + h.height
+                    })
+                }) {
+                    // Click on the header prompt rows toggles the full-prompt view.
+                    let id = info.id;
+                    self.expanded_prompt_pane = if self.expanded_prompt_pane == Some(id) {
+                        None
+                    } else {
+                        Some(id)
+                    };
+                    self.focus_pane(id);
                 } else if let Some(info) = self.view.pane_infos.iter().find(|p| {
                     mouse.column >= p.rect.x
                         && mouse.column < p.rect.x + p.rect.width
@@ -1338,6 +1387,71 @@ impl AppState {
         }
     }
 
+    /// Page the focused pane's host scrollback (Shift+PageUp/Down). `dir` is
+    /// -1 for up (into history) / +1 for down (toward live). A page is the
+    /// pane's visible height minus one row of overlap. Returns false when
+    /// there is no focused pane to scroll.
+    pub(crate) fn scroll_focused_pane_page(
+        &self,
+        terminal_runtimes: &TerminalRuntimeRegistry,
+        dir: i8,
+    ) -> bool {
+        let Some((pane_id, page)) = self.focused_pane_scroll_page(terminal_runtimes) else {
+            return false;
+        };
+        if dir < 0 {
+            self.scroll_pane_up(terminal_runtimes, pane_id, page);
+        } else {
+            self.scroll_pane_down(terminal_runtimes, pane_id, page);
+        }
+        true
+    }
+
+    /// Jump the focused pane's host scrollback to the top of history
+    /// (Shift+Home) or back to the live bottom (Shift+End).
+    pub(crate) fn scroll_focused_pane_edge(
+        &self,
+        terminal_runtimes: &TerminalRuntimeRegistry,
+        to_top: bool,
+    ) -> bool {
+        let Some(pane_id) = self.focused_pane_id_for_scroll() else {
+            return false;
+        };
+        let offset = if to_top {
+            self.pane_scroll_metrics(terminal_runtimes, pane_id)
+                .map_or(0, |metrics| metrics.max_offset_from_bottom)
+        } else {
+            0
+        };
+        self.set_pane_scroll_offset(terminal_runtimes, pane_id, offset);
+        true
+    }
+
+    fn focused_pane_id_for_scroll(&self) -> Option<crate::layout::PaneId> {
+        self.workspaces
+            .get(self.active?)
+            .and_then(|ws| ws.focused_pane_id())
+    }
+
+    fn focused_pane_scroll_page(
+        &self,
+        terminal_runtimes: &TerminalRuntimeRegistry,
+    ) -> Option<(crate::layout::PaneId, usize)> {
+        let pane_id = self.focused_pane_id_for_scroll()?;
+        // Prefer the live viewport height; fall back to the laid-out pane rect.
+        let page = self
+            .pane_scroll_metrics(terminal_runtimes, pane_id)
+            .map(|metrics| metrics.viewport_rows)
+            .or_else(|| {
+                self.pane_info_by_id(pane_id)
+                    .map(|info| info.inner_rect.height as usize)
+            })
+            .unwrap_or(1)
+            .saturating_sub(1)
+            .max(1);
+        Some((pane_id, page))
+    }
+
     pub(crate) fn pane_scroll_metrics(
         &self,
         terminal_runtimes: &TerminalRuntimeRegistry,
@@ -1431,9 +1545,14 @@ impl AppState {
     ) {
         let lines_per_notch = self.mouse_scroll_lines;
 
+        // Shift+wheel is a deterministic escape hatch: always scroll herdr's
+        // own scrollback, even in alt-screen / mouse-reporting panes where a
+        // bare wheel is forwarded to the app.
+        let shift_held = mouse.modifiers.contains(KeyModifiers::SHIFT);
+
         if let Some(info) = self.pane_at(mouse.column, mouse.row).cloned() {
             self.focus_pane(info.id);
-            if self.forward_pane_wheel(terminal_runtimes, &info, mouse) {
+            if !shift_held && self.forward_pane_wheel(terminal_runtimes, &info, mouse) {
                 return;
             }
             match mouse.kind {
@@ -2165,6 +2284,7 @@ mod tests {
                 pane_id: target_pane,
                 agent: Some(Agent::Pi),
                 state: AgentState::Idle,
+                activity: None,
                 visible_blocker: false,
                 visible_idle: false,
                 visible_working: false,
@@ -2326,12 +2446,16 @@ mod tests {
         let mut app = app_for_mouse_test();
         app.state.mode = Mode::ConfirmRemoveWorktree;
         app.state.worktree_remove = Some(crate::app::state::WorktreeRemoveState {
+            managed: true,
             workspace_id: "issue".into(),
             repo_root: "/repo/herdr".into(),
             path: "/repo/herdr-issue".into(),
             error: None,
             removing: false,
             force_confirmation: false,
+            delete_branch: false,
+            branch: None,
+            merge_gate: None,
         });
         let popup = crate::ui::remove_worktree_popup_rect(app.state.screen_rect()).unwrap();
         let inner = Rect::new(
@@ -2354,12 +2478,16 @@ mod tests {
         let mut app = app_for_mouse_test();
         app.state.mode = Mode::ConfirmRemoveWorktree;
         app.state.worktree_remove = Some(crate::app::state::WorktreeRemoveState {
+            managed: true,
             workspace_id: "issue".into(),
             repo_root: "/repo/herdr".into(),
             path: "/repo/herdr-issue".into(),
             error: None,
             removing: false,
             force_confirmation: false,
+            delete_branch: false,
+            branch: None,
+            merge_gate: None,
         });
         let popup = crate::ui::remove_worktree_popup_rect(app.state.screen_rect()).unwrap();
         let inner = Rect::new(

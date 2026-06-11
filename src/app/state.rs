@@ -81,6 +81,8 @@ pub struct Palette {
     pub teal: Color,
     /// Interrupted / warning states.
     pub peach: Color,
+    /// Sidebar divider/separator lines. None falls back to `surface_dim`.
+    pub divider: Option<Color>,
 }
 
 impl Palette {
@@ -103,6 +105,7 @@ impl Palette {
             blue: Color::Rgb(137, 180, 250),
             teal: Color::Rgb(148, 226, 213),
             peach: Color::Rgb(250, 179, 135),
+            divider: None,
         }
     }
 
@@ -125,6 +128,7 @@ impl Palette {
             blue: Color::Rgb(30, 102, 245),
             teal: Color::Rgb(23, 146, 153),
             peach: Color::Rgb(254, 100, 11),
+            divider: None,
         }
     }
 
@@ -147,6 +151,7 @@ impl Palette {
             blue: Color::Blue,
             teal: Color::Cyan,
             peach: Color::Yellow,
+            divider: None,
         }
     }
 
@@ -169,6 +174,7 @@ impl Palette {
             blue: Color::Rgb(122, 162, 247),
             teal: Color::Rgb(125, 207, 255),
             peach: Color::Rgb(255, 158, 100),
+            divider: None,
         }
     }
 
@@ -191,6 +197,7 @@ impl Palette {
             blue: Color::Rgb(46, 125, 233),
             teal: Color::Rgb(17, 140, 116),
             peach: Color::Rgb(177, 92, 0),
+            divider: None,
         }
     }
 
@@ -213,6 +220,7 @@ impl Palette {
             blue: Color::Rgb(139, 233, 253), // cyan-ish
             teal: Color::Rgb(139, 233, 253),
             peach: Color::Rgb(255, 184, 108),
+            divider: None,
         }
     }
 
@@ -235,6 +243,7 @@ impl Palette {
             blue: Color::Rgb(129, 161, 193),
             teal: Color::Rgb(143, 188, 187),
             peach: Color::Rgb(208, 135, 112),
+            divider: None,
         }
     }
 
@@ -257,6 +266,7 @@ impl Palette {
             blue: Color::Rgb(131, 165, 152),
             teal: Color::Rgb(142, 192, 124),
             peach: Color::Rgb(254, 128, 25),
+            divider: None,
         }
     }
 
@@ -279,6 +289,7 @@ impl Palette {
             blue: Color::Rgb(7, 102, 120),
             teal: Color::Rgb(66, 123, 88),
             peach: Color::Rgb(175, 58, 3),
+            divider: None,
         }
     }
 
@@ -301,6 +312,7 @@ impl Palette {
             blue: Color::Rgb(97, 175, 239),
             teal: Color::Rgb(86, 182, 194),
             peach: Color::Rgb(209, 154, 102),
+            divider: None,
         }
     }
 
@@ -323,6 +335,7 @@ impl Palette {
             blue: Color::Rgb(64, 120, 242),
             teal: Color::Rgb(1, 132, 188),
             peach: Color::Rgb(152, 104, 1),
+            divider: None,
         }
     }
 
@@ -345,6 +358,7 @@ impl Palette {
             blue: Color::Rgb(38, 139, 210),
             teal: Color::Rgb(42, 161, 152),
             peach: Color::Rgb(203, 75, 22),
+            divider: None,
         }
     }
 
@@ -367,6 +381,7 @@ impl Palette {
             blue: Color::Rgb(38, 139, 210),
             teal: Color::Rgb(42, 161, 152),
             peach: Color::Rgb(203, 75, 22),
+            divider: None,
         }
     }
 
@@ -389,6 +404,7 @@ impl Palette {
             blue: Color::Rgb(126, 156, 216),
             teal: Color::Rgb(127, 180, 202),
             peach: Color::Rgb(255, 160, 102),
+            divider: None,
         }
     }
 
@@ -411,6 +427,7 @@ impl Palette {
             blue: Color::Rgb(77, 105, 155),
             teal: Color::Rgb(78, 140, 162),
             peach: Color::Rgb(204, 109, 0),
+            divider: None,
         }
     }
 
@@ -432,7 +449,8 @@ impl Palette {
             red: Color::Rgb(235, 111, 146),    // love
             blue: Color::Rgb(49, 116, 143),    // pine
             teal: Color::Rgb(156, 207, 216),   // foam
-            peach: Color::Rgb(234, 154, 151),  // rose
+            peach: Color::Rgb(234, 154, 151),
+            divider: None, // rose
         }
     }
 
@@ -455,6 +473,7 @@ impl Palette {
             blue: Color::Rgb(40, 105, 131),
             teal: Color::Rgb(86, 148, 159),
             peach: Color::Rgb(215, 130, 126),
+            divider: None,
         }
     }
 
@@ -477,6 +496,57 @@ impl Palette {
             blue: Color::Rgb(176, 176, 176),
             teal: Color::Rgb(102, 221, 204),
             peach: Color::Rgb(255, 199, 153),
+            divider: None,
+        }
+    }
+
+    /// Dalton Dark — colorblind-friendly dark palette (blue-yellow primary axis).
+    ///
+    /// Source: gerchowl/dalton-colorscheme (dalton-dark). Token semantics:
+    /// green = done/idle, yellow = working, red = blocked, peach = interrupted,
+    /// blue/teal = notification accents, mauve = branch labels.
+    pub fn dalton() -> Self {
+        Self {
+            accent: Color::Rgb(122, 162, 247),     // clear blue
+            panel_bg: Color::Rgb(40, 40, 40),      // black — raised panel
+            surface0: Color::Rgb(51, 51, 51),      // selection bg
+            surface1: Color::Rgb(60, 60, 60),      // ash — hover/active
+            surface_dim: Color::Rgb(40, 40, 40),   // separators
+            overlay0: Color::Rgb(154, 154, 154),   // cursor gray — muted text
+            overlay1: Color::Rgb(184, 184, 184),   // pale silver
+            text: Color::Rgb(200, 201, 204),       // dalton foreground
+            subtext0: Color::Rgb(184, 184, 184),   // dim labels
+            mauve: Color::Rgb(192, 112, 240),      // hot violet
+            green: Color::Rgb(136, 185, 125),      // soft lime
+            yellow: Color::Rgb(196, 196, 12),      // vivid gold
+            red: Color::Rgb(216, 80, 80),          // punch red
+            blue: Color::Rgb(122, 162, 247),       // clear blue
+            teal: Color::Rgb(102, 145, 167),       // slate blue
+            peach: Color::Rgb(240, 112, 104),      // hot cherry
+            divider: Some(Color::Rgb(60, 60, 60)), // ash hairline
+        }
+    }
+
+    /// Dalton Light — colorblind-friendly light palette (dalton-bright).
+    pub fn dalton_light() -> Self {
+        Self {
+            accent: Color::Rgb(48, 96, 200),          // deep blue
+            panel_bg: Color::Rgb(244, 241, 235),      // warm paper
+            surface0: Color::Rgb(208, 205, 197),      // selection bg
+            surface1: Color::Rgb(232, 229, 223),      // warm white — hover/active
+            surface_dim: Color::Rgb(232, 229, 223),   // separators
+            overlay0: Color::Rgb(112, 112, 122),      // slate gray — muted text
+            overlay1: Color::Rgb(90, 90, 90),         // cursor gray
+            text: Color::Rgb(46, 48, 56),             // dalton-bright foreground
+            subtext0: Color::Rgb(112, 112, 122),      // dim labels
+            mauve: Color::Rgb(120, 48, 168),          // deep violet
+            green: Color::Rgb(58, 117, 48),           // forest
+            yellow: Color::Rgb(122, 109, 0),          // dark gold
+            red: Color::Rgb(184, 48, 48),             // brick red
+            blue: Color::Rgb(48, 96, 200),            // deep blue
+            teal: Color::Rgb(42, 104, 128),           // dark slate
+            peach: Color::Rgb(200, 56, 56),           // bright brick — interrupted
+            divider: Some(Color::Rgb(208, 205, 197)), // selection-tone hairline
         }
     }
 
@@ -501,6 +571,8 @@ impl Palette {
             "rose-pine" | "rosepine" => Some(Self::rose_pine()),
             "rose-pine-dawn" | "rosepine-dawn" | "dawn" => Some(Self::rose_pine_dawn()),
             "vesper" => Some(Self::vesper()),
+            "dalton" | "dalton-dark" => Some(Self::dalton()),
+            "dalton-light" | "dalton-bright" => Some(Self::dalton_light()),
             _ => None,
         }
     }
@@ -556,7 +628,16 @@ impl Palette {
         if let Some(c) = &custom.peach {
             self.peach = parse_color(c);
         }
+        if let Some(c) = &custom.divider {
+            self.divider = Some(parse_color(c));
+        }
         self
+    }
+
+    /// Color for sidebar divider/separator lines. Falls back to `surface_dim`
+    /// when no explicit divider override is set.
+    pub fn divider_color(&self) -> Color {
+        self.divider.unwrap_or(self.surface_dim)
     }
 }
 
@@ -567,8 +648,34 @@ pub struct WorkspaceCardArea {
     pub indented: bool,
 }
 
+/// Hit area of a peer row in the `servers` section. Clicking one switches
+/// to that peer's first workspace; clicking the header toggles the section.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerCardArea {
+    /// Index into `state.peer_summaries`.
+    pub peer_idx: usize,
+    pub rect: Rect,
+}
+
+/// Hit area of a federated remote workspace row in the spaces list.
+/// Clicking one requests a server switch instead of a workspace focus.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteCardArea {
+    /// Index into `state.peer_summaries`.
+    pub peer_idx: usize,
+    /// Index into that peer's `workspaces` summary vec.
+    pub ws_idx: usize,
+    pub rect: Rect,
+    /// Indented rows fold under a project block; unindented rows lead a
+    /// remote-only project group and carry the project label.
+    pub indented: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeCreateState {
+    /// When set, the created workspace's root pane resumes a fork of this
+    /// agent session instead of starting a shell (branch-session flow).
+    pub branch_plan: Option<crate::agent_resume::AgentResumePlan>,
     pub source_workspace_id: String,
     pub source_checkout_path: std::path::PathBuf,
     pub source_existing_membership: Option<crate::workspace::WorktreeSpaceMembership>,
@@ -583,12 +690,20 @@ pub struct WorktreeCreateState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeRemoveState {
+    /// False when the checkout was adopted ad hoc (not a herdr-managed
+    /// membership): the workspace is closed by id after removal.
+    pub managed: bool,
     pub workspace_id: String,
     pub repo_root: std::path::PathBuf,
     pub path: std::path::PathBuf,
     pub error: Option<String>,
     pub removing: bool,
     pub force_confirmation: bool,
+    /// Kill flow: delete the local branch too once the merge gate passes.
+    pub delete_branch: bool,
+    pub branch: Option<String>,
+    /// None while the merge check is still running (kill flow only).
+    pub merge_gate: Option<crate::worktree::WorktreeMergeGate>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -722,7 +837,13 @@ pub struct ViewState {
     pub layout: ViewLayout,
     pub sidebar_rect: Rect,
     pub workspace_card_areas: Vec<WorkspaceCardArea>,
+    pub remote_card_areas: Vec<RemoteCardArea>,
+    /// Hit areas for peer rows in the `servers` section.
+    pub server_card_areas: Vec<ServerCardArea>,
+    /// Hit area for the `servers` section header (toggles collapse).
+    pub servers_header_rect: Rect,
     pub tab_bar_rect: Rect,
+    pub status_line_rect: Rect,
     pub tab_hit_areas: Vec<Rect>,
     pub tab_scroll_left_hit_area: Rect,
     pub tab_scroll_right_hit_area: Rect,
@@ -841,6 +962,7 @@ pub enum SettingsSection {
     Sound,
     Toast,
     PaneLabels,
+    Sidebar,
     Experiments,
     Integrations,
 }
@@ -851,6 +973,7 @@ impl SettingsSection {
         Self::Sound,
         Self::Toast,
         Self::PaneLabels,
+        Self::Sidebar,
         Self::Integrations,
         Self::Experiments,
     ];
@@ -861,6 +984,7 @@ impl SettingsSection {
             Self::Sound => "sound",
             Self::Toast => "toasts",
             Self::PaneLabels => "pane labels",
+            Self::Sidebar => "sidebar",
             Self::Experiments => "experiments",
             Self::Integrations => "integrations",
         }
@@ -895,6 +1019,47 @@ impl ExperimentSetting {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SidebarGapSetting {
+    RowGap,
+    PaneGap,
+}
+
+impl SidebarGapSetting {
+    pub(crate) const ALL: [Self; 2] = [Self::RowGap, Self::PaneGap];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::RowGap => "blank rows between sidebar entries",
+            Self::PaneGap => "blank columns around the pane divider",
+        }
+    }
+
+    pub(crate) fn value(self, state: &AppState) -> u16 {
+        match self {
+            Self::RowGap => state.sidebar_row_gap,
+            Self::PaneGap => state.sidebar_pane_gap,
+        }
+    }
+
+    pub(crate) fn max(self) -> u16 {
+        match self {
+            Self::RowGap => crate::config::MAX_SIDEBAR_ROW_GAP,
+            Self::PaneGap => crate::config::MAX_SIDEBAR_PANE_GAP,
+        }
+    }
+
+    /// Next value in the enter/click cycle, wrapping back to 0 past the max.
+    pub(crate) fn next_value(self, state: &AppState) -> u16 {
+        let current = self.value(state);
+        if current >= self.max() {
+            0
+        } else {
+            current + 1
+        }
+    }
+}
+
 /// All built-in theme names in display order.
 pub const THEME_NAMES: &[&str] = &[
     "catppuccin",
@@ -915,6 +1080,8 @@ pub const THEME_NAMES: &[&str] = &[
     "rose-pine",
     "rose-pine-dawn",
     "vesper",
+    "dalton",
+    "dalton-light",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1077,7 +1244,12 @@ impl ContextMenuState {
             ContextMenuKind::GitWorkspace {
                 is_linked_worktree: true,
                 ..
-            } => &["Rename", "Close", "Delete worktree checkout..."],
+            } => &[
+                "Rename",
+                "Close",
+                "Delete worktree checkout...",
+                "Kill worktree & branch...",
+            ],
             ContextMenuKind::GitWorkspace {
                 is_linked_worktree: false,
                 has_worktree_children: true,
@@ -1195,6 +1367,10 @@ pub struct AppState {
     /// Terminal ids whose size is currently owned by a direct attach client.
     pub direct_attach_resize_locks: std::collections::HashSet<crate::terminal::TerminalId>,
     pub(crate) pane_id_aliases: std::collections::HashMap<u32, PaneId>,
+    /// Per-workspace ephemeral floating panes, keyed by workspace id.
+    /// Floats live outside the workspace/tab/pane tree: never persisted,
+    /// never enumerated by pane walkers, reaped when their process exits.
+    pub floats: std::collections::HashMap<String, crate::app::float::FloatPane>,
     pub workspaces: Vec<Workspace>,
     pub active: Option<usize>,
     pub(crate) previous_pane_focus: Option<PaneFocusTarget>,
@@ -1209,6 +1385,30 @@ pub struct AppState {
     pub request_new_workspace: bool,
     pub request_new_tab: bool,
     pub request_new_linked_worktree: Option<usize>,
+    pub request_branch_session: Option<usize>,
+    pub request_kill_worktree: Option<usize>,
+    /// One-shot guard so the attention all-clear chime fires once per
+    /// empty-queue episode instead of on every keypress.
+    pub attention_all_clear_chimed: bool,
+    /// Chime due: consumed by the App/headless loops (the headless server
+    /// forwards it to the foreground client, which owns audio).
+    pub pending_attention_chime: bool,
+    /// Transient feedback for a rejected/era action (rendered verbatim,
+    /// auto-expires) — unlike config_diagnostic, which is for config problems.
+    pub action_notice: Option<String>,
+    /// Sidebar display aliases for agent labels ([ui] agent_aliases).
+    pub agent_aliases: std::collections::HashMap<String, String>,
+    /// Auto-adopt external linked worktrees into managed groups.
+    pub adopt_external_worktrees: bool,
+    /// Configured federated peer servers ([[peers]]), config-owned.
+    pub peers: Vec<crate::config::PeerConfig>,
+    /// Latest polled summary per configured peer (sidebar remote rows).
+    pub peer_summaries: Vec<crate::peers::PeerSummaryState>,
+    /// A remote row was selected: switch the client to this peer workspace.
+    /// (peer_idx, ws_idx) into peer_summaries. Consumed by both loops.
+    pub request_peer_switch: Option<(usize, usize)>,
+    /// Whether the `servers` sidebar section is collapsed to its header.
+    pub servers_collapsed: bool,
     pub request_open_existing_worktree: Option<usize>,
     pub request_new_workspace_cwd: Option<std::path::PathBuf>,
     pub request_remove_linked_worktree: Option<usize>,
@@ -1270,6 +1470,24 @@ pub struct AppState {
     pub sidebar_min_width: u16,
     pub sidebar_max_width: u16,
     pub mobile_width_threshold: u16,
+    /// Blank rows between sidebar list entries (workspaces and agents).
+    pub sidebar_row_gap: u16,
+    /// Blank columns on each side of the sidebar/pane divider.
+    pub sidebar_pane_gap: u16,
+    /// Max height of the prompt section in the pane header. 0 = context only.
+    pub prompt_float_lines: u16,
+    /// Auto-collapse every sidebar worktree group except the focused one.
+    pub auto_collapse_groups: bool,
+    /// What `new_tab` creates: a tab, or a sibling workspace (spike #25).
+    pub tab_mode: crate::config::TabModeConfig,
+    /// Reserve the agent pane header strip.
+    pub pane_header: bool,
+    /// Show the global machine status line.
+    pub status_line: bool,
+    /// Latest sampler snapshot for the status line.
+    pub system_stats: Option<crate::system_stats::SystemStats>,
+    /// Pane whose header prompt is click-expanded to the full text.
+    pub expanded_prompt_pane: Option<PaneId>,
     pub sidebar_width_source: SidebarWidthSource,
     pub sidebar_width_auto: bool,
     pub sidebar_collapsed: bool,
@@ -1342,10 +1560,31 @@ impl AppState {
 
     pub(crate) fn remove_alias_shadowed_by_new_pane(&mut self, pane_id: PaneId) {
         self.pane_id_aliases.remove(&pane_id.raw());
+        // Lazy GC: drop aliases whose target pane no longer exists. Runs on
+        // pane creation, so the map stays bounded by live panes plus their
+        // historical env ids.
+        let live: std::collections::HashSet<u32> = self
+            .workspaces
+            .iter()
+            .flat_map(|ws| ws.tabs.iter())
+            .flat_map(|tab| tab.layout.pane_ids())
+            .map(|pane| pane.raw())
+            .collect();
+        self.pane_id_aliases
+            .retain(|_, target| live.contains(&target.raw()));
     }
 
     pub fn sound_enabled(&self) -> bool {
         self.sound.enabled
+    }
+
+    /// Sidebar display alias for an agent label: config override first,
+    /// then the built-in short code, then the label unchanged.
+    pub(crate) fn agent_alias<'a>(&'a self, label: &'a str) -> &'a str {
+        self.agent_aliases
+            .get(label)
+            .map(String::as_str)
+            .unwrap_or_else(|| crate::detect::short_agent_label(label))
     }
 
     pub fn toast_delivery(&self) -> ToastDelivery {
@@ -1516,6 +1755,7 @@ impl AppState {
             terminals: std::collections::HashMap::new(),
             direct_attach_resize_locks: std::collections::HashSet::new(),
             pane_id_aliases: std::collections::HashMap::new(),
+            floats: std::collections::HashMap::new(),
             workspaces: Vec::new(),
             active: None,
             previous_pane_focus: None,
@@ -1527,6 +1767,17 @@ impl AppState {
             request_new_workspace: false,
             request_new_tab: false,
             request_new_linked_worktree: None,
+            request_branch_session: None,
+            request_kill_worktree: None,
+            attention_all_clear_chimed: false,
+            pending_attention_chime: false,
+            action_notice: None,
+            agent_aliases: std::collections::HashMap::new(),
+            adopt_external_worktrees: true,
+            peers: Vec::new(),
+            peer_summaries: Vec::new(),
+            request_peer_switch: None,
+            servers_collapsed: false,
             request_open_existing_worktree: None,
             request_new_workspace_cwd: None,
             request_remove_linked_worktree: None,
@@ -1561,7 +1812,11 @@ impl AppState {
                 layout: ViewLayout::Desktop,
                 sidebar_rect: Rect::default(),
                 workspace_card_areas: Vec::new(),
+                remote_card_areas: Vec::new(),
+                server_card_areas: Vec::new(),
+                servers_header_rect: Rect::default(),
                 tab_bar_rect: Rect::default(),
+                status_line_rect: Rect::default(),
                 tab_hit_areas: Vec::new(),
                 tab_scroll_left_hit_area: Rect::default(),
                 tab_scroll_right_hit_area: Rect::default(),
@@ -1594,6 +1849,15 @@ impl AppState {
             sidebar_min_width: 18,
             sidebar_max_width: 36,
             mobile_width_threshold: crate::config::DEFAULT_MOBILE_WIDTH_THRESHOLD,
+            sidebar_row_gap: crate::config::DEFAULT_SIDEBAR_ROW_GAP,
+            sidebar_pane_gap: crate::config::DEFAULT_SIDEBAR_PANE_GAP,
+            prompt_float_lines: crate::config::DEFAULT_PROMPT_FLOAT_LINES,
+            auto_collapse_groups: false,
+            tab_mode: crate::config::TabModeConfig::Tabs,
+            pane_header: true,
+            status_line: true,
+            system_stats: None,
+            expanded_prompt_pane: None,
             sidebar_width_source: SidebarWidthSource::ConfigDefault,
             sidebar_width_auto: false,
             sidebar_collapsed: false,
@@ -1684,6 +1948,21 @@ mod tests {
     use crossterm::event::KeyEvent;
 
     #[test]
+    fn divider_color_falls_back_to_surface_dim_and_honors_override() {
+        let palette = Palette::catppuccin();
+        assert_eq!(palette.divider_color(), palette.surface_dim);
+
+        let custom = crate::config::CustomThemeColors {
+            divider: Some("#3c3c3c".into()),
+            ..Default::default()
+        };
+        let palette = Palette::catppuccin().with_overrides(&custom);
+        assert_eq!(palette.divider_color(), Color::Rgb(0x3c, 0x3c, 0x3c));
+        // Other tokens untouched.
+        assert_eq!(palette.surface_dim, Palette::catppuccin().surface_dim);
+    }
+
+    #[test]
     fn built_in_theme_names_resolve() {
         for name in THEME_NAMES {
             assert!(
@@ -1746,7 +2025,12 @@ mod tests {
 
         assert_eq!(
             menu.items(),
-            &["Rename", "Close", "Delete worktree checkout..."]
+            &[
+                "Rename",
+                "Close",
+                "Delete worktree checkout...",
+                "Kill worktree & branch...",
+            ]
         );
     }
 

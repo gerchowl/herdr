@@ -136,6 +136,7 @@ fn handle_connection(
     running: &Arc<AtomicBool>,
     capabilities: Option<ServerCapabilities>,
 ) -> std::io::Result<()> {
+    let peer_pid = socket_peer_pid(&stream);
     if let Err(err) = stream.set_write_timeout(Some(STREAM_WRITE_TIMEOUT)) {
         debug!(err = %err, "api connection write timeout unavailable");
     }
@@ -181,8 +182,6 @@ fn handle_connection(
                 event_hub,
                 running,
             );
-            // Subscriptions are long-lived; their roundtrip duration reflects
-            // stream lifetime, not request latency, so skip the slow-path log.
             match &result {
                 Ok(()) => crate::logging::api_request_completed(
                     &request_id,
@@ -206,8 +205,6 @@ fn handle_connection(
                     "client_disconnected",
                     changes_ui,
                 );
-                // PaneWaitForOutput latency is dominated by client-controlled
-                // timeouts (api.wait.*), so duration here would be misleading.
                 return Ok(());
             };
             let result = write_text_line_allow_disconnect(&mut stream, &response);
@@ -233,6 +230,7 @@ fn handle_connection(
                 },
                 api_tx,
                 capabilities,
+                peer_pid,
             );
             let result = write_text_line_allow_disconnect(&mut stream, &response);
             let outcome = match &result {
@@ -257,10 +255,58 @@ fn handle_connection(
     }
 }
 
+/// PID of the process at the other end of the unix socket. macOS exposes it
+/// via LOCAL_PEERPID; Linux via SO_PEERCRED. None when unavailable.
+fn socket_peer_pid(stream: &UnixStream) -> Option<u32> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd;
+        let mut pid: libc::pid_t = 0;
+        let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+        // SOL_LOCAL = 0, LOCAL_PEERPID = 2 (sys/un.h)
+        let rc = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                0,
+                2,
+                &mut pid as *mut _ as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        return (rc == 0 && pid > 0).then_some(pid as u32);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let mut cred = libc::ucred {
+            pid: 0,
+            uid: 0,
+            gid: 0,
+        };
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        let rc = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                &mut cred as *mut _ as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        return (rc == 0 && cred.pid > 0).then_some(cred.pid as u32);
+    }
+    #[allow(unreachable_code)]
+    {
+        let _ = stream;
+        None
+    }
+}
+
 fn handle_request(
     request: Request,
     api_tx: &ApiRequestSender,
     capabilities: Option<ServerCapabilities>,
+    peer_pid: Option<u32>,
 ) -> String {
     match request.method {
         Method::Ping(_) => serde_json::to_string(&SuccessResponse {
@@ -275,7 +321,7 @@ fn handle_request(
             r#"{"id":"","error":{"code":"internal_error","message":"failed to encode response"}}"#
                 .to_string()
         }),
-        _ => dispatch_to_app(request, api_tx),
+        _ => dispatch_to_app(request, api_tx, peer_pid),
     }
 }
 
@@ -471,20 +517,22 @@ fn is_connection_closed_error(err: &std::io::Error) -> bool {
     )
 }
 
-fn dispatch_to_app(request: Request, api_tx: &ApiRequestSender) -> String {
-    dispatch_to_app_with_timeout(request, api_tx, None)
+fn dispatch_to_app(request: Request, api_tx: &ApiRequestSender, peer_pid: Option<u32>) -> String {
+    dispatch_to_app_with_timeout(request, api_tx, None, peer_pid)
 }
 
 pub(super) fn dispatch_to_app_with_timeout(
     request: Request,
     api_tx: &ApiRequestSender,
     timeout: Option<Duration>,
+    peer_pid: Option<u32>,
 ) -> String {
     let request_id = request.id.clone();
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     if let Err(err) = api_tx.send(ApiRequestMessage {
         request,
         respond_to,
+        peer_pid,
     }) {
         return error_response_json(
             request_id,
@@ -655,6 +703,7 @@ mod tests {
             },
             &tx,
             Some(ServerCapabilities { live_handoff: true }),
+            None,
         );
 
         let parsed: SuccessResponse = serde_json::from_str(&response).unwrap();
@@ -671,7 +720,8 @@ mod tests {
         };
 
         let request_for_thread = request.clone();
-        let thread = std::thread::spawn(move || handle_request(request_for_thread, &tx, None));
+        let thread =
+            std::thread::spawn(move || handle_request(request_for_thread, &tx, None, None));
 
         let msg = rx.blocking_recv().unwrap();
         assert_eq!(msg.request.id, "req_2");
