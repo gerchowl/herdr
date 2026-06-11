@@ -242,6 +242,12 @@ impl PaneTerminal {
         self.ghostty.apply_host_terminal_theme(theme);
     }
 
+    /// Host terminal theme last written into this pane's emulator.
+    #[cfg(test)]
+    pub fn test_host_terminal_theme(&self) -> crate::terminal_theme::TerminalTheme {
+        self.ghostty.test_host_terminal_theme()
+    }
+
     pub fn has_transient_default_color_override(&self) -> bool {
         self.ghostty.has_transient_default_color_override()
     }
@@ -361,6 +367,15 @@ impl GhosttyPaneTerminal {
             core.child_default_background_changed = false;
             write_host_terminal_theme(&mut core.terminal, theme);
         }
+    }
+
+    /// Host terminal theme last written into this pane's emulator.
+    #[cfg(test)]
+    pub fn test_host_terminal_theme(&self) -> crate::terminal_theme::TerminalTheme {
+        self.core
+            .lock()
+            .map(|core| core.host_terminal_theme)
+            .unwrap_or_default()
     }
 
     pub fn has_transient_default_color_override(&self) -> bool {

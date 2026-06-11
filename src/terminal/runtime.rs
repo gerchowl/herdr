@@ -198,6 +198,12 @@ impl TerminalRuntime {
         self.0.apply_host_terminal_theme(theme);
     }
 
+    /// Host terminal theme last written into this pane's emulator.
+    #[cfg(test)]
+    pub fn test_host_terminal_theme(&self) -> crate::terminal_theme::TerminalTheme {
+        self.0.test_host_terminal_theme()
+    }
+
     pub fn begin_graceful_release(&self, agent: crate::detect::Agent) {
         self.0.begin_graceful_release(agent);
     }

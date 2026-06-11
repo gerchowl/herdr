@@ -61,6 +61,9 @@ pub(crate) enum ServerEvent {
         /// Fleet snapshot carried in the client's Hello (hub-and-spoke
         /// down-gossip); `None` for locally-attached clients.
         fleet: Option<protocol::FleetSnapshot>,
+        /// Host terminal theme captured by the client before the handshake;
+        /// `None` when the client could not capture one.
+        host_theme: Option<crate::terminal_theme::TerminalTheme>,
         writer: ClientWriter,
     },
     /// A client sent an input message.
@@ -172,6 +175,7 @@ pub(crate) fn handle_client_handshake(
         keybindings,
         direct_attach_requested,
         fleet,
+        host_theme,
     ) = match hello {
         ClientMessage::Hello {
             version,
@@ -183,6 +187,7 @@ pub(crate) fn handle_client_handshake(
             keybindings,
             launch_mode,
             fleet,
+            host_theme,
         } => {
             // Version check.
             match protocol::check_client_version(version) {
@@ -223,6 +228,7 @@ pub(crate) fn handle_client_handshake(
                 keybindings,
                 launch_mode == ClientLaunchMode::TerminalAttach,
                 fleet,
+                host_theme,
             )
         }
         _ => {
@@ -268,6 +274,7 @@ pub(crate) fn handle_client_handshake(
         keybindings,
         direct_attach_requested,
         fleet,
+        host_theme,
         writer,
     });
 
@@ -596,6 +603,7 @@ new_tab = "ctrl+notakey"
                 keybindings: ClientKeybindings::Server,
                 launch_mode: ClientLaunchMode::App,
                 fleet: None,
+                host_theme: None,
             },
         )
         .expect("write hello");
@@ -629,6 +637,7 @@ new_tab = "ctrl+notakey"
                 keybindings,
                 direct_attach_requested,
                 fleet,
+                host_theme,
                 writer,
             } => {
                 assert_eq!(client_id, 42);
@@ -638,6 +647,7 @@ new_tab = "ctrl+notakey"
                 assert!(keybindings.is_none());
                 assert!(!direct_attach_requested);
                 assert!(fleet.is_none());
+                assert!(host_theme.is_none());
                 drop(writer);
             }
             other => panic!("expected ClientConnected, got {other:?}"),
@@ -673,6 +683,7 @@ new_tab = "ctrl+notakey"
                 keybindings: ClientKeybindings::Server,
                 launch_mode: ClientLaunchMode::TerminalAttach,
                 fleet: None,
+                host_theme: None,
             },
         )
         .expect("write hello");
@@ -702,6 +713,73 @@ new_tab = "ctrl+notakey"
                 ..
             } => {
                 assert!(direct_attach_requested);
+                drop(writer);
+            }
+            other => panic!("expected ClientConnected, got {other:?}"),
+        }
+
+        drop(client_stream);
+        should_quit.store(true, Ordering::Release);
+        handle
+            .join()
+            .expect("handshake thread join")
+            .expect("handshake thread result");
+    }
+
+    #[test]
+    fn handshake_carries_host_theme_into_client_connected() {
+        let (mut client_stream, server_stream) = UnixStream::pair().expect("socket pair");
+        let (server_event_tx, mut server_event_rx) = mpsc::channel(4);
+        let should_quit = Arc::new(AtomicBool::new(false));
+        let handshake_quit = should_quit.clone();
+        let handle = std::thread::spawn(move || {
+            handle_client_handshake(server_stream, 42, &server_event_tx, &handshake_quit)
+        });
+
+        let theme = crate::terminal_theme::TerminalTheme {
+            foreground: Some(crate::terminal_theme::RgbColor {
+                r: 0xcc,
+                g: 0xcc,
+                b: 0xcc,
+            }),
+            background: Some(crate::terminal_theme::RgbColor {
+                r: 0x1e,
+                g: 0x1e,
+                b: 0x2e,
+            }),
+        };
+        protocol::write_message(
+            &mut client_stream,
+            &ClientMessage::Hello {
+                version: PROTOCOL_VERSION,
+                cols: 100,
+                rows: 30,
+                cell_width_px: 8,
+                cell_height_px: 16,
+                requested_encoding: RenderEncoding::TerminalAnsi,
+                keybindings: ClientKeybindings::Server,
+                launch_mode: ClientLaunchMode::App,
+                fleet: None,
+                host_theme: Some(theme),
+            },
+        )
+        .expect("write hello");
+
+        let welcome: ServerMessage =
+            protocol::read_message(&mut client_stream, MAX_FRAME_SIZE).expect("read welcome");
+        match welcome {
+            ServerMessage::Welcome { error, .. } => assert_eq!(error, None),
+            other => panic!("expected Welcome, got {other:?}"),
+        }
+
+        match server_event_rx
+            .blocking_recv()
+            .expect("client connected event")
+        {
+            ServerEvent::ClientConnected {
+                host_theme, writer, ..
+            } => {
+                assert_eq!(host_theme, Some(theme));
                 drop(writer);
             }
             other => panic!("expected ClientConnected, got {other:?}"),

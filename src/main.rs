@@ -353,6 +353,13 @@ enum AttachLeg {
 /// switch. A leg's client records its switch target (a federated peer's SSH
 /// destination, from a sidebar remote row) in the switch file; each recorded
 /// target chains into a fresh `--remote` leg.
+///
+/// Every leg — local in-process and remote via the spawned `herdr client`
+/// subprocess — funnels into `client::run_client_with_mode`, which retries
+/// attaches refused with the live-handoff notice (#38) and re-captures the
+/// host terminal theme per leg for the attach handshake (#47). A SwitchServer
+/// relaunch racing a handoff therefore waits inside the leg instead of
+/// bailing here.
 fn run_attach_legs(first: AttachLeg) -> io::Result<()> {
     let switch_file = std::env::temp_dir().join(format!("herdr-switch-{}", std::process::id()));
     // Inherited by the (possibly nested) client process of every leg.

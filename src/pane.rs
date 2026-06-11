@@ -1117,6 +1117,12 @@ impl PaneRuntime {
         self.terminal.apply_host_terminal_theme(theme);
     }
 
+    /// Host terminal theme last written into this pane's emulator.
+    #[cfg(test)]
+    pub fn test_host_terminal_theme(&self) -> crate::terminal_theme::TerminalTheme {
+        self.terminal.test_host_terminal_theme()
+    }
+
     pub fn spawn(
         pane_id: PaneId,
         rows: u16,

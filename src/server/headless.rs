@@ -1757,9 +1757,7 @@ impl HeadlessServer {
             self.send_to_client(
                 client_id,
                 ServerMessage::ServerShutdown {
-                    reason: Some(
-                        "live update in progress; reconnect after handoff completes".to_owned(),
-                    ),
+                    reason: Some(crate::protocol::LIVE_HANDOFF_ATTACH_NOTICE.to_owned()),
                 },
             );
             if let Some(client) = self.clients.get_mut(&client_id) {
@@ -1865,14 +1863,12 @@ impl HeadlessServer {
                 render_encoding,
                 direct_attach_requested,
                 fleet,
+                host_theme,
             } => {
                 if self.handoff_in_progress {
                     if let Ok(message) =
                         Self::frame_server_message(&ServerMessage::ServerShutdown {
-                            reason: Some(
-                                "live update in progress; reconnect after handoff completes"
-                                    .to_owned(),
-                            ),
+                            reason: Some(crate::protocol::LIVE_HANDOFF_ATTACH_NOTICE.to_owned()),
                         })
                     {
                         let _ = writer.control.send(message);
@@ -1890,6 +1886,7 @@ impl HeadlessServer {
                     "client connected"
                 );
                 let last_activity = self.allocate_activity_stamp();
+                let host_theme = host_theme.unwrap_or_default();
                 self.clients.insert(
                     client_id,
                     ClientConnection::new_with_mode(
@@ -1900,7 +1897,7 @@ impl HeadlessServer {
                             width_px: cell_width_px,
                             height_px: cell_height_px,
                         },
-                        crate::terminal_theme::TerminalTheme::default(),
+                        host_theme,
                         None,
                         last_activity,
                         render_encoding,
@@ -1916,6 +1913,12 @@ impl HeadlessServer {
                     // attaches, so no stale home row survives.
                     self.app.state.fleet_snapshot =
                         fleet.map(crate::peers::FleetSnapshotState::from_wire);
+                    // Adopt the theme the attaching client captured from its
+                    // host terminal (#47): new panes spawn with it, and the
+                    // OSC 10/11 default-color updates are pushed into every
+                    // existing pane runtime so running panes repaint.
+                    // Last attach wins; an empty/absent theme changes nothing.
+                    self.app.set_host_terminal_theme(host_theme);
                 }
                 if first_app_client {
                     self.app.mark_git_status_refresh_due(Instant::now());
@@ -3634,6 +3637,7 @@ mod tests {
             keybindings: None,
             direct_attach_requested: false,
             fleet: Some(fleet),
+            host_theme: None,
             writer: writer_a,
         }));
         let snapshot = server
@@ -3657,6 +3661,7 @@ mod tests {
             keybindings: None,
             direct_attach_requested: false,
             fleet: None,
+            host_theme: None,
             writer: writer_b,
         }));
         assert!(server.app.state.fleet_snapshot.is_none());
@@ -3682,11 +3687,120 @@ mod tests {
             keybindings: None,
             direct_attach_requested: true,
             fleet: None,
+            host_theme: None,
             writer: writer_a,
         }));
         assert!(
             server.app.state.fleet_snapshot.is_some(),
             "direct terminal attaches are not app legs and must not clear the snapshot"
+        );
+    }
+
+    fn sample_host_theme() -> crate::terminal_theme::TerminalTheme {
+        crate::terminal_theme::TerminalTheme {
+            foreground: Some(crate::terminal_theme::RgbColor {
+                r: 0xcc,
+                g: 0xcc,
+                b: 0xcc,
+            }),
+            background: Some(crate::terminal_theme::RgbColor {
+                r: 0x1e,
+                g: 0x1e,
+                b: 0x2e,
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn app_client_attach_adopts_carried_host_theme_for_new_and_existing_panes() {
+        let mut server = test_headless_server();
+        let (writer, _control, _render) = test_client_writer();
+
+        // A pane that was spawned before the client attached (e.g. a spoke
+        // restoring its session headlessly) — it must receive the OSC 10/11
+        // default-color update when the theme arrives with the attach.
+        let terminal_id = crate::terminal::TerminalId::alloc();
+        let (runtime, _rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        server
+            .app
+            .terminal_runtimes
+            .insert(terminal_id.clone(), runtime);
+
+        let theme = sample_host_theme();
+        assert!(server.handle_server_event(ServerEvent::ClientConnected {
+            client_id: 1,
+            cols: 80,
+            rows: 24,
+            cell_width_px: 0,
+            cell_height_px: 0,
+            render_encoding: RenderEncoding::TerminalAnsi,
+            keybindings: None,
+            direct_attach_requested: false,
+            fleet: None,
+            host_theme: Some(theme),
+            writer,
+        }));
+
+        // New panes spawn with the adopted theme...
+        assert_eq!(server.app.state.host_terminal_theme, theme);
+        // ...and the existing pane runtime received the default-color push.
+        let runtime = server
+            .app
+            .terminal_runtimes
+            .get(&terminal_id)
+            .expect("existing runtime");
+        assert_eq!(runtime.test_host_terminal_theme(), theme);
+    }
+
+    #[test]
+    fn app_client_attach_without_theme_keeps_existing_host_theme() {
+        let mut server = test_headless_server();
+        let (writer, _control, _render) = test_client_writer();
+        let existing = sample_host_theme();
+        server.app.state.host_terminal_theme = existing;
+
+        assert!(server.handle_server_event(ServerEvent::ClientConnected {
+            client_id: 1,
+            cols: 80,
+            rows: 24,
+            cell_width_px: 0,
+            cell_height_px: 0,
+            render_encoding: RenderEncoding::SemanticFrame,
+            keybindings: None,
+            direct_attach_requested: false,
+            fleet: None,
+            host_theme: None,
+            writer,
+        }));
+
+        assert_eq!(
+            server.app.state.host_terminal_theme, existing,
+            "a theme-less client must not clear the adopted theme"
+        );
+    }
+
+    #[test]
+    fn terminal_attach_client_never_adopts_host_theme() {
+        let mut server = test_headless_server();
+        let (writer, _control, _render) = test_client_writer();
+
+        assert!(server.handle_server_event(ServerEvent::ClientConnected {
+            client_id: 7,
+            cols: 80,
+            rows: 24,
+            cell_width_px: 0,
+            cell_height_px: 0,
+            render_encoding: RenderEncoding::TerminalAnsi,
+            keybindings: None,
+            direct_attach_requested: true,
+            fleet: None,
+            host_theme: Some(sample_host_theme()),
+            writer,
+        }));
+
+        assert!(
+            server.app.state.host_terminal_theme.is_empty(),
+            "direct terminal attaches are not app legs and must not adopt a theme"
         );
     }
 
@@ -3715,6 +3829,7 @@ new_tab = "prefix+t"
             keybindings: Some(Box::new(local_keybindings)),
             direct_attach_requested: false,
             fleet: None,
+            host_theme: None,
             writer: writer_a,
         }));
         assert_eq!(
@@ -3740,6 +3855,7 @@ new_tab = "prefix+t"
             keybindings: None,
             direct_attach_requested: false,
             fleet: None,
+            host_theme: None,
             writer: writer_b,
         }));
         assert_eq!(
@@ -3781,6 +3897,7 @@ new_tab = "prefix+t"
             keybindings: Some(Box::new(local_keybindings)),
             direct_attach_requested: false,
             fleet: None,
+            host_theme: None,
             writer: writer_a,
         }));
         assert_eq!(server.app.state.config_diagnostic, without_keybindings);
@@ -3795,6 +3912,7 @@ new_tab = "prefix+t"
             keybindings: None,
             direct_attach_requested: false,
             fleet: None,
+            host_theme: None,
             writer: writer_b,
         }));
         assert_eq!(
@@ -3839,6 +3957,7 @@ next_tab = ""
             keybindings: Some(Box::new(local_keybindings)),
             direct_attach_requested: false,
             fleet: None,
+            host_theme: None,
             writer,
         }));
         server.app.state.mode = crate::app::Mode::Settings;
@@ -3914,6 +4033,7 @@ next_tab = ""
             keybindings: Some(Box::new(local_config.live_keybinds().unwrap())),
             direct_attach_requested: false,
             fleet: None,
+            host_theme: None,
             writer: writer_a,
         }));
         server.app.state.mode = crate::app::Mode::Settings;
@@ -3935,6 +4055,7 @@ next_tab = ""
             keybindings: None,
             direct_attach_requested: false,
             fleet: None,
+            host_theme: None,
             writer: writer_b,
         }));
         assert_eq!(
@@ -3969,6 +4090,7 @@ next_tab = ""
             keybindings: None,
             direct_attach_requested: true,
             fleet: None,
+            host_theme: None,
             writer,
         }));
         assert!(server.clients.contains_key(&7));
@@ -4009,6 +4131,7 @@ next_tab = ""
             keybindings: None,
             direct_attach_requested: false,
             fleet: None,
+            host_theme: None,
             writer,
         }));
 
@@ -4044,6 +4167,7 @@ next_tab = ""
             keybindings: None,
             direct_attach_requested: true,
             fleet: None,
+            host_theme: None,
             writer,
         }));
 
@@ -4078,6 +4202,7 @@ next_tab = ""
             keybindings: None,
             direct_attach_requested: false,
             fleet: None,
+            host_theme: None,
             writer,
         }));
         assert!(server.has_app_client());
@@ -4124,6 +4249,7 @@ next_tab = ""
             keybindings: None,
             direct_attach_requested: true,
             fleet: None,
+            host_theme: None,
             writer,
         }));
         assert!(
@@ -5421,6 +5547,7 @@ next_tab = ""
             keybindings: None,
             direct_attach_requested: true,
             fleet: None,
+            host_theme: None,
             writer,
         }));
         assert!(

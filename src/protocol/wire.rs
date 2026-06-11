@@ -17,7 +17,19 @@ use serde::{Deserialize, Serialize};
 /// v14: `Hello` and `SwitchServer` carry an optional client-side fleet
 /// snapshot (hub-and-spoke down-gossip). Bincode is positional with no
 /// unknown-field tolerance, so the additive fields require a deliberate bump.
-pub const PROTOCOL_VERSION: u32 = 14;
+///
+/// v15: `Hello` carries the attaching client's captured host terminal theme
+/// (`host_theme`) so remote/spoke servers adopt the client's default colors
+/// at attach time. Additive field on a positional wire — deliberate bump
+/// (single-owner fleet, all peers deploy in lockstep).
+pub const PROTOCOL_VERSION: u32 = 15;
+
+/// Refusal notice sent to clients while a live update handoff is in
+/// progress. Clients recognize this exact string (in a rejection `Welcome`
+/// error or a `ServerShutdown` reason) and retry the attach with backoff
+/// instead of bailing to the shell.
+pub const LIVE_HANDOFF_ATTACH_NOTICE: &str =
+    "live update in progress; reconnect after handoff completes";
 
 /// Reserved `SwitchServer` target: the client's launcher interprets it as
 /// "re-attach to the local server" (the way home from a spoke), reusing the
@@ -219,6 +231,12 @@ pub enum ClientMessage {
         /// Fleet snapshot carried from the server the client switched away
         /// from. `None` for locally-attached clients (no origin, no home row).
         fleet: Option<FleetSnapshot>,
+        /// Host terminal default colors (OSC 10/11) captured by the attaching
+        /// client just before the handshake. `None` when the client could not
+        /// capture a theme (non-tty stdin, unresponsive terminal). The server
+        /// adopts a non-empty theme as `host_terminal_theme` (last attach
+        /// wins) and pushes it into existing pane PTYs.
+        host_theme: Option<crate::terminal_theme::TerminalTheme>,
     },
 
     /// Raw input bytes read from the client's stdin.
@@ -815,6 +833,7 @@ mod tests {
             keybindings: ClientKeybindings::Server,
             launch_mode: ClientLaunchMode::App,
             fleet: None,
+            host_theme: None,
         };
         let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
         let (decoded, _): (ClientMessage, _) =
@@ -961,6 +980,38 @@ mod tests {
             keybindings: ClientKeybindings::Server,
             launch_mode: ClientLaunchMode::App,
             fleet: Some(sample_fleet_snapshot()),
+            host_theme: None,
+        };
+        let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
+        let (decoded, _): (ClientMessage, _) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+        assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn client_hello_with_host_theme_roundtrip() {
+        let msg = ClientMessage::Hello {
+            version: PROTOCOL_VERSION,
+            cols: 80,
+            rows: 24,
+            cell_width_px: 8,
+            cell_height_px: 16,
+            requested_encoding: RenderEncoding::TerminalAnsi,
+            keybindings: ClientKeybindings::Server,
+            launch_mode: ClientLaunchMode::App,
+            fleet: None,
+            host_theme: Some(crate::terminal_theme::TerminalTheme {
+                foreground: Some(crate::terminal_theme::RgbColor {
+                    r: 0xcc,
+                    g: 0xcc,
+                    b: 0xcc,
+                }),
+                background: Some(crate::terminal_theme::RgbColor {
+                    r: 0x1e,
+                    g: 0x1e,
+                    b: 0x2e,
+                }),
+            }),
         };
         let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
         let (decoded, _): (ClientMessage, _) =
@@ -1185,6 +1236,7 @@ mod tests {
             keybindings: ClientKeybindings::Server,
             launch_mode: ClientLaunchMode::App,
             fleet: None,
+            host_theme: None,
         };
         let mut buf = Vec::new();
         write_message(&mut buf, &msg).unwrap();
@@ -1260,6 +1312,7 @@ mod tests {
                     keybindings: ClientKeybindings::Server,
                     launch_mode: ClientLaunchMode::App,
                     fleet: None,
+                    host_theme: None,
                 },
                 1 => ClientMessage::Input {
                     data: vec![(i % 256) as u8; (i as usize % 50) + 1],
@@ -1697,6 +1750,7 @@ mod tests {
             keybindings: ClientKeybindings::Server,
             launch_mode: ClientLaunchMode::App,
             fleet: None,
+            host_theme: None,
         };
         let mut buf = Vec::new();
         write_message(&mut buf, &msg).unwrap();
@@ -1733,6 +1787,7 @@ mod tests {
                 keybindings: ClientKeybindings::Server,
                 launch_mode: ClientLaunchMode::App,
                 fleet: None,
+                host_theme: None,
             },
             ClientMessage::Input {
                 data: b"hello world".to_vec(),

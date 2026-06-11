@@ -225,8 +225,9 @@ pub fn client_handshake(
     cols: u16,
     rows: u16,
 ) -> Result<(u32, Option<String>), String> {
-    // fleet: Option<FleetSnapshot> = None (single 0 byte).
-    client_handshake_with_fleet(stream, version, cols, rows, &[0])
+    // fleet: Option<FleetSnapshot> = None (single 0 byte),
+    // host_theme: Option<TerminalTheme> = None (single 0 byte).
+    client_handshake_with_fleet_and_theme(stream, version, cols, rows, &[0], &[0])
 }
 
 /// Handshake whose Hello carries pre-encoded `fleet: Option<FleetSnapshot>`
@@ -238,6 +239,37 @@ pub fn client_handshake_with_fleet(
     cols: u16,
     rows: u16,
     fleet_option_bytes: &[u8],
+) -> Result<(u32, Option<String>), String> {
+    client_handshake_with_fleet_and_theme(stream, version, cols, rows, fleet_option_bytes, &[0])
+}
+
+/// Handshake whose Hello carries a `host_theme: Option<TerminalTheme>` with
+/// both default colors set, e.g. `encode_host_theme_option(...)`.
+#[allow(dead_code)]
+pub fn client_handshake_with_theme(
+    stream: &mut UnixStream,
+    version: u32,
+    cols: u16,
+    rows: u16,
+    theme_option_bytes: &[u8],
+) -> Result<(u32, Option<String>), String> {
+    client_handshake_with_fleet_and_theme(stream, version, cols, rows, &[0], theme_option_bytes)
+}
+
+/// Encodes `Some(TerminalTheme { foreground: Some(fg), background: Some(bg) })`
+/// the way bincode lays it out inside the Hello.
+#[allow(dead_code)]
+pub fn encode_host_theme_option(fg: (u8, u8, u8), bg: (u8, u8, u8)) -> Vec<u8> {
+    vec![1, 1, fg.0, fg.1, fg.2, 1, bg.0, bg.1, bg.2]
+}
+
+pub fn client_handshake_with_fleet_and_theme(
+    stream: &mut UnixStream,
+    version: u32,
+    cols: u16,
+    rows: u16,
+    fleet_option_bytes: &[u8],
+    theme_option_bytes: &[u8],
 ) -> Result<(u32, Option<String>), String> {
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
@@ -255,6 +287,7 @@ pub fn client_handshake_with_fleet(
             &encode_varint_u32(0),  // ClientKeybindings::Server
             &encode_varint_u32(0),  // ClientLaunchMode::App
             fleet_option_bytes,
+            theme_option_bytes,
         ],
     );
     let framed = frame_message(&hello_payload);

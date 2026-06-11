@@ -17,9 +17,10 @@ mod input;
 use std::collections::HashSet;
 use std::io::{self, Write as _};
 use std::os::unix::net::UnixStream;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{
     DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
@@ -490,6 +491,7 @@ fn do_handshake(
     cell_height_px: u32,
     requested_encoding: RenderEncoding,
     direct_attach_requested: bool,
+    host_theme: Option<crate::terminal_theme::TerminalTheme>,
 ) -> Result<RenderEncoding, ClientError> {
     stream
         .set_nonblocking(false)
@@ -510,6 +512,7 @@ fn do_handshake(
             ClientLaunchMode::App
         },
         fleet: carried_fleet_snapshot(),
+        host_theme,
     };
     protocol::write_message(stream, &hello)
         .map_err(|e| ClientError::ConnectionFailed(io::Error::other(e.to_string())))?;
@@ -582,6 +585,307 @@ pub fn run_terminal_attach(terminal_id: String, takeover: bool) -> io::Result<()
     )
 }
 
+// ---------------------------------------------------------------------------
+// Host theme capture (pre-handshake)
+// ---------------------------------------------------------------------------
+
+/// How long to wait for the host terminal's OSC 10/11 color replies before
+/// the handshake. Terminals that support the query answer within a few
+/// milliseconds; one that never answers costs this once per attach leg.
+const HOST_THEME_CAPTURE_TIMEOUT: Duration = Duration::from_millis(300);
+
+/// Poll granularity while waiting for color replies.
+const HOST_THEME_CAPTURE_POLL_MS: i32 = 25;
+
+/// Captures the host terminal's default colors (OSC 10/11) before the
+/// handshake so they ride the `Hello` and a remote/spoke server can adopt
+/// them at attach time (#47). This runs on every attach leg, so a
+/// SwitchServer relaunch re-captures from the same host terminal without any
+/// launcher plumbing.
+///
+/// Returns the captured theme plus every raw byte read while waiting —
+/// normally just the color replies, but any early keystrokes are preserved
+/// and forwarded to the server as the session's first input.
+fn capture_host_terminal_theme() -> (Option<crate::terminal_theme::TerminalTheme>, Vec<u8>) {
+    use std::io::IsTerminal;
+
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        return (None, Vec::new());
+    }
+    // Raw mode so the replies are readable immediately instead of sitting in
+    // the line discipline; restored before the handshake either way.
+    if crossterm::terminal::enable_raw_mode().is_err() {
+        return (None, Vec::new());
+    }
+    let captured = read_host_theme_replies();
+    let _ = crossterm::terminal::disable_raw_mode();
+    captured
+}
+
+fn read_host_theme_replies() -> (Option<crate::terminal_theme::TerminalTheme>, Vec<u8>) {
+    use std::io::Read;
+
+    if write_host_terminal_theme_query(io::stdout()).is_err() {
+        return (None, Vec::new());
+    }
+
+    let mut buf = Vec::new();
+    let mut theme = crate::terminal_theme::TerminalTheme::default();
+    let deadline = Instant::now() + HOST_THEME_CAPTURE_TIMEOUT;
+    let stdin = io::stdin();
+    let mut reader = stdin.lock();
+    while Instant::now() < deadline {
+        match input::stdin_read_ready(&reader, HOST_THEME_CAPTURE_POLL_MS) {
+            Some(true) => {
+                let mut scratch = [0u8; 1024];
+                match reader.read(&mut scratch) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        buf.extend_from_slice(&scratch[..n]);
+                        theme = theme_from_capture_buffer(&buf);
+                        if theme.foreground.is_some() && theme.background.is_some() {
+                            break;
+                        }
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                    Err(_) => break,
+                }
+            }
+            Some(false) => {}
+            None => break,
+        }
+    }
+
+    if theme.is_empty() {
+        debug!("host terminal did not answer the default color query");
+    } else {
+        info!(?theme, "captured host terminal theme for handshake");
+    }
+    ((!theme.is_empty()).then_some(theme), buf)
+}
+
+fn theme_from_capture_buffer(buf: &[u8]) -> crate::terminal_theme::TerminalTheme {
+    let mut theme = crate::terminal_theme::TerminalTheme::default();
+    for event in crate::raw_input::parse_raw_input_bytes_sync(buf) {
+        if let crate::raw_input::RawInputEvent::HostDefaultColor { kind, color } = event {
+            theme = theme.with_color(kind, color);
+        }
+    }
+    theme
+}
+
+// ---------------------------------------------------------------------------
+// Live-handoff attach retry (#38)
+// ---------------------------------------------------------------------------
+
+/// Pause between attach attempts while a live handoff is in progress.
+const HANDOFF_RETRY_INTERVAL: Duration = Duration::from_millis(200);
+
+/// Total budget for waiting out a live handoff before surfacing the error.
+const HANDOFF_RETRY_WINDOW: Duration = Duration::from_secs(30);
+
+/// A session that ran at least this long counts as a real attach: the next
+/// live-handoff refusal opens a fresh retry window instead of draining the
+/// previous one. Shorter sessions (e.g. refused right at ClientConnected)
+/// keep consuming the window so a flapping server cannot retry forever.
+const HANDOFF_SESSION_RESET_THRESHOLD: Duration = Duration::from_secs(5);
+
+const HANDOFF_SPINNER: [char; 4] = ['|', '/', '-', '\\'];
+
+/// One attach attempt's failure, tagged by the phase it failed in.
+enum AttachAttemptError {
+    /// Connecting or handshaking failed; nothing was drawn yet.
+    Handshake(ClientError),
+    /// The terminal could not be prepared. Never retried.
+    TerminalSetup(io::Error),
+    /// The established session ended with an error.
+    Session(ClientError),
+}
+
+impl AttachAttemptError {
+    fn is_live_handoff_refusal(&self) -> bool {
+        match self {
+            AttachAttemptError::Handshake(ClientError::HandshakeRejected { error, .. }) => {
+                error == protocol::LIVE_HANDOFF_ATTACH_NOTICE
+            }
+            AttachAttemptError::Handshake(ClientError::ServerShutdown {
+                reason: Some(reason),
+            })
+            | AttachAttemptError::Session(ClientError::ServerShutdown {
+                reason: Some(reason),
+            }) => reason == protocol::LIVE_HANDOFF_ATTACH_NOTICE,
+            _ => false,
+        }
+    }
+
+    fn into_client_error(self) -> Result<ClientError, io::Error> {
+        match self {
+            AttachAttemptError::Handshake(err) | AttachAttemptError::Session(err) => Ok(err),
+            AttachAttemptError::TerminalSetup(err) => Err(err),
+        }
+    }
+}
+
+/// Retry state for attaches refused during a live update handoff (#38).
+#[derive(Default)]
+struct HandoffRetry {
+    deadline: Option<Instant>,
+    status_line_shown: bool,
+    spinner_frame: usize,
+}
+
+impl HandoffRetry {
+    /// Returns true when the failed attach attempt should be retried after a
+    /// short pause. The first live-handoff refusal opens a ~30s window;
+    /// within it, transient connect/handshake failures (the old server
+    /// dying, the new one binding the socket) are retried too. A session
+    /// that ran long enough to be a real attach resets the window, so a
+    /// later handoff gets a fresh budget.
+    fn should_retry(&mut self, err: &AttachAttemptError, attempt_duration: Duration) -> bool {
+        let now = Instant::now();
+        if matches!(err, AttachAttemptError::Session(_))
+            && attempt_duration >= HANDOFF_SESSION_RESET_THRESHOLD
+        {
+            self.deadline = None;
+        }
+        if err.is_live_handoff_refusal() && self.deadline.is_none() {
+            self.deadline = Some(now + HANDOFF_RETRY_WINDOW);
+            return true;
+        }
+        let Some(deadline) = self.deadline else {
+            return false;
+        };
+        if now >= deadline {
+            return false;
+        }
+        match err {
+            AttachAttemptError::Session(_) => err.is_live_handoff_refusal(),
+            AttachAttemptError::TerminalSetup(_) => false,
+            // A newer server rejected us: the handoff completed onto a
+            // protocol this client cannot speak. Retrying cannot succeed —
+            // surface the upgrade guidance immediately. Everything else
+            // (refused or dropped connections, EOFs from the dying server)
+            // is expected churn inside the window.
+            AttachAttemptError::Handshake(ClientError::HandshakeRejected { version, .. }) => {
+                *version <= PROTOCOL_VERSION
+            }
+            AttachAttemptError::Handshake(_) => true,
+        }
+    }
+
+    fn pause_before_retry(&mut self) {
+        self.show_status_line();
+        std::thread::sleep(HANDOFF_RETRY_INTERVAL);
+    }
+
+    /// Single status line on stderr while reconnecting; rewritten in place
+    /// (with a spinner) when stderr is a terminal, printed once otherwise.
+    fn show_status_line(&mut self) {
+        use std::io::IsTerminal;
+        if io::stderr().is_terminal() {
+            let frame = HANDOFF_SPINNER[self.spinner_frame % HANDOFF_SPINNER.len()];
+            self.spinner_frame = self.spinner_frame.wrapping_add(1);
+            eprint!("\r\x1b[K{frame} herdr: handoff in progress, reconnecting…");
+            let _ = io::stderr().flush();
+        } else if !self.status_line_shown {
+            eprintln!("herdr: handoff in progress, reconnecting…");
+        }
+        self.status_line_shown = true;
+    }
+
+    fn clear_status_line(&mut self) {
+        use std::io::IsTerminal;
+        if self.status_line_shown && io::stderr().is_terminal() {
+            eprint!("\r\x1b[K");
+            let _ = io::stderr().flush();
+        }
+        self.status_line_shown = false;
+    }
+}
+
+/// Runs one complete attach attempt: connect, handshake, terminal setup, and
+/// the client session loop. Phase-tagged errors let the caller decide what is
+/// retryable during a live handoff.
+#[allow(clippy::too_many_arguments)]
+fn run_attach_attempt(
+    socket_path: &Path,
+    requested_encoding: RenderEncoding,
+    attach_request: Option<&(String, bool)>,
+    direct_attach: bool,
+    kitty_graphics_enabled: bool,
+    host_theme: Option<crate::terminal_theme::TerminalTheme>,
+    pending_stdin: &mut Option<Vec<u8>>,
+    stdin_rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
+    rt: &tokio::runtime::Runtime,
+    should_quit: &Arc<AtomicBool>,
+    sound_config: &crate::config::SoundConfig,
+    mouse_scroll_lines: usize,
+    redraw_on_focus_gained: bool,
+) -> Result<(), AttachAttemptError> {
+    let mut stream = UnixStream::connect(socket_path)
+        .map_err(|err| AttachAttemptError::Handshake(ClientError::ConnectionFailed(err)))?;
+
+    // Read the terminal geometry before the handshake, while still outside
+    // raw mode. Re-read on every attempt so a resize that happens during a
+    // handoff window is honored.
+    let (cols, rows, cell_width_px, cell_height_px) =
+        current_terminal_geometry(kitty_graphics_enabled);
+
+    // Perform handshake while the stream is still in blocking mode.
+    let negotiated_encoding = do_handshake(
+        &mut stream,
+        cols,
+        rows,
+        cell_width_px,
+        cell_height_px,
+        requested_encoding,
+        attach_request.is_some(),
+        host_theme,
+    )
+    .map_err(AttachAttemptError::Handshake)?;
+
+    if let Some((terminal_id, takeover)) = attach_request {
+        let attach = ClientMessage::AttachTerminal {
+            terminal_id: terminal_id.clone(),
+            takeover: *takeover,
+        };
+        write_to_server(&mut stream, &attach)
+            .map_err(|err| AttachAttemptError::Handshake(ClientError::ConnectionLost(err)))?;
+    }
+
+    // Now set up the terminal. This must happen AFTER the handshake succeeds,
+    // so we don't leave the terminal in raw mode if the server rejects us.
+    let _guard = if direct_attach {
+        setup_direct_attach_terminal()
+    } else {
+        setup_terminal(false)
+    }
+    .map_err(AttachAttemptError::TerminalSetup)?;
+
+    let attach_escape = direct_attach.then(AttachEscapeState::default);
+    let initial_input = pending_stdin.take();
+    let result = rt.block_on(run_client_loop(
+        stream,
+        cols,
+        rows,
+        should_quit.clone(),
+        sound_config.clone(),
+        mouse_scroll_lines,
+        redraw_on_focus_gained,
+        kitty_graphics_enabled,
+        false,
+        negotiated_encoding,
+        attach_escape,
+        initial_input,
+        stdin_rx,
+    ));
+
+    // Restore the terminal before the caller prints anything.
+    drop(_guard);
+
+    result.map_err(AttachAttemptError::Session)
+}
+
 fn run_client_with_mode(
     requested_encoding: RenderEncoding,
     attach_request: Option<(String, bool)>,
@@ -597,66 +901,31 @@ fn run_client_with_mode(
     let direct_attach_requested = attach_request.is_some();
     let kitty_graphics_enabled =
         loaded_config.config.experimental.kitty_graphics && !direct_attach_requested;
+    let direct_attach = attach_escape.is_some();
 
     let socket_path = client_socket_path();
     crate::logging::startup("client");
     info!(path = %socket_path.display(), "{log_message}");
 
-    // Try to connect to the server.
-    let mut stream = match UnixStream::connect(&socket_path) {
-        Ok(s) => s,
-        Err(err) => {
-            // Server unreachable — show clear error and exit.
-            let client_err = ClientError::ConnectionFailed(err);
-            eprintln!("herdr: {client_err}");
-            std::process::exit(1);
-        }
-    };
-
-    // Get the terminal geometry before handshake (before raw mode).
-    let (cols, rows, cell_width_px, cell_height_px) =
-        current_terminal_geometry(kitty_graphics_enabled);
-
-    // Perform handshake while the stream is still in blocking mode.
-    let negotiated_encoding = match do_handshake(
-        &mut stream,
-        cols,
-        rows,
-        cell_width_px,
-        cell_height_px,
-        requested_encoding,
-        direct_attach_requested,
-    ) {
-        Ok(encoding) => encoding,
-        Err(err) => {
-            eprintln!("herdr: {err}");
-            std::process::exit(1);
-        }
-    };
-
-    if let Some((terminal_id, takeover)) = attach_request {
-        let attach = ClientMessage::AttachTerminal {
-            terminal_id,
-            takeover,
-        };
-        if let Err(err) = write_to_server(&mut stream, &attach) {
-            eprintln!("herdr: failed to request terminal attach: {err}");
-            std::process::exit(1);
-        }
-    }
-
-    // Now set up the terminal. This must happen AFTER the handshake succeeds,
-    // so we don't leave the terminal in raw mode if the server rejects us.
-    let direct_attach = attach_escape.is_some();
-    let _guard = if direct_attach {
-        setup_direct_attach_terminal()
+    // Capture the host terminal theme before the handshake so it rides the
+    // Hello (#47). Direct terminal attaches mirror a single pane and never
+    // report a theme (unchanged behavior).
+    let (host_theme, capture_leftover) = if direct_attach_requested {
+        (None, Vec::new())
     } else {
-        setup_terminal(false)
-    }
-    .map_err(|err| {
-        eprintln!("herdr: failed to set up terminal: {err}");
-        err
-    })?;
+        capture_host_terminal_theme()
+    };
+    let mut pending_stdin = (!capture_leftover.is_empty()).then_some(capture_leftover);
+
+    // Spawn the stdin reader thread once, after the theme capture released
+    // stdin. It outlives individual attach attempts so a handoff retry never
+    // leaves typed bytes stranded in a session-scoped reader.
+    let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
+    let should_quit = Arc::new(AtomicBool::new(false));
+    let stdin_quit = should_quit.clone();
+    std::thread::spawn(move || {
+        input::stdin_reader_loop(stdin_tx, &stdin_quit);
+    });
 
     // Install a panic hook to restore the terminal on panic (same as monolithic).
     let in_tmux = std::env::var("TMUX").is_ok();
@@ -672,35 +941,57 @@ fn run_client_with_mode(
         .build()
         .map_err(io::Error::other)?;
 
-    let should_quit = Arc::new(AtomicBool::new(false));
-
     // Install Ctrl+C handler.
     let quit_flag = should_quit.clone();
     let _ = ctrlc::set_handler(move || {
         quit_flag.store(true, Ordering::Release);
     });
 
-    let result = rt.block_on(async {
-        run_client_loop(
-            stream,
-            cols,
-            rows,
-            should_quit,
-            sound_config,
+    // Attach, retrying while the server refuses with the live-handoff notice
+    // (#38): ~200ms pauses for up to ~30s behind a single status line, then
+    // the original error.
+    let mut handoff_retry = HandoffRetry::default();
+    let result = loop {
+        let attempt_started = Instant::now();
+        match run_attach_attempt(
+            &socket_path,
+            requested_encoding,
+            attach_request.as_ref(),
+            direct_attach,
+            kitty_graphics_enabled,
+            host_theme,
+            &mut pending_stdin,
+            &mut stdin_rx,
+            &rt,
+            &should_quit,
+            &sound_config,
             mouse_scroll_lines,
             redraw_on_focus_gained,
-            kitty_graphics_enabled,
-            false,
-            negotiated_encoding,
-            attach_escape,
-        )
-        .await
-    });
+        ) {
+            Ok(()) => break Ok(()),
+            Err(err) => {
+                if should_quit.load(Ordering::Acquire)
+                    || !handoff_retry.should_retry(&err, attempt_started.elapsed())
+                {
+                    break Err(err);
+                }
+                handoff_retry.pause_before_retry();
+            }
+        }
+    };
+    handoff_retry.clear_status_line();
 
-    // Restore the terminal before printing any final status message.
-    drop(_guard);
+    if let Err(attempt_err) = result {
+        let err = match attempt_err.into_client_error() {
+            Ok(client_err) => client_err,
+            Err(setup_err) => {
+                eprintln!("herdr: failed to set up terminal: {setup_err}");
+                rt.shutdown_timeout(Duration::from_millis(100));
+                crate::logging::shutdown("client");
+                return Err(setup_err);
+            }
+        };
 
-    if let Err(err) = result {
         eprintln!("herdr: {err}");
         rt.shutdown_timeout(Duration::from_millis(100));
         crate::logging::shutdown("client");
@@ -725,10 +1016,12 @@ fn run_client_with_mode(
 /// The main client event loop.
 ///
 /// Uses a threaded architecture:
-/// - stdin reader thread → sends raw input bytes to main loop
+/// - stdin reader thread (owned by the caller, survives attach retries)
+///   → sends raw input chunks to the main loop
 /// - resize poller thread → sends resize events to main loop
 /// - server reader thread → reads ServerMessages and sends to main loop
 /// - main loop: coordinates input, output, and server communication
+#[allow(clippy::too_many_arguments)]
 async fn run_client_loop(
     stream: UnixStream,
     cols: u16,
@@ -741,6 +1034,8 @@ async fn run_client_loop(
     mouse_capture_active: bool,
     negotiated_encoding: RenderEncoding,
     attach_escape: Option<AttachEscapeState>,
+    initial_input: Option<Vec<u8>>,
+    stdin_rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
 ) -> Result<(), ClientError> {
     let mut state = ClientState {
         blit_encoder: render_ansi::BlitEncoder::new(),
@@ -754,15 +1049,10 @@ async fn run_client_loop(
     };
     debug!(?negotiated_encoding, "client render encoding active");
 
-    // Channel for events from the stdin, resize, and server reader threads.
+    // Channel for events from the resize and server reader threads. The
+    // stdin reader outlives this session (handoff retries reuse it), so it
+    // has its own channel passed in by the caller.
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<ClientLoopEvent>(256);
-
-    // Spawn the stdin reader thread.
-    let stdin_quit = should_quit.clone();
-    let stdin_tx = event_tx.clone();
-    std::thread::spawn(move || {
-        input::stdin_reader_loop(stdin_tx, &stdin_quit);
-    });
 
     if state.attach_escape.is_none() {
         query_host_terminal_theme();
@@ -801,10 +1091,30 @@ async fn run_client_loop(
         .set_nonblocking(false)
         .map_err(ClientError::ConnectionFailed)?;
 
+    // Bytes consumed from stdin during the pre-handshake theme capture:
+    // forward them as the session's first input so no keystroke is lost. The
+    // server parses any color replies in here exactly like live ones.
+    if let Some(data) = initial_input {
+        let msg = ClientMessage::Input { data };
+        if let Err(e) = write_to_server(&mut write_stream, &msg) {
+            return Err(ClientError::ConnectionLost(e));
+        }
+    }
+
     // Main event loop.
+    let mut stdin_closed = false;
     while !should_quit.load(Ordering::Acquire) {
         let event = tokio::select! {
             ev = event_rx.recv() => ev.unwrap_or(ClientLoopEvent::Timer),
+            data = stdin_rx.recv(), if !stdin_closed => match data {
+                Some(data) => ClientLoopEvent::StdinInput(data),
+                None => {
+                    // Stdin hit EOF and the reader thread exited; keep
+                    // serving frames and other events.
+                    stdin_closed = true;
+                    ClientLoopEvent::Timer
+                }
+            },
             _ = tokio::time::sleep(Duration::from_millis(100)) => ClientLoopEvent::Timer,
         };
 
@@ -1347,6 +1657,138 @@ mod tests {
     use super::*;
     use std::ffi::OsString;
     use std::sync::{Mutex, OnceLock};
+
+    fn refusal_session_error() -> AttachAttemptError {
+        AttachAttemptError::Session(ClientError::ServerShutdown {
+            reason: Some(protocol::LIVE_HANDOFF_ATTACH_NOTICE.to_string()),
+        })
+    }
+
+    fn refusal_handshake_error() -> AttachAttemptError {
+        AttachAttemptError::Handshake(ClientError::HandshakeRejected {
+            version: PROTOCOL_VERSION,
+            error: protocol::LIVE_HANDOFF_ATTACH_NOTICE.to_string(),
+        })
+    }
+
+    fn transient_handshake_error() -> AttachAttemptError {
+        AttachAttemptError::Handshake(ClientError::ConnectionFailed(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            "refused",
+        )))
+    }
+
+    #[test]
+    fn live_handoff_refusals_are_recognized_in_both_phases() {
+        assert!(refusal_session_error().is_live_handoff_refusal());
+        assert!(refusal_handshake_error().is_live_handoff_refusal());
+        assert!(!transient_handshake_error().is_live_handoff_refusal());
+        assert!(!AttachAttemptError::Session(ClientError::ServerShutdown {
+            reason: Some("detached".to_string()),
+        })
+        .is_live_handoff_refusal());
+    }
+
+    #[test]
+    fn handoff_retry_opens_window_on_refusal_then_retries_transients() {
+        let mut retry = HandoffRetry::default();
+
+        // First refusal opens the window and retries.
+        assert!(retry.should_retry(&refusal_session_error(), Duration::ZERO));
+
+        // Transient failures inside the window are expected churn: the old
+        // server dying, the new one rebinding the socket, or the old server
+        // still answering with its older protocol version.
+        assert!(retry.should_retry(&transient_handshake_error(), Duration::ZERO));
+        assert!(retry.should_retry(&refusal_handshake_error(), Duration::ZERO));
+        assert!(retry.should_retry(
+            &AttachAttemptError::Handshake(ClientError::HandshakeRejected {
+                version: PROTOCOL_VERSION - 1,
+                error: "older server".to_string(),
+            }),
+            Duration::ZERO,
+        ));
+
+        // A NEWER server rejecting us means the handoff completed onto a
+        // protocol we cannot speak — surface the upgrade guidance now.
+        assert!(!retry.should_retry(
+            &AttachAttemptError::Handshake(ClientError::HandshakeRejected {
+                version: PROTOCOL_VERSION + 1,
+                error: "newer server".to_string(),
+            }),
+            Duration::ZERO,
+        ));
+    }
+
+    #[test]
+    fn handoff_retry_never_starts_without_a_refusal() {
+        let mut retry = HandoffRetry::default();
+        assert!(!retry.should_retry(&transient_handshake_error(), Duration::ZERO));
+        assert!(!retry.should_retry(
+            &AttachAttemptError::Session(ClientError::ServerShutdown {
+                reason: Some("detached".to_string()),
+            }),
+            Duration::ZERO,
+        ));
+        assert!(!retry.should_retry(
+            &AttachAttemptError::TerminalSetup(io::Error::other("tty broke")),
+            Duration::ZERO,
+        ));
+    }
+
+    #[test]
+    fn handoff_retry_stops_at_the_window_deadline() {
+        let mut retry = HandoffRetry {
+            deadline: Some(Instant::now() - Duration::from_millis(1)),
+            ..HandoffRetry::default()
+        };
+        assert!(!retry.should_retry(&refusal_handshake_error(), Duration::ZERO));
+        assert!(!retry.should_retry(&transient_handshake_error(), Duration::ZERO));
+        // A short-lived session refusal does not reopen the expired window:
+        // a flapping server cannot keep the client retrying forever.
+        assert!(!retry.should_retry(&refusal_session_error(), Duration::from_millis(50)));
+    }
+
+    #[test]
+    fn handoff_retry_long_session_earns_a_fresh_window() {
+        let mut retry = HandoffRetry {
+            deadline: Some(Instant::now() - Duration::from_millis(1)),
+            ..HandoffRetry::default()
+        };
+        // The session ran for real before this refusal (a later, separate
+        // handoff): a fresh retry window opens.
+        assert!(retry.should_retry(&refusal_session_error(), HANDOFF_SESSION_RESET_THRESHOLD));
+    }
+
+    #[test]
+    fn theme_capture_buffer_parses_osc_color_replies() {
+        let buf = b"\x1b]10;rgb:cccc/dddd/eeee\x1b\\\x1b]11;#1e1e2e\x07";
+        let theme = theme_from_capture_buffer(buf);
+        assert_eq!(
+            theme.foreground,
+            Some(crate::terminal_theme::RgbColor {
+                r: 0xcc,
+                g: 0xdd,
+                b: 0xee,
+            })
+        );
+        assert_eq!(
+            theme.background,
+            Some(crate::terminal_theme::RgbColor {
+                r: 0x1e,
+                g: 0x1e,
+                b: 0x2e,
+            })
+        );
+
+        // Keystrokes mixed into the capture window do not corrupt parsing.
+        let mixed = b"a\x1b]11;#1e1e2e\x07b";
+        let theme = theme_from_capture_buffer(mixed);
+        assert!(theme.foreground.is_none());
+        assert!(theme.background.is_some());
+
+        assert!(theme_from_capture_buffer(b"plain typing").is_empty());
+    }
 
     #[test]
     fn recorded_switch_roundtrips_with_and_without_fleet() {
