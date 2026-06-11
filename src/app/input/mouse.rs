@@ -519,6 +519,16 @@ impl AppState {
                         return None;
                     }
 
+                    // Spaces section: the header's all/current label toggles
+                    // the scope between the full workspace list and the
+                    // focused space group.
+                    if self.on_spaces_panel_scope_toggle(mouse.column, mouse.row) {
+                        self.spaces_panel_scope = self.spaces_panel_scope.toggled();
+                        self.workspace_scroll = 0;
+                        self.mark_session_dirty();
+                        return None;
+                    }
+
                     let cards = if self.view.workspace_card_areas.is_empty() {
                         crate::ui::compute_workspace_card_areas(self, self.view.sidebar_rect)
                     } else {

@@ -534,8 +534,48 @@ pub(crate) fn workspace_list_entries(app: &AppState) -> Vec<WorkspaceListEntry> 
             }
         }
     }
+    if matches!(app.spaces_panel_scope, PanelScope::Current) {
+        retain_focused_space_group(
+            app,
+            &mut entries,
+            visible_group_idx,
+            active_group.as_deref(),
+            &grouped_keys,
+        );
+    }
     fold_remote_entries(app, &mut entries);
     entries
+}
+
+/// Spaces scope `current`: keep only the focused workspace's space-group
+/// block — or just the focused workspace itself when it is not part of a
+/// collapsible group. Filtering happens here, in the single source of the
+/// rendered list, so hit-areas, scroll, and keyboard selection all stay
+/// consistent with what is on screen. With no focused workspace the full
+/// list stays (nothing to pin to).
+fn retain_focused_space_group(
+    app: &AppState,
+    entries: &mut Vec<WorkspaceListEntry>,
+    focused_idx: Option<usize>,
+    active_group: Option<&str>,
+    grouped_keys: &std::collections::HashSet<String>,
+) {
+    let Some(focused_idx) = focused_idx.filter(|idx| *idx < app.workspaces.len()) else {
+        return;
+    };
+    let focused_key = active_group.filter(|key| grouped_keys.contains(*key));
+    entries.retain(|entry| match entry {
+        WorkspaceListEntry::Workspace { ws_idx, .. } => match focused_key {
+            Some(key) => app
+                .workspaces
+                .get(*ws_idx)
+                .and_then(|ws| ws.worktree_space())
+                .is_some_and(|space| space.key == key),
+            None => *ws_idx == focused_idx,
+        },
+        // Remote rows are folded in after this filter runs.
+        WorkspaceListEntry::Remote { .. } => false,
+    });
 }
 
 /// Fold federated peer workspaces into the spaces list: rows whose
@@ -606,6 +646,12 @@ fn fold_remote_entries(app: &AppState, entries: &mut Vec<WorkspaceListEntry>) {
                 },
             );
         }
+    }
+
+    // Spaces scope current pins the list to the focused project: remote-only
+    // projects (no local block to splice into) stay hidden with the rest.
+    if matches!(app.spaces_panel_scope, PanelScope::Current) {
+        return;
     }
 
     // Remote-only projects trail the list; the first row of each project is
@@ -1647,13 +1693,25 @@ fn render_workspace_list(
 
     let list_bottom = area.y + area.height.saturating_sub(1);
     if area.height > 0 {
+        let header_rect = Rect::new(area.x, area.y, area.width, 1);
         frame.render_widget(
             Paragraph::new(Line::from(vec![Span::styled(
                 " spaces",
                 Style::default().fg(p.overlay0).add_modifier(Modifier::BOLD),
             )])),
-            Rect::new(area.x, area.y, area.width, 1),
+            header_rect,
         );
+        let toggle_rect = panel_scope_toggle_rect(header_rect, app.spaces_panel_scope);
+        if toggle_rect != Rect::default() {
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    panel_scope_toggle_label(app.spaces_panel_scope),
+                    Style::default().fg(p.overlay0).add_modifier(Modifier::BOLD),
+                ))
+                .alignment(Alignment::Right),
+                toggle_rect,
+            );
+        }
     }
 
     let metrics = workspace_list_scroll_metrics(app, area);
@@ -3064,6 +3122,187 @@ mod tests {
                     indented: false,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn spaces_current_scope_renders_only_focused_group() {
+        let mut app = AppState::test_new();
+        app.workspaces = vec![
+            workspace_with_worktree_space("main", Some("repo-key"), "/repo/herdr"),
+            workspace_with_worktree_space("issue", Some("repo-key"), "/repo/herdr-issue"),
+            Workspace::test_new("notes"),
+        ];
+        app.mode = Mode::Terminal;
+        app.active = Some(1);
+        app.spaces_panel_scope = PanelScope::Current;
+
+        // Focused grouped workspace: the whole group block renders — parent
+        // plus members — and nothing else.
+        assert_eq!(
+            workspace_list_entries(&app),
+            vec![
+                WorkspaceListEntry::Workspace {
+                    ws_idx: 0,
+                    indented: false,
+                },
+                WorkspaceListEntry::Workspace {
+                    ws_idx: 1,
+                    indented: true,
+                },
+            ]
+        );
+
+        // Focused ungrouped workspace: just that workspace.
+        app.active = Some(2);
+        assert_eq!(
+            workspace_list_entries(&app),
+            vec![WorkspaceListEntry::Workspace {
+                ws_idx: 2,
+                indented: false,
+            }]
+        );
+
+        // Scope all: the full list, unchanged.
+        app.spaces_panel_scope = PanelScope::All;
+        assert_eq!(workspace_list_entries(&app).len(), 3);
+    }
+
+    #[test]
+    fn spaces_current_scope_stays_orthogonal_to_group_collapse() {
+        let mut app = AppState::test_new();
+        app.workspaces = vec![
+            workspace_with_worktree_space("main", Some("repo-key"), "/repo/herdr"),
+            workspace_with_worktree_space("issue", Some("repo-key"), "/repo/herdr-issue"),
+            Workspace::test_new("notes"),
+        ];
+        app.mode = Mode::Terminal;
+        app.active = Some(1);
+        app.spaces_panel_scope = PanelScope::Current;
+        app.collapsed_space_keys.insert("repo-key".into());
+
+        // Collapse still folds members within the rendered group: parent +
+        // the focused child only.
+        assert_eq!(
+            workspace_list_entries(&app),
+            vec![
+                WorkspaceListEntry::Workspace {
+                    ws_idx: 0,
+                    indented: false,
+                },
+                WorkspaceListEntry::Workspace {
+                    ws_idx: 1,
+                    indented: true,
+                },
+            ]
+        );
+
+        app.active = Some(0);
+        assert_eq!(
+            workspace_list_entries(&app),
+            vec![WorkspaceListEntry::Workspace {
+                ws_idx: 0,
+                indented: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn spaces_current_scope_keeps_focused_project_remotes_and_hides_remote_only_projects() {
+        let mut app = AppState::test_new();
+        app.workspaces = vec![
+            workspace_with_project_key("herdr", "github.com/gerchowl/herdr"),
+            workspace_with_project_key("other", "github.com/gerchowl/other"),
+        ];
+        app.peer_summaries = vec![peer_with_workspaces(
+            "anvil",
+            vec![
+                remote_summary(
+                    "herdr",
+                    Some("github.com/gerchowl/herdr"),
+                    Some("herdr"),
+                    Some("fix/pty"),
+                ),
+                remote_summary(
+                    "dotfiles",
+                    Some("github.com/gerchowl/dotfiles"),
+                    Some("dotfiles"),
+                    None,
+                ),
+            ],
+        )];
+        app.mode = Mode::Terminal;
+        app.active = Some(0);
+        app.spaces_panel_scope = PanelScope::Current;
+
+        // The focused project keeps its spliced remote rows; the second
+        // local project and the remote-only trailing project both hide.
+        assert_eq!(
+            workspace_list_entries(&app),
+            vec![
+                WorkspaceListEntry::Workspace {
+                    ws_idx: 0,
+                    indented: false,
+                },
+                WorkspaceListEntry::Remote {
+                    peer_idx: 0,
+                    ws_idx: 0,
+                    indented: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn spaces_current_scope_clamps_keyboard_selection_to_visible_entries() {
+        let mut app = AppState::test_new();
+        app.workspaces = vec![
+            workspace_with_worktree_space("main", Some("repo-key"), "/repo/herdr"),
+            workspace_with_worktree_space("issue", Some("repo-key"), "/repo/herdr-issue"),
+            Workspace::test_new("notes"),
+        ];
+        app.mode = Mode::Navigate;
+        app.selected = 0;
+        app.spaces_panel_scope = PanelScope::Current;
+
+        // Selection moves through the visible (focused-group) entries only:
+        // a large delta clamps to the last group member, never reaching the
+        // hidden flat workspace.
+        app.move_selected_workspace_by_visible_delta(5);
+        assert_eq!(app.selected, 1);
+        app.move_selected_workspace_by_visible_delta(-5);
+        assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn spaces_header_renders_scope_toggle_label() {
+        let mut app = AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.ensure_test_terminals();
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = crate::app::Mode::Terminal;
+        app.spaces_panel_scope = PanelScope::Current;
+
+        let area = Rect::new(0, 0, 30, 40);
+        let mut terminal =
+            Terminal::new(TestBackend::new(30, 40)).expect("test terminal should initialize");
+        let runtimes = TerminalRuntimeRegistry::new();
+        terminal
+            .draw(|frame| render_sidebar(&app, &runtimes, frame, area))
+            .expect("sidebar should render");
+
+        let (ws_area, _) =
+            expanded_sidebar_sections(area, app.sidebar_section_split, app.sidebar_pane_gap);
+        let (_, list_area) = carve_servers_band(ws_area, servers_section_height(&app));
+        let buffer = terminal.backend().buffer();
+        let header_text: String = (list_area.x..list_area.x + list_area.width)
+            .map(|x| buffer[(x, list_area.y)].symbol().to_string())
+            .collect();
+        assert!(header_text.starts_with(" spaces"), "{header_text:?}");
+        assert!(
+            header_text.trim_end().ends_with("current"),
+            "{header_text:?}"
         );
     }
 

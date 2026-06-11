@@ -480,6 +480,16 @@ impl AppState {
         rect_contains(rect, col, row)
     }
 
+    pub(super) fn on_spaces_panel_scope_toggle(&self, col: u16, row: u16) -> bool {
+        let area = self.workspace_list_rect();
+        if area == Rect::default() || area.height == 0 {
+            return false;
+        }
+        let header = Rect::new(area.x, area.y, area.width, 1);
+        let rect = crate::ui::panel_scope_toggle_rect(header, self.spaces_panel_scope);
+        rect_contains(rect, col, row)
+    }
+
     pub(super) fn agent_detail_target_at(
         &self,
         row: u16,
@@ -865,6 +875,40 @@ mod tests {
             toggle.y,
         ));
         assert_eq!(app.state.servers_panel_scope, PanelScope::All);
+    }
+
+    #[test]
+    fn clicking_spaces_header_toggle_switches_spaces_scope() {
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = vec![Workspace::test_new("test")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.state.workspace_scroll = 3;
+
+        let list_area = app.state.workspace_list_rect();
+        assert_ne!(list_area, Rect::default());
+        let header = Rect::new(list_area.x, list_area.y, list_area.width, 1);
+        let toggle = crate::ui::panel_scope_toggle_rect(header, app.state.spaces_panel_scope);
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            toggle.x,
+            toggle.y,
+        ));
+
+        assert_eq!(app.state.spaces_panel_scope, PanelScope::Current);
+        assert_eq!(app.state.workspace_scroll, 0);
+        let snapshot = capture_snapshot(&app.state);
+        assert_eq!(snapshot.spaces_panel_scope, PanelScope::Current);
+
+        // Toggling again returns to all.
+        let toggle = crate::ui::panel_scope_toggle_rect(header, app.state.spaces_panel_scope);
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            toggle.x,
+            toggle.y,
+        ));
+        assert_eq!(app.state.spaces_panel_scope, PanelScope::All);
     }
 
     #[test]
