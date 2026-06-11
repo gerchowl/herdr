@@ -8,13 +8,17 @@ use ratatui::{
 
 use super::scrollbar::{render_scrollbar, should_show_scrollbar};
 use super::status::{agent_icon, state_dot, state_label, state_label_color};
-use crate::app::state::{AgentPanelScope, Palette};
+use crate::app::state::{AgentPanelScope, Palette, PanelScope};
 use crate::app::{AppState, Mode};
 use crate::detect::AgentState;
 use crate::terminal::TerminalRuntimeRegistry;
 
 const WORKSPACE_SECTION_HEADER_ROWS: u16 = 2;
 const AGENT_PANEL_HEADER_ROWS: u16 = 3;
+/// Rows pinned to the very bottom of the expanded sidebar: a hairline
+/// divider over the standalone `menu` row (#41 — the global-menu entry
+/// lives last, below the agents section).
+pub(crate) const SIDEBAR_MENU_BAND_ROWS: u16 = 2;
 
 pub(crate) struct AgentPanelEntry {
     pub ws_idx: usize,
@@ -47,40 +51,65 @@ fn sidebar_section_heights(total_h: u16, split_ratio: f32) -> (u16, u16) {
     (ws_h, detail_h)
 }
 
+/// The expanded sidebar's content rect: everything left of the vertical
+/// divider column and its breathing-room gap.
+fn expanded_sidebar_content(area: Rect, pane_gap: u16) -> Rect {
+    Rect::new(
+        area.x,
+        area.y,
+        area.width.saturating_sub(1 + pane_gap),
+        area.height,
+    )
+}
+
 pub(crate) fn expanded_sidebar_sections(
     area: Rect,
     split_ratio: f32,
     pane_gap: u16,
 ) -> (Rect, Rect) {
-    let content = Rect::new(
-        area.x,
-        area.y,
-        area.width.saturating_sub(1 + pane_gap),
-        area.height,
-    );
+    let content = expanded_sidebar_content(area, pane_gap);
     if content.width == 0 || content.height == 0 {
         return (Rect::default(), Rect::default());
     }
 
-    let (ws_h, detail_h) = sidebar_section_heights(content.height, split_ratio);
+    // The pinned menu band at the very bottom is carved out first; the
+    // spaces/agents sections split whatever sits above it.
+    let sections_h = content.height.saturating_sub(SIDEBAR_MENU_BAND_ROWS);
+    let (ws_h, detail_h) = sidebar_section_heights(sections_h, split_ratio);
     let ws_area = Rect::new(content.x, content.y, content.width, ws_h);
     let detail_area = Rect::new(content.x, content.y + ws_h, content.width, detail_h);
     (ws_area, detail_area)
 }
 
 pub(crate) fn sidebar_section_divider_rect(area: Rect, split_ratio: f32, pane_gap: u16) -> Rect {
-    let content = Rect::new(
-        area.x,
-        area.y,
-        area.width.saturating_sub(1 + pane_gap),
-        area.height,
-    );
-    if content.width == 0 || content.height < 6 {
+    let content = expanded_sidebar_content(area, pane_gap);
+    let sections_h = content.height.saturating_sub(SIDEBAR_MENU_BAND_ROWS);
+    if content.width == 0 || sections_h < 6 {
         return Rect::default();
     }
 
-    let (ws_h, _) = sidebar_section_heights(content.height, split_ratio);
+    let (ws_h, _) = sidebar_section_heights(sections_h, split_ratio);
     Rect::new(content.x, content.y + ws_h, content.width, 1)
+}
+
+/// The standalone `menu` row pinned to the expanded sidebar's last row
+/// (#41): servers ─ spaces ─ agents ─ … ─ menu.
+pub(crate) fn sidebar_menu_row_rect(area: Rect, pane_gap: u16) -> Rect {
+    let content = expanded_sidebar_content(area, pane_gap);
+    if content.width == 0 || content.height < SIDEBAR_MENU_BAND_ROWS {
+        return Rect::default();
+    }
+    Rect::new(content.x, content.y + content.height - 1, content.width, 1)
+}
+
+/// The hairline divider directly above the pinned `menu` row — the same
+/// visual language as the other section boundaries.
+pub(crate) fn sidebar_menu_divider_rect(area: Rect, pane_gap: u16) -> Rect {
+    let row = sidebar_menu_row_rect(area, pane_gap);
+    if row == Rect::default() {
+        return Rect::default();
+    }
+    Rect::new(row.x, row.y - 1, row.width, 1)
 }
 
 fn agent_panel_current_workspace_idx(app: &AppState) -> Option<usize> {
@@ -108,6 +137,29 @@ fn agent_panel_toggle_label(scope: AgentPanelScope) -> &'static str {
         AgentPanelScope::CurrentWorkspace => "current",
         AgentPanelScope::AllWorkspaces => "all",
     }
+}
+
+fn panel_scope_toggle_label(scope: PanelScope) -> &'static str {
+    match scope {
+        PanelScope::Current => "current",
+        PanelScope::All => "all",
+    }
+}
+
+/// Right-aligned all/current toggle inside a one-row section header — the
+/// servers and spaces counterpart of [`agent_panel_toggle_rect`].
+pub(crate) fn panel_scope_toggle_rect(header: Rect, scope: PanelScope) -> Rect {
+    if header.width == 0 || header.height == 0 {
+        return Rect::default();
+    }
+
+    let width = panel_scope_toggle_label(scope).chars().count() as u16;
+    Rect::new(
+        header.x + header.width.saturating_sub(width),
+        header.y,
+        width.min(header.width),
+        1,
+    )
 }
 
 pub(crate) fn agent_panel_toggle_rect(area: Rect, scope: AgentPanelScope) -> Rect {
@@ -413,7 +465,7 @@ pub(crate) fn normalized_workspace_scroll(app: &AppState, area: Rect, requested:
         app.sidebar_pane_gap,
         servers_section_height(app),
     );
-    let body = workspace_list_body_rect(ws_area, false);
+    let body = workspace_list_body_rect(ws_area, false, app.sidebar_new_entry_visible());
     if body.height == 0 {
         return requested;
     }
@@ -511,8 +563,48 @@ pub(crate) fn workspace_list_entries(app: &AppState) -> Vec<WorkspaceListEntry> 
             }
         }
     }
+    if matches!(app.spaces_panel_scope, PanelScope::Current) {
+        retain_focused_space_group(
+            app,
+            &mut entries,
+            visible_group_idx,
+            active_group.as_deref(),
+            &grouped_keys,
+        );
+    }
     fold_remote_entries(app, &mut entries);
     entries
+}
+
+/// Spaces scope `current`: keep only the focused workspace's space-group
+/// block — or just the focused workspace itself when it is not part of a
+/// collapsible group. Filtering happens here, in the single source of the
+/// rendered list, so hit-areas, scroll, and keyboard selection all stay
+/// consistent with what is on screen. With no focused workspace the full
+/// list stays (nothing to pin to).
+fn retain_focused_space_group(
+    app: &AppState,
+    entries: &mut Vec<WorkspaceListEntry>,
+    focused_idx: Option<usize>,
+    active_group: Option<&str>,
+    grouped_keys: &std::collections::HashSet<String>,
+) {
+    let Some(focused_idx) = focused_idx.filter(|idx| *idx < app.workspaces.len()) else {
+        return;
+    };
+    let focused_key = active_group.filter(|key| grouped_keys.contains(*key));
+    entries.retain(|entry| match entry {
+        WorkspaceListEntry::Workspace { ws_idx, .. } => match focused_key {
+            Some(key) => app
+                .workspaces
+                .get(*ws_idx)
+                .and_then(|ws| ws.worktree_space())
+                .is_some_and(|space| space.key == key),
+            None => *ws_idx == focused_idx,
+        },
+        // Remote rows are folded in after this filter runs.
+        WorkspaceListEntry::Remote { .. } => false,
+    });
 }
 
 /// Fold federated peer workspaces into the spaces list: rows whose
@@ -583,6 +675,12 @@ fn fold_remote_entries(app: &AppState, entries: &mut Vec<WorkspaceListEntry>) {
                 },
             );
         }
+    }
+
+    // Spaces scope current pins the list to the focused project: remote-only
+    // projects (no local block to splice into) stay hidden with the rest.
+    if matches!(app.spaces_panel_scope, PanelScope::Current) {
+        return;
     }
 
     // Remote-only projects trail the list; the first row of each project is
@@ -676,19 +774,40 @@ fn server_band_slots(app: &AppState) -> Vec<Option<crate::app::state::PeerSwitch
     slots
 }
 
+/// The band rows actually rendered, honoring the servers scope toggle:
+/// `all` keeps every slot, `current` only the local server — plus the home
+/// row when a fleet snapshot origin exists, because the way home must never
+/// hide.
+fn visible_server_band_slots(app: &AppState) -> Vec<Option<crate::app::state::PeerSwitchRequest>> {
+    let slots = server_band_slots(app);
+    match app.servers_panel_scope {
+        PanelScope::All => slots,
+        PanelScope::Current => slots
+            .into_iter()
+            .filter(|slot| {
+                matches!(
+                    slot,
+                    None | Some(crate::app::state::PeerSwitchRequest::Home)
+                )
+            })
+            .collect(),
+    }
+}
+
 /// Height the `servers` section wants: 0 with nothing but the self row,
-/// else a header row plus two lines per server row (capped) — or just the
-/// header when collapsed.
+/// else a header row plus two lines per visible server row (capped) plus
+/// the trailing hairline divider that separates `servers` from `spaces`.
 pub(crate) fn servers_section_height(app: &AppState) -> u16 {
-    let slots = server_band_slots(app).len() as u16;
-    if slots <= 1 {
+    if server_band_slots(app).len() <= 1 {
         return 0;
     }
-    if app.servers_collapsed {
-        return 1;
-    }
-    let rows = slots.min(SERVERS_SECTION_MAX_ROWS);
-    1 + rows * SERVER_ROW_LINES
+    let rows = (visible_server_band_slots(app).len() as u16).min(SERVERS_SECTION_MAX_ROWS);
+    1 + rows * SERVER_ROW_LINES + 1
+}
+
+/// The band minus its trailing divider row: the header plus the server rows.
+fn server_band_rows_area(area: Rect) -> Rect {
+    Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1))
 }
 
 /// Split the spaces-section rect into the `servers` band (top) and the
@@ -722,20 +841,23 @@ pub(crate) fn workspace_list_rect(
     carve_servers_band(ws_area, servers_height).1
 }
 
-pub(crate) fn workspace_list_body_rect(area: Rect, has_scrollbar: bool) -> Rect {
+/// The spaces list's row area: below the header rows, above the `new`
+/// footer row when one is reserved (`has_footer` — hidden in workspace
+/// tab-mode, where the slot returns to the list).
+pub(crate) fn workspace_list_body_rect(area: Rect, has_scrollbar: bool, has_footer: bool) -> Rect {
     if area.width == 0 || area.height <= WORKSPACE_SECTION_HEADER_ROWS {
         return Rect::default();
     }
 
     let body_y = area.y.saturating_add(WORKSPACE_SECTION_HEADER_ROWS);
-    let footer_y = area.y + area.height.saturating_sub(1);
-    let body_height = footer_y.saturating_sub(body_y);
+    let body_bottom = (area.y + area.height).saturating_sub(u16::from(has_footer));
+    let body_height = body_bottom.saturating_sub(body_y);
     let body_width = area.width.saturating_sub(u16::from(has_scrollbar));
     Rect::new(area.x, body_y, body_width, body_height)
 }
 
 fn workspace_list_visible_count(app: &AppState, area: Rect, scroll: usize) -> usize {
-    let body = workspace_list_body_rect(area, false);
+    let body = workspace_list_body_rect(area, false, app.sidebar_new_entry_visible());
     if body.width == 0 || body.height == 0 {
         return 0;
     }
@@ -801,7 +923,7 @@ pub(crate) fn workspace_list_scroll_metrics(
 
 pub(crate) fn workspace_list_scrollbar_rect(app: &AppState, area: Rect) -> Option<Rect> {
     let metrics = workspace_list_scroll_metrics(app, area);
-    let body = workspace_list_body_rect(area, true);
+    let body = workspace_list_body_rect(area, true, app.sidebar_new_entry_visible());
     (should_show_scrollbar(metrics) && body.width > 0 && body.height > 0).then_some(Rect::new(
         area.x + area.width.saturating_sub(1),
         body.y,
@@ -883,7 +1005,11 @@ pub(crate) fn compute_workspace_list_areas(
     }
 
     let metrics = workspace_list_scroll_metrics(app, ws_area);
-    let body = workspace_list_body_rect(ws_area, should_show_scrollbar(metrics));
+    let body = workspace_list_body_rect(
+        ws_area,
+        should_show_scrollbar(metrics),
+        app.sidebar_new_entry_visible(),
+    );
     if body.width == 0 || body.height == 0 {
         return (Vec::new(), Vec::new());
     }
@@ -1101,11 +1227,12 @@ pub(crate) fn workspace_drop_indicator_row(
     cards: &[crate::app::state::WorkspaceCardArea],
     area: Rect,
     insert_idx: usize,
+    has_footer: bool,
 ) -> Option<u16> {
     if area.height == 0 {
         return None;
     }
-    let list_bottom = area.y + area.height.saturating_sub(1);
+    let list_bottom = (area.y + area.height).saturating_sub(u16::from(has_footer));
 
     let first = cards.first()?;
     if insert_idx == first.ws_idx {
@@ -1158,6 +1285,7 @@ pub(super) fn render_sidebar(
     }
     render_workspace_list(app, terminal_runtimes, frame, list_area, is_navigating);
     render_agent_detail(app, terminal_runtimes, frame, detail_area);
+    render_menu_row(app, frame, area);
     render_sidebar_toggle(app, frame, area, false, p);
 }
 
@@ -1171,11 +1299,11 @@ fn server_slot_rect(servers_area: Rect, slot: u16) -> Option<Rect> {
         .then(|| Rect::new(servers_area.x, y, servers_area.width, SERVER_ROW_LINES))
 }
 
-/// Compute hit areas for the `servers` section: the header rect (toggles
-/// collapse) and one two-line rect per visible switchable row (home,
-/// snapshot, config peer — see [`server_band_slots`] for the order). The
-/// local server's slot deliberately gets NO card — clicking yourself must
-/// never request a server switch.
+/// Compute hit areas for the `servers` section: the header rect (hosts the
+/// all/current scope toggle) and one two-line rect per visible switchable
+/// row (home, snapshot, config peer — see [`server_band_slots`] for the
+/// order). The local server's slot deliberately gets NO card — clicking
+/// yourself must never request a server switch.
 pub(crate) fn compute_server_section_areas(
     app: &AppState,
     area: Rect,
@@ -1188,50 +1316,70 @@ pub(crate) fn compute_server_section_areas(
         return (Rect::default(), Vec::new());
     }
     let header_rect = Rect::new(servers_area.x, servers_area.y, servers_area.width, 1);
+    let rows_area = server_band_rows_area(servers_area);
     let mut cards = Vec::new();
-    if !app.servers_collapsed {
-        for (slot, target) in server_band_slots(app).into_iter().enumerate() {
-            // The self row (None) gets no card.
-            let Some(target) = target else {
-                continue;
-            };
-            let Some(rect) = server_slot_rect(servers_area, slot as u16) else {
-                break;
-            };
-            cards.push(crate::app::state::ServerCardArea { target, rect });
-        }
+    for (slot, target) in visible_server_band_slots(app).into_iter().enumerate() {
+        // The self row (None) gets no card.
+        let Some(target) = target else {
+            continue;
+        };
+        let Some(rect) = server_slot_rect(rows_area, slot as u16) else {
+            break;
+        };
+        cards.push(crate::app::state::ServerCardArea { target, rect });
     }
     (header_rect, cards)
 }
 
 fn render_servers_section(app: &AppState, frame: &mut Frame, area: Rect, is_navigating: bool) {
     let p = &app.palette;
-    let chevron = if app.servers_collapsed { "▸" } else { "▾" };
     let down = app
         .peer_summaries
         .iter()
         .filter(|peer| peer.reachability() == crate::peers::PeerReachability::Down)
         .count();
     let header = if down > 0 {
-        format!("{chevron} servers ({down} down)")
+        format!(" servers ({down} down)")
     } else {
-        format!("{chevron} servers")
+        " servers".to_string()
     };
+    let header_rect = Rect::new(area.x, area.y, area.width, 1);
     frame.render_widget(
         Paragraph::new(Line::from(vec![Span::styled(
             header,
             Style::default().fg(p.overlay0).add_modifier(Modifier::BOLD),
         )])),
-        Rect::new(area.x, area.y, area.width, 1),
+        header_rect,
     );
+    let toggle_rect = panel_scope_toggle_rect(header_rect, app.servers_panel_scope);
+    if toggle_rect != Rect::default() {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                panel_scope_toggle_label(app.servers_panel_scope),
+                Style::default().fg(p.overlay0).add_modifier(Modifier::BOLD),
+            ))
+            .alignment(Alignment::Right),
+            toggle_rect,
+        );
+    }
     let _ = is_navigating;
 
-    if app.servers_collapsed {
-        return;
+    // Hairline divider on the band's last row: the same visual language as
+    // the spaces↔agents divider below.
+    if area.height > 1 {
+        let divider_y = area.y + area.height - 1;
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                "─".repeat(area.width as usize),
+                Style::default().fg(p.divider_color()),
+            )),
+            Rect::new(area.x, divider_y, area.width, 1),
+        );
     }
 
-    for (slot, target) in server_band_slots(app).into_iter().enumerate() {
-        let Some(rect) = server_slot_rect(area, slot as u16) else {
+    let rows_area = server_band_rows_area(area);
+    for (slot, target) in visible_server_band_slots(app).into_iter().enumerate() {
+        let Some(rect) = server_slot_rect(rows_area, slot as u16) else {
             break;
         };
         // The currently-attached machine reads like the active workspace row —
@@ -1292,11 +1440,14 @@ fn render_server_rows(frame: &mut Frame, rect: Rect, [title, health]: [Line<'sta
 /// Indentation that lines the health glyphs up under the server name.
 const SERVER_HEALTH_INDENT: &str = "   ";
 
-/// The local server's row: `● mba22 ✦` plus the status line's health glyphs
-/// fed from the same local `SystemStats` sample the HUD shows.
+/// The local server's row: `● mba22 ✦` plus battery and net throughput on
+/// the title line (#41 — peers don't carry those), over the shared
+/// fixed-width metric line, all fed from the same local `SystemStats`
+/// sample the HUD shows.
 fn self_server_rows(app: &AppState) -> [Line<'static>; 2] {
+    use super::status::{battery_icon, battery_style, format_net_io, push_band_metric};
     let p = &app.palette;
-    let title = Line::from(vec![
+    let mut title = vec![
         Span::styled(" ", Style::default()),
         Span::styled("●", Style::default().fg(p.accent)),
         Span::styled(" ", Style::default()),
@@ -1305,15 +1456,34 @@ fn self_server_rows(app: &AppState) -> [Line<'static>; 2] {
             Style::default().fg(p.text).add_modifier(Modifier::BOLD),
         ),
         Span::styled(" ✦", Style::default().fg(p.accent)),
-    ]);
+    ];
 
     let mut health: Vec<Span<'static>> = Vec::new();
     if let Some(stats) = app.system_stats.as_ref() {
+        if let Some(percent) = stats.battery_percent {
+            push_band_metric(
+                &mut title,
+                battery_icon(percent, stats.battery_charging),
+                format!("{percent}%"),
+                battery_style(percent, p),
+                p,
+            );
+        }
+        if let (Some(rx), Some(tx)) = (stats.net_rx_per_sec, stats.net_tx_per_sec) {
+            push_band_metric(
+                &mut title,
+                "\u{f06f3}", // nf-md-network
+                format_net_io(rx, tx),
+                Style::default().fg(p.teal),
+                p,
+            );
+        }
         health = server_health_spans(
             stats.cpu_percent,
             stats.mem_used,
             stats.mem_total,
             stats.disk_free,
+            stats.gpu_percent.map(f32::from),
             p,
         );
     }
@@ -1329,7 +1499,7 @@ fn self_server_rows(app: &AppState) -> [Line<'static>; 2] {
     }
     push_rollup_spans(&mut health, blocked, working, p);
     health.insert(0, Span::styled(SERVER_HEALTH_INDENT, Style::default()));
-    [title, Line::from(health)]
+    [Line::from(title), Line::from(health)]
 }
 
 /// The pinned origin row of a carried fleet snapshot: `← mba22 home` over a
@@ -1382,8 +1552,8 @@ fn snapshot_server_rows(
 }
 
 /// One peer's two `servers` lines:
-/// `● anvil  34ms` over `   cpu 71% · mem 48G/64G ❶`, or the compact
-/// `unreachable {age}` form when the peer is down.
+/// `● anvil  34ms` over `    71% 48G/64G ❶` (the band's fixed-width metric
+/// line), or the compact `unreachable {age}` form when the peer is down.
 fn peer_server_rows(
     peer: &crate::peers::PeerSummaryState,
     p: &crate::app::state::Palette,
@@ -1429,11 +1599,14 @@ fn peer_server_rows(
 
     let mut health: Vec<Span<'static>> = Vec::new();
     if let Some(system) = peer.system.as_ref() {
+        // Peer summaries don't carry gpu (or net/battery) — see
+        // `PeerSystemSummary`; the shared formatter simply omits them.
         health = server_health_spans(
             system.cpu_percent.map(f32::from),
             system.mem_used,
             system.mem_total,
             system.disk_free,
+            None,
             p,
         );
     }
@@ -1452,45 +1625,57 @@ fn peer_server_rows(
     [Line::from(title), Line::from(health)]
 }
 
-/// Compact machine health in the status line's glyph language:
-/// `cpu 42% · mem 13G/16G · disk 213G`, utilization-colored at 60/85%.
+/// A server row's metric line in the band's fixed-width glyph language:
+/// ` 42% 13G/16G 213G  37%` (cpu, mem, disk, gpu) — space-separated, no
+/// `·` (the dots cost width for nothing at this density). CPU/GPU render
+/// right-aligned width-3 and mem used pads to the width of total so the
+/// columns hold still across refreshes. One formatter for the self,
+/// snapshot, and config-peer rows alike (#41).
 fn server_health_spans(
     cpu_percent: Option<f32>,
     mem_used: Option<u64>,
     mem_total: Option<u64>,
     disk_free: Option<u64>,
+    gpu_percent: Option<f32>,
     p: &crate::app::state::Palette,
 ) -> Vec<Span<'static>> {
-    use super::status::{mem_percent, push_metric, utilization_style};
+    use super::status::{
+        format_mem_ratio, format_percent3, mem_percent, push_band_metric, utilization_style,
+    };
     let mut spans = Vec::new();
     if let Some(cpu) = cpu_percent {
-        push_metric(
+        push_band_metric(
             &mut spans,
             "\u{f0ee0}", // nf-md-cpu_64_bit
-            format!("{cpu:.0}%"),
+            format_percent3(cpu),
             utilization_style(cpu, p),
             p,
         );
     }
     if let (Some(used), Some(total)) = (mem_used, mem_total) {
-        push_metric(
+        push_band_metric(
             &mut spans,
             "\u{f035b}", // nf-md-memory
-            format!(
-                "{}/{}",
-                crate::system_stats::human_bytes(used),
-                crate::system_stats::human_bytes(total)
-            ),
+            format_mem_ratio(used, total),
             utilization_style(mem_percent(used, total), p),
             p,
         );
     }
     if let Some(free) = disk_free {
-        push_metric(
+        push_band_metric(
             &mut spans,
             "\u{f02ca}", // nf-md-harddisk
             crate::system_stats::human_bytes(free),
             Style::default().fg(p.text),
+            p,
+        );
+    }
+    if let Some(gpu) = gpu_percent {
+        push_band_metric(
+            &mut spans,
+            "\u{f08ae}", // nf-md-expansion_card
+            format_percent3(gpu),
+            utilization_style(gpu, p),
             p,
         );
     }
@@ -1573,23 +1758,41 @@ fn render_workspace_list(
         }
         _ => None,
     };
+    let has_footer = app.sidebar_new_entry_visible();
     let insertion_row = match app.drag.as_ref().map(|drag| &drag.target) {
         Some(crate::app::state::DragTarget::WorkspaceReorder {
             insert_idx: Some(insert_idx),
             ..
-        }) => workspace_drop_indicator_row(&app.view.workspace_card_areas, area, *insert_idx),
+        }) => workspace_drop_indicator_row(
+            &app.view.workspace_card_areas,
+            area,
+            *insert_idx,
+            has_footer,
+        ),
         _ => None,
     };
 
-    let list_bottom = area.y + area.height.saturating_sub(1);
+    let list_bottom = (area.y + area.height).saturating_sub(u16::from(has_footer));
     if area.height > 0 {
+        let header_rect = Rect::new(area.x, area.y, area.width, 1);
         frame.render_widget(
             Paragraph::new(Line::from(vec![Span::styled(
                 " spaces",
                 Style::default().fg(p.overlay0).add_modifier(Modifier::BOLD),
             )])),
-            Rect::new(area.x, area.y, area.width, 1),
+            header_rect,
         );
+        let toggle_rect = panel_scope_toggle_rect(header_rect, app.spaces_panel_scope);
+        if toggle_rect != Rect::default() {
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    panel_scope_toggle_label(app.spaces_panel_scope),
+                    Style::default().fg(p.overlay0).add_modifier(Modifier::BOLD),
+                ))
+                .alignment(Alignment::Right),
+                toggle_rect,
+            );
+        }
     }
 
     let metrics = workspace_list_scroll_metrics(app, area);
@@ -1794,30 +1997,47 @@ fn render_workspace_list(
         render_scrollbar(frame, metrics, track, p.surface_dim, p.overlay0, "▕");
     }
 
-    if app.mouse_capture && list_bottom > area.y {
+    if app.mouse_capture && has_footer && list_bottom > area.y {
         let new_rect = app.sidebar_new_button_rect();
         frame.render_widget(
             Paragraph::new(Span::styled(" new", Style::default().fg(p.overlay0))),
             new_rect,
         );
+    }
+}
 
-        let menu_rect = app.global_launcher_rect();
-        let menu_line = if app.global_menu_attention_badge_visible() {
-            Line::from(vec![
-                Span::styled(
-                    "● ",
-                    Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled("menu", Style::default().fg(p.overlay0)),
-            ])
-        } else {
-            Line::from(vec![Span::styled("menu", Style::default().fg(p.overlay0))])
-        };
+/// The pinned bottom band (#41): a hairline divider over the standalone
+/// `menu` row — the sidebar's last row, below the agents section. Gated on
+/// the mouse UI like the old footer entry; the click target is the whole
+/// row ([`AppState::global_launcher_rect`]).
+fn render_menu_row(app: &AppState, frame: &mut Frame, area: Rect) {
+    if !app.mouse_capture {
+        return;
+    }
+    let p = &app.palette;
+    let divider = sidebar_menu_divider_rect(area, app.sidebar_pane_gap);
+    if divider != Rect::default() {
         frame.render_widget(
-            Paragraph::new(menu_line).alignment(Alignment::Right),
-            menu_rect,
+            Paragraph::new(Span::styled(
+                "─".repeat(divider.width as usize),
+                Style::default().fg(p.divider_color()),
+            )),
+            divider,
         );
     }
+    let row = sidebar_menu_row_rect(area, app.sidebar_pane_gap);
+    if row == Rect::default() {
+        return;
+    }
+    let mut spans = vec![Span::styled(" ", Style::default())];
+    if app.global_menu_attention_badge_visible() {
+        spans.push(Span::styled(
+            "● ",
+            Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+        ));
+    }
+    spans.push(Span::styled("menu", Style::default().fg(p.overlay0)));
+    frame.render_widget(Paragraph::new(Line::from(spans)), row);
 }
 
 fn render_agent_detail(
@@ -2050,17 +2270,20 @@ mod tests {
     }
 
     #[test]
-    fn servers_section_height_tracks_peers_and_collapse() {
+    fn servers_section_height_tracks_peers_and_scope() {
         let mut app = crate::app::state::AppState::test_new();
         assert_eq!(servers_section_height(&app), 0);
         app.peer_summaries = vec![
             peer_with_workspaces("anvil", vec![]),
             peer_with_workspaces("sage", vec![]),
         ];
-        // Header + two lines each for the self row and both peers.
-        assert_eq!(servers_section_height(&app), 7);
-        app.servers_collapsed = true;
-        assert_eq!(servers_section_height(&app), 1); // header only
+        // Header + two lines each for the self row and both peers + the
+        // trailing divider before the spaces list.
+        assert_eq!(servers_section_height(&app), 1 + 3 * SERVER_ROW_LINES + 1);
+        // Scope current: only the self row renders, the band stays visible
+        // (header keeps the toggle reachable).
+        app.servers_panel_scope = PanelScope::Current;
+        assert_eq!(servers_section_height(&app), 1 + SERVER_ROW_LINES + 1);
     }
 
     #[test]
@@ -2070,7 +2293,9 @@ mod tests {
             peer_with_workspaces("anvil", vec![]),
             peer_with_workspaces("sage", vec![]),
         ];
-        let area = Rect::new(0, 0, 30, 30);
+        // Tall enough that the half-section cap fits the full band: header +
+        // three two-line rows + the trailing divider (8 rows).
+        let area = Rect::new(0, 0, 30, 34);
         let (header, cards) = compute_server_section_areas(&app, area);
         assert_ne!(header, Rect::default());
         assert_eq!(cards.len(), 2);
@@ -2100,7 +2325,9 @@ mod tests {
         assert_eq!(cards[1].rect.y, cards[0].rect.y + SERVER_ROW_LINES);
         assert_eq!(cards[1].rect.height, SERVER_ROW_LINES);
 
-        app.servers_collapsed = true;
+        // Scope current without a carried snapshot: only the self row stays,
+        // which has no hit-area — the header (with its toggle) remains.
+        app.servers_panel_scope = PanelScope::Current;
         let (header, cards) = compute_server_section_areas(&app, area);
         assert_ne!(header, Rect::default());
         assert!(cards.is_empty());
@@ -2138,8 +2365,8 @@ mod tests {
             ]
         );
 
-        // Header + five two-line rows.
-        assert_eq!(servers_section_height(&app), 1 + 5 * SERVER_ROW_LINES);
+        // Header + five two-line rows + the trailing divider.
+        assert_eq!(servers_section_height(&app), 1 + 5 * SERVER_ROW_LINES + 1);
 
         // The hit-areas skip the self slot: home sits directly under the
         // header, the first snapshot row two lines below the self row.
@@ -2173,8 +2400,173 @@ mod tests {
         let mut app = crate::app::state::AppState::test_new();
         // The typical spoke: zero config peers, but a carried snapshot.
         app.fleet_snapshot = Some(carried_snapshot("mba22", vec!["anvil"]));
-        // Header + home + self + one snapshot row.
-        assert_eq!(servers_section_height(&app), 1 + 3 * SERVER_ROW_LINES);
+        // Header + home + self + one snapshot row + the trailing divider.
+        assert_eq!(servers_section_height(&app), 1 + 3 * SERVER_ROW_LINES + 1);
+    }
+
+    #[test]
+    fn servers_current_scope_keeps_home_row_when_snapshot_present() {
+        use crate::app::state::PeerSwitchRequest;
+        let mut app = crate::app::state::AppState::test_new();
+        app.fleet_snapshot = Some(carried_snapshot("mba22", vec!["anvil", "ksb"]));
+        app.peer_summaries = vec![peer_with_workspaces("ownpeer", vec![])];
+        app.servers_panel_scope = PanelScope::Current;
+
+        // The way home must never hide: scope current keeps home + self.
+        assert_eq!(
+            visible_server_band_slots(&app),
+            vec![Some(PeerSwitchRequest::Home), None]
+        );
+        assert_eq!(servers_section_height(&app), 1 + 2 * SERVER_ROW_LINES + 1);
+
+        // Home stays clickable directly under the header; snapshot/config
+        // peers lose their hit-areas with their rows.
+        let (header, cards) = compute_server_section_areas(&app, Rect::new(0, 0, 30, 80));
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].target, PeerSwitchRequest::Home);
+        assert_eq!(cards[0].rect.y, header.y + 1);
+    }
+
+    #[test]
+    fn servers_header_scope_toggle_sits_right_aligned_in_header_row() {
+        let header = Rect::new(2, 5, 24, 1);
+        let toggle = panel_scope_toggle_rect(header, PanelScope::All);
+        assert_eq!(toggle, Rect::new(2 + 24 - 3, 5, 3, 1));
+        let toggle = panel_scope_toggle_rect(header, PanelScope::Current);
+        assert_eq!(toggle, Rect::new(2 + 24 - 7, 5, 7, 1));
+        assert_eq!(
+            panel_scope_toggle_rect(Rect::default(), PanelScope::All),
+            Rect::default()
+        );
+    }
+
+    #[test]
+    fn servers_band_renders_scope_label_and_divider_above_spaces() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.ensure_test_terminals();
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = crate::app::Mode::Terminal;
+        app.peer_summaries = vec![peer_with_workspaces("anvil", vec![])];
+
+        let area = Rect::new(0, 0, 30, 40);
+        let mut terminal =
+            Terminal::new(TestBackend::new(30, 40)).expect("test terminal should initialize");
+        let runtimes = TerminalRuntimeRegistry::new();
+        terminal
+            .draw(|frame| render_sidebar(&app, &runtimes, frame, area))
+            .expect("sidebar should render");
+
+        let (ws_area, _) =
+            expanded_sidebar_sections(area, app.sidebar_section_split, app.sidebar_pane_gap);
+        let (servers_area, list_area) = carve_servers_band(ws_area, servers_section_height(&app));
+        let buffer = terminal.backend().buffer();
+
+        // Header row: " servers" with the right-aligned scope label.
+        let header_text: String = (servers_area.x..servers_area.x + servers_area.width)
+            .map(|x| buffer[(x, servers_area.y)].symbol().to_string())
+            .collect();
+        assert!(header_text.starts_with(" servers"), "{header_text:?}");
+        assert!(header_text.trim_end().ends_with("all"), "{header_text:?}");
+
+        // The band's last row is a hairline divider — the same visual
+        // language as the spaces↔agents divider.
+        let divider_y = servers_area.y + servers_area.height - 1;
+        for x in servers_area.x..servers_area.x + servers_area.width {
+            assert_eq!(buffer[(x, divider_y)].symbol(), "─", "col {x}");
+        }
+
+        // The spaces header starts directly below the divider.
+        let spaces_text: String = (list_area.x..list_area.x + list_area.width)
+            .map(|x| buffer[(x, list_area.y)].symbol().to_string())
+            .collect();
+        assert!(spaces_text.starts_with(" spaces"), "{spaces_text:?}");
+    }
+
+    fn buffer_row_text(buffer: &ratatui::buffer::Buffer, rect: Rect, y: u16) -> String {
+        (rect.x..rect.x + rect.width)
+            .map(|x| buffer[(x, y)].symbol().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn menu_renders_pinned_to_sidebar_bottom_with_divider_above() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.ensure_test_terminals();
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = crate::app::Mode::Terminal;
+
+        let area = Rect::new(0, 0, 30, 40);
+        // The `new` footer renders through the state's hit-area rect.
+        app.view.sidebar_rect = area;
+        let mut terminal =
+            Terminal::new(TestBackend::new(30, 40)).expect("test terminal should initialize");
+        let runtimes = TerminalRuntimeRegistry::new();
+        terminal
+            .draw(|frame| render_sidebar(&app, &runtimes, frame, area))
+            .expect("sidebar should render");
+        let buffer = terminal.backend().buffer();
+
+        // The menu is a standalone row pinned to the sidebar's last row…
+        let row = sidebar_menu_row_rect(area, app.sidebar_pane_gap);
+        assert_eq!(row.y, area.y + area.height - 1);
+        let row_text = buffer_row_text(buffer, row, row.y);
+        assert!(row_text.trim_start().starts_with("menu"), "{row_text:?}");
+
+        // …separated above by the hairline divider idiom.
+        let divider = sidebar_menu_divider_rect(area, app.sidebar_pane_gap);
+        for x in divider.x..divider.x + divider.width {
+            assert_eq!(buffer[(x, divider.y)].symbol(), "─", "col {x}");
+        }
+
+        // The spaces footer hosts only `new` now — no mid-field menu.
+        let ws_rect = workspace_list_rect(area, app.sidebar_section_split, app.sidebar_pane_gap, 0);
+        let footer_text = buffer_row_text(buffer, ws_rect, ws_rect.y + ws_rect.height - 1);
+        assert!(footer_text.contains("new"), "{footer_text:?}");
+        assert!(!footer_text.contains("menu"), "{footer_text:?}");
+    }
+
+    #[test]
+    fn workspace_tab_mode_hides_the_new_entry_but_keeps_the_menu() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.ensure_test_terminals();
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = crate::app::Mode::Terminal;
+        app.tab_mode = crate::config::TabModeConfig::Workspace;
+
+        let area = Rect::new(0, 0, 30, 40);
+        let mut terminal =
+            Terminal::new(TestBackend::new(30, 40)).expect("test terminal should initialize");
+        let runtimes = TerminalRuntimeRegistry::new();
+        terminal
+            .draw(|frame| render_sidebar(&app, &runtimes, frame, area))
+            .expect("sidebar should render");
+        let buffer = terminal.backend().buffer();
+
+        // No `new` anywhere in the sidebar; the pinned menu row remains.
+        let all_text: String = (area.y..area.y + area.height)
+            .map(|y| buffer_row_text(buffer, area, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!all_text.contains("new"), "{all_text}");
+        let row = sidebar_menu_row_rect(area, app.sidebar_pane_gap);
+        let row_text = buffer_row_text(buffer, row, row.y);
+        assert!(row_text.trim_start().starts_with("menu"), "{row_text:?}");
+
+        // The spaces list reclaims the footer row.
+        let ws_rect = workspace_list_rect(area, app.sidebar_section_split, app.sidebar_pane_gap, 0);
+        let body_tabs = workspace_list_body_rect(ws_rect, false, true);
+        let body_workspace = workspace_list_body_rect(ws_rect, false, false);
+        assert_eq!(body_workspace.height, body_tabs.height + 1);
+        assert_eq!(
+            body_workspace.y + body_workspace.height,
+            ws_rect.y + ws_rect.height
+        );
     }
 
     #[test]
@@ -2203,12 +2595,18 @@ mod tests {
 
     #[test]
     fn self_server_rows_show_local_identity_and_glyph_health() {
+        const G: u64 = 1024 * 1024 * 1024;
         let mut app = crate::app::state::AppState::test_new();
         app.system_stats = Some(crate::system_stats::SystemStats {
             cpu_percent: Some(42.0),
-            mem_used: Some(13 * 1024 * 1024 * 1024),
-            mem_total: Some(16 * 1024 * 1024 * 1024),
-            disk_free: Some(213 * 1024 * 1024 * 1024),
+            mem_used: Some(13 * G),
+            mem_total: Some(16 * G),
+            disk_free: Some(213 * G),
+            battery_percent: Some(85),
+            battery_charging: Some(false),
+            net_rx_per_sec: Some(1500),
+            net_tx_per_sec: Some(512),
+            gpu_percent: Some(8),
             ..Default::default()
         });
         let [title, health] = self_server_rows(&app);
@@ -2216,9 +2614,39 @@ mod tests {
         let health = line_text(&health);
         assert!(title.contains(&crate::app::short_host_name()), "{title}");
         assert!(title.contains('\u{2726}'), "{title}"); // ✦ current marker
-        assert!(health.contains("\u{f0ee0} 42%"), "{health}");
+                                                        // Battery and net live on the title line (#41): quintile glyph +
+                                                        // charge, then the net glyph with ▼rx ▲tx.
+        assert!(title.contains("\u{f0079} 85%"), "{title}");
+        assert!(
+            title.contains("\u{f06f3} \u{25bc}1.5K \u{25b2}512B"),
+            "{title}"
+        );
+        // The metric line: cpu/mem/disk/gpu, space-separated (no `·`),
+        // cpu/gpu right-aligned width-3.
+        assert!(health.contains("\u{f0ee0}  42%"), "{health}");
         assert!(health.contains("\u{f035b} 13G/16G"), "{health}");
         assert!(health.contains("\u{f02ca} 213G"), "{health}");
+        assert!(health.contains("\u{f08ae}   8%"), "{health}");
+        assert!(!health.contains('\u{b7}'), "{health}");
+        assert!(
+            health.contains("42% \u{f035b} 13G/16G \u{f02ca} 213G \u{f08ae}"),
+            "{health}"
+        );
+    }
+
+    #[test]
+    fn self_server_rows_omit_battery_net_and_gpu_when_unsampled() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.system_stats = Some(crate::system_stats::SystemStats {
+            cpu_percent: Some(42.0),
+            ..Default::default()
+        });
+        let [title, health] = self_server_rows(&app);
+        let title = line_text(&title);
+        let health = line_text(&health);
+        assert!(!title.contains("\u{f06f3}"), "{title}");
+        assert!(!title.contains('%'), "{title}");
+        assert!(!health.contains("\u{f08ae}"), "{health}");
     }
 
     #[test]
@@ -2246,12 +2674,34 @@ mod tests {
         let health = line_text(&health);
         assert!(title.contains("anvil"), "{title}");
         assert!(title.contains("34ms"), "{title}");
-        // The second line speaks the status line's glyph language and rolls
-        // the one working agent up as a circled count.
-        assert!(health.contains("\u{f0ee0} 71%"), "{health}");
+        // The second line speaks the band's fixed-width glyph language
+        // (cpu right-aligned width-3, no `·` separators) and rolls the one
+        // working agent up as a circled count.
+        assert!(health.contains("\u{f0ee0}  71%"), "{health}");
         assert!(health.contains("\u{f035b} 48G/64G"), "{health}");
+        assert!(!health.contains('\u{b7}'), "{health}");
         assert!(health.contains('\u{2776}'), "{health}"); // ❶ working
         assert!(!health.contains("anvil"), "{health}");
+    }
+
+    #[test]
+    fn peer_server_rows_keep_metric_columns_stable_at_full_utilization() {
+        const G: u64 = 1024 * 1024 * 1024;
+        let p = crate::app::state::AppState::test_new().palette;
+        let mut peer = peer_with_workspaces("anvil", vec![]);
+        peer.host = Some("anvil".into());
+        peer.system = Some(crate::api::schema::PeerSystemSummary {
+            cpu_percent: Some(100),
+            mem_used: Some(92 * G),
+            mem_total: Some(512 * G),
+            disk_free: None,
+        });
+        let [_, health] = peer_server_rows(&peer, &p);
+        let health = line_text(&health);
+        // 100% fills the width-3 column exactly; mem used pads to the
+        // width of total so the slash column never jitters.
+        assert!(health.contains("\u{f0ee0} 100%"), "{health}");
+        assert!(health.contains("\u{f035b}  92G/512G"), "{health}");
     }
 
     #[test]
@@ -2657,10 +3107,42 @@ mod tests {
 
     #[test]
     fn expanded_sidebar_sections_handle_tiny_heights() {
+        // The bottom two rows stay reserved for the pinned menu band; the
+        // sections split the three rows above it.
         let (ws_area, detail_area) = expanded_sidebar_sections(Rect::new(0, 0, 20, 5), 0.9, 0);
 
-        assert_eq!(ws_area, Rect::new(0, 0, 19, 3));
-        assert_eq!(detail_area, Rect::new(0, 3, 19, 2));
+        assert_eq!(ws_area, Rect::new(0, 0, 19, 2));
+        assert_eq!(detail_area, Rect::new(0, 2, 19, 1));
+    }
+
+    #[test]
+    fn sidebar_sections_end_above_the_pinned_menu_band() {
+        let area = Rect::new(0, 0, 26, 20);
+        let (ws_area, detail_area) = expanded_sidebar_sections(area, 0.5, 0);
+
+        // servers/spaces + agents fill everything above the 2-row band.
+        assert_eq!(
+            ws_area.height + detail_area.height,
+            area.height - SIDEBAR_MENU_BAND_ROWS
+        );
+
+        // The menu row is the very last sidebar row, its divider directly
+        // above, both directly below the agents section.
+        let row = sidebar_menu_row_rect(area, 0);
+        let divider = sidebar_menu_divider_rect(area, 0);
+        assert_eq!(row, Rect::new(0, 19, 25, 1));
+        assert_eq!(divider, Rect::new(0, 18, 25, 1));
+        assert_eq!(detail_area.y + detail_area.height, divider.y);
+
+        // Degenerate heights reserve nothing.
+        assert_eq!(
+            sidebar_menu_row_rect(Rect::new(0, 0, 26, 1), 0),
+            Rect::default()
+        );
+        assert_eq!(
+            sidebar_menu_divider_rect(Rect::new(0, 0, 26, 1), 0),
+            Rect::default()
+        );
     }
 
     #[test]
@@ -2858,7 +3340,7 @@ mod tests {
         app.mode = Mode::Terminal;
         app.workspace_scroll = 1;
 
-        let (cards, headers) = compute_workspace_list_areas(&app, Rect::new(0, 0, 30, 12));
+        let (cards, headers) = compute_workspace_list_areas(&app, Rect::new(0, 0, 30, 14));
 
         assert!(headers.is_empty());
         assert_eq!(cards.len(), 1);
@@ -2913,6 +3395,187 @@ mod tests {
                     indented: false,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn spaces_current_scope_renders_only_focused_group() {
+        let mut app = AppState::test_new();
+        app.workspaces = vec![
+            workspace_with_worktree_space("main", Some("repo-key"), "/repo/herdr"),
+            workspace_with_worktree_space("issue", Some("repo-key"), "/repo/herdr-issue"),
+            Workspace::test_new("notes"),
+        ];
+        app.mode = Mode::Terminal;
+        app.active = Some(1);
+        app.spaces_panel_scope = PanelScope::Current;
+
+        // Focused grouped workspace: the whole group block renders — parent
+        // plus members — and nothing else.
+        assert_eq!(
+            workspace_list_entries(&app),
+            vec![
+                WorkspaceListEntry::Workspace {
+                    ws_idx: 0,
+                    indented: false,
+                },
+                WorkspaceListEntry::Workspace {
+                    ws_idx: 1,
+                    indented: true,
+                },
+            ]
+        );
+
+        // Focused ungrouped workspace: just that workspace.
+        app.active = Some(2);
+        assert_eq!(
+            workspace_list_entries(&app),
+            vec![WorkspaceListEntry::Workspace {
+                ws_idx: 2,
+                indented: false,
+            }]
+        );
+
+        // Scope all: the full list, unchanged.
+        app.spaces_panel_scope = PanelScope::All;
+        assert_eq!(workspace_list_entries(&app).len(), 3);
+    }
+
+    #[test]
+    fn spaces_current_scope_stays_orthogonal_to_group_collapse() {
+        let mut app = AppState::test_new();
+        app.workspaces = vec![
+            workspace_with_worktree_space("main", Some("repo-key"), "/repo/herdr"),
+            workspace_with_worktree_space("issue", Some("repo-key"), "/repo/herdr-issue"),
+            Workspace::test_new("notes"),
+        ];
+        app.mode = Mode::Terminal;
+        app.active = Some(1);
+        app.spaces_panel_scope = PanelScope::Current;
+        app.collapsed_space_keys.insert("repo-key".into());
+
+        // Collapse still folds members within the rendered group: parent +
+        // the focused child only.
+        assert_eq!(
+            workspace_list_entries(&app),
+            vec![
+                WorkspaceListEntry::Workspace {
+                    ws_idx: 0,
+                    indented: false,
+                },
+                WorkspaceListEntry::Workspace {
+                    ws_idx: 1,
+                    indented: true,
+                },
+            ]
+        );
+
+        app.active = Some(0);
+        assert_eq!(
+            workspace_list_entries(&app),
+            vec![WorkspaceListEntry::Workspace {
+                ws_idx: 0,
+                indented: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn spaces_current_scope_keeps_focused_project_remotes_and_hides_remote_only_projects() {
+        let mut app = AppState::test_new();
+        app.workspaces = vec![
+            workspace_with_project_key("herdr", "github.com/gerchowl/herdr"),
+            workspace_with_project_key("other", "github.com/gerchowl/other"),
+        ];
+        app.peer_summaries = vec![peer_with_workspaces(
+            "anvil",
+            vec![
+                remote_summary(
+                    "herdr",
+                    Some("github.com/gerchowl/herdr"),
+                    Some("herdr"),
+                    Some("fix/pty"),
+                ),
+                remote_summary(
+                    "dotfiles",
+                    Some("github.com/gerchowl/dotfiles"),
+                    Some("dotfiles"),
+                    None,
+                ),
+            ],
+        )];
+        app.mode = Mode::Terminal;
+        app.active = Some(0);
+        app.spaces_panel_scope = PanelScope::Current;
+
+        // The focused project keeps its spliced remote rows; the second
+        // local project and the remote-only trailing project both hide.
+        assert_eq!(
+            workspace_list_entries(&app),
+            vec![
+                WorkspaceListEntry::Workspace {
+                    ws_idx: 0,
+                    indented: false,
+                },
+                WorkspaceListEntry::Remote {
+                    peer_idx: 0,
+                    ws_idx: 0,
+                    indented: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn spaces_current_scope_clamps_keyboard_selection_to_visible_entries() {
+        let mut app = AppState::test_new();
+        app.workspaces = vec![
+            workspace_with_worktree_space("main", Some("repo-key"), "/repo/herdr"),
+            workspace_with_worktree_space("issue", Some("repo-key"), "/repo/herdr-issue"),
+            Workspace::test_new("notes"),
+        ];
+        app.mode = Mode::Navigate;
+        app.selected = 0;
+        app.spaces_panel_scope = PanelScope::Current;
+
+        // Selection moves through the visible (focused-group) entries only:
+        // a large delta clamps to the last group member, never reaching the
+        // hidden flat workspace.
+        app.move_selected_workspace_by_visible_delta(5);
+        assert_eq!(app.selected, 1);
+        app.move_selected_workspace_by_visible_delta(-5);
+        assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn spaces_header_renders_scope_toggle_label() {
+        let mut app = AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.ensure_test_terminals();
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = crate::app::Mode::Terminal;
+        app.spaces_panel_scope = PanelScope::Current;
+
+        let area = Rect::new(0, 0, 30, 40);
+        let mut terminal =
+            Terminal::new(TestBackend::new(30, 40)).expect("test terminal should initialize");
+        let runtimes = TerminalRuntimeRegistry::new();
+        terminal
+            .draw(|frame| render_sidebar(&app, &runtimes, frame, area))
+            .expect("sidebar should render");
+
+        let (ws_area, _) =
+            expanded_sidebar_sections(area, app.sidebar_section_split, app.sidebar_pane_gap);
+        let (_, list_area) = carve_servers_band(ws_area, servers_section_height(&app));
+        let buffer = terminal.backend().buffer();
+        let header_text: String = (list_area.x..list_area.x + list_area.width)
+            .map(|x| buffer[(x, list_area.y)].symbol().to_string())
+            .collect();
+        assert!(header_text.starts_with(" spaces"), "{header_text:?}");
+        assert!(
+            header_text.trim_end().ends_with("current"),
+            "{header_text:?}"
         );
     }
 

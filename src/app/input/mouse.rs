@@ -94,12 +94,16 @@ impl AppState {
                     | Mode::GlobalMenu
                     | Mode::KeybindHelp
             );
+        // The whole pinned menu row launches the global menu — except the
+        // sidebar collapse toggle's cell, which keeps priority when the
+        // pane gap is 0 and the two share the bottom row.
         let launcher = self.global_launcher_rect();
         let launcher_hit = launcher_enabled
             && mouse.column >= launcher.x
             && mouse.column < launcher.x + launcher.width
             && mouse.row >= launcher.y
-            && mouse.row < launcher.y + launcher.height;
+            && mouse.row < launcher.y + launcher.height
+            && !self.on_sidebar_toggle(mouse.column, mouse.row);
 
         if matches!(mouse.kind, MouseEventKind::Moved) && self.mode == Mode::GlobalMenu {
             let actions = global_menu_actions(self);
@@ -503,16 +507,12 @@ impl AppState {
                         return None;
                     }
 
-                    // Servers section: header toggles collapse, a (two-line)
-                    // peer row switches to that peer's first workspace. The
-                    // self row has no card, so clicking it is a no-op.
-                    let header = self.view.servers_header_rect;
-                    if header != ratatui::layout::Rect::default()
-                        && mouse.row == header.y
-                        && mouse.column >= header.x
-                        && mouse.column < header.x + header.width
-                    {
-                        self.servers_collapsed = !self.servers_collapsed;
+                    // Servers section: the header's all/current label toggles
+                    // the scope, a (two-line) peer row switches to that
+                    // peer's first workspace. The self row has no card, so
+                    // clicking it is a no-op.
+                    if self.on_servers_panel_scope_toggle(mouse.column, mouse.row) {
+                        self.servers_panel_scope = self.servers_panel_scope.toggled();
                         self.mark_session_dirty();
                         return None;
                     }
@@ -520,6 +520,16 @@ impl AppState {
                         mouse.row >= card.rect.y && mouse.row < card.rect.y + card.rect.height
                     }) {
                         self.request_peer_switch = Some(card.target.clone());
+                        return None;
+                    }
+
+                    // Spaces section: the header's all/current label toggles
+                    // the scope between the full workspace list and the
+                    // focused space group.
+                    if self.on_spaces_panel_scope_toggle(mouse.column, mouse.row) {
+                        self.spaces_panel_scope = self.spaces_panel_scope.toggled();
+                        self.workspace_scroll = 0;
+                        self.mark_session_dirty();
                         return None;
                     }
 
