@@ -1342,6 +1342,35 @@ impl ContextMenuState {
                 has_worktree_children: false,
                 ..
             } => &["Rename", "Close", "New worktree", "Open worktree..."],
+            // A linked worktree that is ALSO the space head (#62): main was
+            // closed, this member now anchors the space. It keeps its own
+            // worktree actions AND the close-whole-space / collapse affordances.
+            ContextMenuKind::GitWorkspace {
+                is_linked_worktree: true,
+                has_worktree_children: true,
+                collapsed: true,
+                ..
+            } => &[
+                "Rename",
+                "Close",
+                "Close group",
+                "Delete worktree checkout...",
+                "Kill worktree & branch...",
+                "Expand",
+            ],
+            ContextMenuKind::GitWorkspace {
+                is_linked_worktree: true,
+                has_worktree_children: true,
+                collapsed: false,
+                ..
+            } => &[
+                "Rename",
+                "Close",
+                "Close group",
+                "Delete worktree checkout...",
+                "Kill worktree & branch...",
+                "Collapse",
+            ],
             ContextMenuKind::GitWorkspace {
                 is_linked_worktree: true,
                 ..
@@ -1624,6 +1653,10 @@ pub struct AppState {
     pub redraw_on_focus_gained: bool,
     pub mouse_scroll_lines: usize,
     pub confirm_close: bool,
+    /// The pending confirm-close is the whole-space affordance (#62): close
+    /// every member, not just the selected workspace. Set when opening the
+    /// confirm for "Close group"; cleared on accept/cancel.
+    pub confirm_close_whole_space: bool,
     pub prompt_new_tab_name: bool,
     pub show_agent_labels_on_pane_borders: bool,
     pub pane_history_persistence: bool,
@@ -2063,6 +2096,7 @@ impl AppState {
             redraw_on_focus_gained: true,
             mouse_scroll_lines: crate::config::DEFAULT_MOUSE_SCROLL_LINES,
             confirm_close: true,
+            confirm_close_whole_space: false,
             prompt_new_tab_name: true,
             show_agent_labels_on_pane_borders: false,
             pane_history_persistence: false,

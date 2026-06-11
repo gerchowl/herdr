@@ -455,21 +455,37 @@ fn space_state_counts(app: &AppState, key: &str) -> Vec<(AgentState, bool, usize
     .collect()
 }
 
+/// The section-head workspace index for a project-section key: the local main
+/// checkout (non-linked) when present, else the first remaining member (#62).
+/// One place derives the head so grouping, the triangle, and selection agree
+/// even after main closes — the space must NOT disband when main goes away.
+pub(crate) fn space_head_idx(app: &AppState, key: &str) -> Option<usize> {
+    let members = section_member_indices(app, key);
+    members
+        .iter()
+        .copied()
+        .find(|idx| !app.workspaces[*idx].is_linked_checkout())
+        .or_else(|| members.first().copied())
+}
+
 /// The group affordances (key + collapsed flag) a workspace row carries —
-/// only the section's PRIMARY row (the first non-linked member, i.e. the
-/// main checkout) of a multi-member project section gets them (#33).
+/// only the section's HEAD row (the main checkout when present, else the first
+/// remaining member after main closes) of a multi-member project section gets
+/// them (#33, #62).
 pub(crate) fn workspace_parent_group_state(
     app: &AppState,
     ws_idx: usize,
 ) -> Option<(String, bool)> {
     let key = app.project_section_key(ws_idx)?;
     let members = section_member_indices(app, &key);
-    let primary = members
-        .iter()
-        .copied()
-        .find(|idx| !app.workspaces[*idx].is_linked_checkout())?;
-    (primary == ws_idx && members.len() >= 2)
-        .then(|| (key.clone(), app.collapsed_space_keys.contains(&key)))
+    // Only the section HEAD carries the group triangle/collapse affordance.
+    // With main present that's the main row; with main closed (#62) it's the
+    // first remaining member — never an indented member row, and the space
+    // does NOT disband when main goes away.
+    if space_head_idx(app, &key) != Some(ws_idx) {
+        return None;
+    }
+    (members.len() >= 2).then(|| (key.clone(), app.collapsed_space_keys.contains(&key)))
 }
 
 pub(super) fn grouped_child_display_label(
@@ -596,10 +612,16 @@ pub(crate) fn workspace_list_entries(app: &AppState) -> Vec<WorkspaceListEntry> 
         let Some(members) = members_by_key.get(key) else {
             continue;
         };
+        // Section head = the local main checkout (non-linked) when present, so
+        // the space row keeps its identity and muscle memory. When main has
+        // been closed (#62) the space must NOT disband: fall back to the first
+        // remaining member of the project section. Nothing dereferences main as
+        // the group's anchor.
         let Some(parent_idx) = members
             .iter()
             .copied()
             .find(|idx| !app.workspaces[*idx].is_linked_checkout())
+            .or_else(|| members.first().copied())
         else {
             entries.push(WorkspaceListEntry::Workspace {
                 ws_idx,
@@ -4692,31 +4714,6 @@ mod tests {
     }
 
     #[test]
-    fn linked_only_worktree_members_do_not_form_parentless_group() {
-        let mut app = AppState::test_new();
-        app.workspaces = vec![
-            workspace_with_worktree_space("issue", Some("repo-key"), "/repo/herdr-issue"),
-            workspace_with_worktree_space("review", Some("repo-key"), "/repo/herdr-review"),
-        ];
-
-        let entries = workspace_list_entries(&app);
-
-        assert_eq!(
-            entries,
-            vec![
-                WorkspaceListEntry::Workspace {
-                    ws_idx: 0,
-                    indented: false
-                },
-                WorkspaceListEntry::Workspace {
-                    ws_idx: 1,
-                    indented: false
-                },
-            ]
-        );
-    }
-
-    #[test]
     fn compact_space_group_scroll_offset_can_start_inside_group() {
         let mut app = AppState::test_new();
         app.workspaces = vec![
@@ -4795,6 +4792,34 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn workspace_list_entries_group_survives_main_closed_members_only() {
+        // #62: main checkout gone (or never restored) — the space still groups
+        // on its members, with the first member promoted to the section head.
+        let mut app = AppState::test_new();
+        app.workspaces = vec![
+            workspace_with_worktree_space("issue", Some("repo-key"), "/repo/herdr-issue"),
+            workspace_with_worktree_space("fix", Some("repo-key"), "/repo/herdr-fix"),
+        ];
+
+        assert_eq!(
+            workspace_list_entries(&app),
+            vec![
+                WorkspaceListEntry::Workspace {
+                    ws_idx: 0,
+                    indented: false,
+                },
+                WorkspaceListEntry::Workspace {
+                    ws_idx: 1,
+                    indented: true,
+                },
+            ]
+        );
+        // The head row carries the group triangle even though it's a worktree.
+        assert!(workspace_parent_group_state(&app, 0).is_some());
+        assert!(workspace_parent_group_state(&app, 1).is_none());
     }
 
     #[test]

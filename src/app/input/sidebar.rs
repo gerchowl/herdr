@@ -1096,15 +1096,19 @@ mod tests {
         app.state.mode = Mode::Terminal;
         app.state.agent_panel_scope = AgentPanelScope::AllWorkspaces;
 
-        let (_, detail_area) = crate::ui::expanded_sidebar_sections(
-            app.state.view.sidebar_rect,
-            app.state.sidebar_section_split,
-            app.state.sidebar_pane_gap,
+        let detail_area = app.state.agent_panel_rect();
+        // Single-row entries (#62): the second agent row is one row + gap below
+        // the first. Click it directly rather than at a fixed two-line offset.
+        let metrics = crate::ui::agent_panel_scroll_metrics(&app.state, detail_area);
+        let body = crate::ui::agent_panel_body_rect(
+            detail_area,
+            crate::ui::should_show_scrollbar(metrics),
         );
+        let second_row = body.y + 1 + app.state.sidebar_row_gap;
         app.handle_mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
-            detail_area.x + 2,
-            detail_area.y + 6,
+            body.x + 2,
+            second_row,
         ));
 
         assert_eq!(app.state.active, Some(1));
@@ -1661,7 +1665,7 @@ mod tests {
     }
 
     #[test]
-    fn top_drop_slot_is_distinct_from_gap_below_first_workspace() {
+    fn workspace_drop_slot_maps_card_rows_to_insert_indices() {
         let mut app = app_for_mouse_test();
         let first_repo = temp_git_repo("main");
         let second_repo = temp_git_repo("main");
@@ -1692,10 +1696,21 @@ mod tests {
             .cwd = second_repo.clone();
         crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
 
-        assert_eq!(app.state.workspace_drop_index_at_row(0), Some(0));
-        assert_eq!(app.state.workspace_drop_index_at_row(1), Some(0));
-        assert_eq!(app.state.workspace_drop_index_at_row(2), Some(0));
-        assert_eq!(app.state.workspace_drop_index_at_row(3), Some(1));
+        // Single-line rows (#62). The drop indicator for inserting before a
+        // card sits on the row just above it, so the row above card 0 resolves
+        // to drop-index 0, and the row just below card 1 (its trailing slot)
+        // resolves to the append index (2).
+        let card0 = app.state.view.workspace_card_areas[0].rect;
+        let card1 = app.state.view.workspace_card_areas[1].rect;
+        assert_eq!(card0.height, 1);
+        if let Some(above) = card0.y.checked_sub(1) {
+            assert_eq!(app.state.workspace_drop_index_at_row(above), Some(0));
+        }
+        assert_eq!(
+            app.state
+                .workspace_drop_index_at_row(card1.y + card1.height),
+            Some(2)
+        );
 
         let _ = fs::remove_dir_all(first_repo);
         let _ = fs::remove_dir_all(second_repo);
