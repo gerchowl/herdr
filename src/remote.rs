@@ -32,6 +32,12 @@ pub(crate) const REMOTE_KEYBINDINGS_ENV_VAR: &str = "HERDR_REMOTE_KEYBINDINGS";
 /// down-gossip). Set per-child, never exported to the launcher's own env.
 pub(crate) const FLEET_SNAPSHOT_ENV_VAR: &str = "HERDR_FLEET_SNAPSHOT";
 
+/// The ssh target of the server a remote client leg is attaching to, handed to
+/// the spawned client process so its connection-slots manager (#65) knows which
+/// slot is active (the others, incl. home, are warm-dialed). Unset for a local
+/// attach — then home is the active slot.
+pub(crate) const ACTIVE_SSH_TARGET_ENV_VAR: &str = "HERDR_ACTIVE_SSH_TARGET";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RemoteKeybindings {
     Local,
@@ -164,6 +170,9 @@ fn validate_remote_target(target: &str) -> Result<&str, String> {
 pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
     let session_name = crate::session::active_name()
         .unwrap_or_else(|| crate::session::DEFAULT_SESSION_NAME.to_string());
+    // The active ssh target for the spawned client's slot manager (#65),
+    // captured before `remote.target` is moved into the bridge.
+    let active_ssh_target = remote.target.clone();
     let local_socket = local_forward_socket_path(&remote.target, &session_name);
     let program = std::env::args()
         .next()
@@ -212,7 +221,13 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
             origin_summary: None,
         });
 
-    run_client_process(&local_socket, &reattach_command, remote.keybindings, &fleet)
+    run_client_process(
+        &local_socket,
+        &reattach_command,
+        remote.keybindings,
+        &fleet,
+        &active_ssh_target,
+    )
 }
 
 pub(crate) fn run_remote_client_bridge() -> io::Result<()> {
@@ -1629,6 +1644,7 @@ fn run_client_process(
     reattach_command: &str,
     keybindings: RemoteKeybindings,
     fleet: &crate::protocol::FleetSnapshot,
+    active_ssh_target: &str,
 ) -> io::Result<()> {
     let exe = std::env::current_exe()?;
     let fleet_json = serde_json::to_string(fleet).map_err(io::Error::other)?;
@@ -1642,6 +1658,7 @@ fn run_client_process(
         .env(REATTACH_COMMAND_ENV_VAR, reattach_command)
         .env(REMOTE_KEYBINDINGS_ENV_VAR, keybindings.as_str())
         .env(FLEET_SNAPSHOT_ENV_VAR, fleet_json)
+        .env(ACTIVE_SSH_TARGET_ENV_VAR, active_ssh_target)
         .env_remove(crate::api::SOCKET_PATH_ENV_VAR)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
@@ -1658,7 +1675,7 @@ fn run_client_process(
     }
 }
 
-fn local_forward_socket_path(target: &str, session_name: &str) -> PathBuf {
+pub(crate) fn local_forward_socket_path(target: &str, session_name: &str) -> PathBuf {
     let pid = std::process::id();
     let target_clean = sanitize_path_component(target);
     let session_clean = sanitize_path_component(session_name);

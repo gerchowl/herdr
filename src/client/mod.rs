@@ -13,6 +13,7 @@
 //! - Displays sound/toast notifications forwarded from server
 
 mod input;
+pub(crate) mod slots;
 
 use std::collections::HashSet;
 use std::io::{self, Write as _};
@@ -713,6 +714,11 @@ enum ClientLoopEvent {
     ServerMessage(ServerMessage),
     /// Server reader thread exited (connection lost).
     ServerDisconnected,
+    /// A background warm-all dial succeeded: this slot now holds a paused
+    /// connection (#65). Carries the slot key and the writable stream half.
+    SlotWarmed(String, UnixStream),
+    /// A background warm-all dial failed: keep the slot cold with backoff.
+    SlotDialFailed(String),
     /// Timer tick.
     Timer,
 }
@@ -1320,24 +1326,25 @@ async fn run_client_loop(
         resize_poll_loop(resize_tx, cols, rows, kitty_graphics_enabled, &resize_quit);
     });
 
-    // Spawn the server reader thread (blocking reads from the socket).
+    let max_frame_size = if kitty_graphics_enabled {
+        MAX_GRAPHICS_FRAME_SIZE
+    } else {
+        MAX_FRAME_SIZE
+    };
+
+    // Spawn the active-slot reader thread (blocking reads from the socket).
     // Clone the stream's file descriptor so we can read from a blocking stream.
-    let server_read_quit = should_quit.clone();
-    let server_read_tx = event_tx.clone();
-    let read_stream = stream.try_clone().map_err(ClientError::ConnectionFailed)?;
-    std::thread::spawn(move || {
-        let max_frame_size = if kitty_graphics_enabled {
-            MAX_GRAPHICS_FRAME_SIZE
-        } else {
-            MAX_FRAME_SIZE
-        };
-        server_reader_thread(
-            read_stream,
-            server_read_tx,
-            &server_read_quit,
-            max_frame_size,
-        );
-    });
+    // The reader carries its OWN quit flag (in addition to `should_quit`) so a
+    // connection-slots flip can retire just this reader and bind a new one to
+    // the slot that became active, without tearing the whole loop down (#65).
+    let mut active_reader_quit = Arc::new(AtomicBool::new(false));
+    spawn_slot_reader(
+        stream.try_clone().map_err(ClientError::ConnectionFailed)?,
+        event_tx.clone(),
+        should_quit.clone(),
+        active_reader_quit.clone(),
+        max_frame_size,
+    );
 
     // Use the original stream for writing (blocking is fine since we write
     // from the async loop).
@@ -1345,6 +1352,13 @@ async fn run_client_loop(
     write_stream
         .set_nonblocking(false)
         .map_err(ClientError::ConnectionFailed)?;
+
+    // Connection slots (#65): when enabled, build the slot manager over the
+    // active connection and background-dial the warm-all fleet. The active
+    // slot's write stream is `write_stream`; a warm switch flips it in process
+    // without releasing the terminal. When disabled, `slot_manager` is None and
+    // the legacy exit-and-relaunch leg path drives every switch.
+    let mut slot_manager = build_slot_manager(&write_stream, max_frame_size);
 
     // Bytes consumed from stdin during the pre-handshake theme capture:
     // forward them as the session's first input so no keystroke is lost. The
@@ -1355,6 +1369,14 @@ async fn run_client_loop(
             return Err(ClientError::ConnectionLost(e));
         }
     }
+
+    // Connection-slots warm-all dialing bookkeeping (#65): keys of slots a
+    // background dial is currently in flight for, so the periodic dialer never
+    // double-dials. The dialer fires on the timer tick.
+    let mut slot_dials_in_flight: HashSet<String> = HashSet::new();
+    let mut last_slot_dial_sweep = Instant::now()
+        .checked_sub(Duration::from_secs(60))
+        .unwrap_or_else(Instant::now);
 
     // Main event loop.
     let mut stdin_closed = false;
@@ -1502,6 +1524,47 @@ async fn run_client_loop(
                     fleet,
                     focus_workspace,
                 } => {
+                    // Connection slots (#65): if the target is a WARM slot, flip
+                    // to it in process — pause the old slot, resume the new one
+                    // with a full redraw, rebind input — without ever releasing
+                    // the terminal or exiting. The launcher's switch file is not
+                    // written, so no relaunch leg spawns.
+                    if let Some(manager) = slot_manager.as_mut() {
+                        let target = slots::SlotTarget::from_key(&ssh_target);
+                        match manager.flip_to(&target) {
+                            Ok(Some(new_stream)) => {
+                                // Retire the old active reader and bind a new one
+                                // to the slot that just became active.
+                                active_reader_quit.store(true, Ordering::Release);
+                                let new_quit = Arc::new(AtomicBool::new(false));
+                                if let Ok(read_clone) = new_stream.try_clone() {
+                                    spawn_slot_reader(
+                                        read_clone,
+                                        event_tx.clone(),
+                                        should_quit.clone(),
+                                        new_quit.clone(),
+                                        max_frame_size,
+                                    );
+                                    active_reader_quit = new_quit;
+                                    write_stream = new_stream;
+                                    let _ = write_stream.set_nonblocking(false);
+                                    // Resume already asked the server for a full
+                                    // redraw; nudge the host surface so the
+                                    // repaint lands cleanly over the old frame.
+                                    state.request_full_redraw();
+                                    continue;
+                                }
+                            }
+                            Ok(None) => {
+                                // Cold/unknown/already-active: fall through to
+                                // the legacy relaunch-leg path below.
+                            }
+                            Err(err) => {
+                                warn!(err = %err, target = %ssh_target, "slot flip failed; demoting and falling back to dial");
+                                manager.handle_dead(&target);
+                            }
+                        }
+                    }
                     // Record the target for the launcher's attach loop, then
                     // exit exactly like a detach. The outermost herdr process
                     // reads the file and starts the next leg.
@@ -1548,8 +1611,55 @@ async fn run_client_loop(
                     "server closed connection",
                 )));
             }
+            ClientLoopEvent::SlotWarmed(key, stream) => {
+                slot_dials_in_flight.remove(&key);
+                if let Some(manager) = slot_manager.as_mut() {
+                    let target = slots::SlotTarget::from_key(&key);
+                    let conn = slots::SlotConnection {
+                        target,
+                        write_stream: stream,
+                    };
+                    if let Err(err) = manager.add_warm(conn) {
+                        debug!(target = %key, err = %err, "failed to pause newly warmed slot");
+                    } else {
+                        debug!(target = %key, "slot warmed and paused");
+                    }
+                }
+            }
+            ClientLoopEvent::SlotDialFailed(key) => {
+                slot_dials_in_flight.remove(&key);
+                if let Some(manager) = slot_manager.as_mut() {
+                    manager
+                        .registry
+                        .mark_dial_failed(&slots::SlotTarget::from_key(&key), Instant::now());
+                }
+            }
             ClientLoopEvent::Timer => {
-                // Check if we should quit.
+                // Warm-all dial sweep (#65): periodically dial the registry's
+                // pending cold slots so a later switch to any fleet server is an
+                // instant flip. Throttled; in-flight slots are skipped.
+                if let Some(manager) = slot_manager.as_mut() {
+                    let now = Instant::now();
+                    if now.duration_since(last_slot_dial_sweep) >= Duration::from_secs(2) {
+                        last_slot_dial_sweep = now;
+                        let geometry = (state.reported_size.0, state.reported_size.1, 0, 0);
+                        for effect in manager.registry.pending_dials(now) {
+                            if let slots::SlotEffect::Dial(target) = effect {
+                                let key = target.key().to_string();
+                                if !slot_dials_in_flight.insert(key) {
+                                    continue;
+                                }
+                                spawn_warm_dial(
+                                    target.clone(),
+                                    slot_socket_path(&target),
+                                    geometry,
+                                    negotiated_encoding,
+                                    event_tx.clone(),
+                                );
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -1566,12 +1676,155 @@ async fn run_client_loop(
 // Server reader thread
 // ---------------------------------------------------------------------------
 
+/// Spawn the reader thread for one slot's stream. The reader stops when either
+/// the loop-wide `should_quit` or this slot's `reader_quit` flips — a
+/// connection-slots flip retires the old active reader via `reader_quit` while
+/// the loop keeps running (#65).
+fn spawn_slot_reader(
+    stream: UnixStream,
+    event_tx: tokio::sync::mpsc::Sender<ClientLoopEvent>,
+    should_quit: Arc<AtomicBool>,
+    reader_quit: Arc<AtomicBool>,
+    max_frame_size: usize,
+) {
+    std::thread::spawn(move || {
+        let combined = CombinedQuit {
+            global: should_quit,
+            slot: reader_quit,
+        };
+        server_reader_thread(stream, event_tx, &combined, max_frame_size);
+    });
+}
+
+/// A reader quits when EITHER its loop-wide flag or its per-slot flag is set.
+struct CombinedQuit {
+    global: Arc<AtomicBool>,
+    slot: Arc<AtomicBool>,
+}
+
+impl CombinedQuit {
+    fn load(&self, order: Ordering) -> bool {
+        self.global.load(order) || self.slot.load(order)
+    }
+}
+
+/// Build the connection-slots manager when `[slots] enabled`, owning the active
+/// connection (a clone of the active write stream) and the warm-all target
+/// list derived from config peers plus the carried fleet snapshot. Returns None
+/// when slots are disabled — the legacy leg path then drives switches.
+fn build_slot_manager(
+    active_write_stream: &UnixStream,
+    _max_frame_size: usize,
+) -> Option<slots::SlotManager> {
+    let loaded = crate::config::Config::load();
+    let slots_config = loaded.config.slots.clone();
+    if !slots_config.enabled {
+        return None;
+    }
+
+    // The active slot is whatever leg launched this client: home for a local
+    // attach, the ssh target for a remote leg (carried in REATTACH/remote env).
+    let active_target = std::env::var(crate::remote::ACTIVE_SSH_TARGET_ENV_VAR)
+        .ok()
+        .filter(|t| !t.is_empty())
+        .map(slots::SlotTarget::Ssh)
+        .unwrap_or(slots::SlotTarget::Home);
+
+    // Warm-all targets: locally-configured peers (a hub knows its fleet) plus
+    // the carried snapshot's peers and origin (a spoke learns its fleet from
+    // the down-gossip, #73). Home is always included.
+    let config_peers: Vec<String> = loaded
+        .config
+        .peers
+        .iter()
+        .map(|p| p.ssh_target().to_string())
+        .collect();
+    let mut carried: Vec<String> = Vec::new();
+    if let Some(fleet) = carried_fleet_snapshot() {
+        carried.extend(fleet.peers.iter().map(|p| p.ssh_target.clone()));
+        if let Some(origin) = fleet.origin_summary.as_ref() {
+            carried.push(origin.ssh_target.clone());
+        }
+    }
+    let targets = slots::warm_all_targets(&config_peers, &carried, slots_config.max);
+
+    let active_conn = slots::SlotConnection {
+        target: active_target,
+        write_stream: active_write_stream.try_clone().ok()?,
+    };
+    Some(slots::SlotManager::new(
+        active_conn,
+        targets,
+        slots_config.max,
+    ))
+}
+
+/// Background-dial a warm slot: connect its socket and complete the handshake
+/// so the server holds a session, then report the writable stream back to the
+/// loop (which pauses it). Runs on a detached thread — a slow or failing dial
+/// must never stall the active paint path (#65). Stage 1 warms slots whose
+/// transport is reachable as a local socket: home (the local client socket) and
+/// any peer whose ssh-stdio bridge socket is already live; a cold peer with no
+/// bridge stays cold and a switch to it falls back to the relaunch leg.
+fn spawn_warm_dial(
+    target: slots::SlotTarget,
+    socket_path: std::path::PathBuf,
+    geometry: (u16, u16, u32, u32),
+    requested_encoding: RenderEncoding,
+    event_tx: tokio::sync::mpsc::Sender<ClientLoopEvent>,
+) {
+    std::thread::spawn(move || {
+        let key = target.key().to_string();
+        let (cols, rows, cell_width_px, cell_height_px) = geometry;
+        let dialed = (|| -> Result<UnixStream, ClientError> {
+            let mut stream =
+                UnixStream::connect(&socket_path).map_err(ClientError::ConnectionFailed)?;
+            // A warm slot is a full app client, like the active one. It carries
+            // no host theme (the active slot owns the host terminal) and no
+            // notice; the handshake just establishes a paused session.
+            do_handshake(
+                &mut stream,
+                cols,
+                rows,
+                cell_width_px,
+                cell_height_px,
+                requested_encoding,
+                false,
+                None,
+            )?;
+            Ok(stream)
+        })();
+        let event = match dialed {
+            Ok(stream) => ClientLoopEvent::SlotWarmed(key, stream),
+            Err(err) => {
+                debug!(target = %key, err = %err, "warm-all dial failed; slot stays cold");
+                ClientLoopEvent::SlotDialFailed(key)
+            }
+        };
+        let _ = event_tx.blocking_send(event);
+    });
+}
+
+/// Socket path for a slot target: the local client socket for home, the
+/// ssh-stdio bridge's forwarded socket for a peer (already live only when a
+/// prior leg or a background bootstrap brought the bridge up).
+fn slot_socket_path(target: &slots::SlotTarget) -> std::path::PathBuf {
+    match target {
+        slots::SlotTarget::Home => crate::server::socket_paths::client_socket_path(),
+        slots::SlotTarget::Ssh(t) => {
+            let session = crate::session::active_name()
+                .unwrap_or_else(|| crate::session::DEFAULT_SESSION_NAME.to_string());
+            crate::remote::local_forward_socket_path(t, &session)
+        }
+    }
+}
+
 /// Blocking thread that reads ServerMessages from the server and sends them
 /// to the main event loop.
 fn server_reader_thread(
     mut stream: UnixStream,
     event_tx: tokio::sync::mpsc::Sender<ClientLoopEvent>,
-    should_quit: &Arc<AtomicBool>,
+    should_quit: &CombinedQuit,
     max_frame_size: usize,
 ) {
     // Ensure the read stream is in blocking mode to avoid WouldBlock errors

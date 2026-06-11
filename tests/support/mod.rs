@@ -378,6 +378,22 @@ pub fn send_detach(stream: &mut UnixStream) -> Result<(), String> {
     Ok(())
 }
 
+/// Send `ClientMessage::SetFrameSubscription { enabled }` (#65, proto 18). The
+/// variant is index 7 (the last in `ClientMessage`); the bool is one byte.
+#[allow(dead_code)]
+pub fn send_set_frame_subscription(stream: &mut UnixStream, enabled: bool) -> Result<(), String> {
+    let mut buf = encode_varint_u32(7);
+    buf.push(u8::from(enabled));
+    let framed = frame_message(&buf);
+    stream
+        .write_all(&framed)
+        .map_err(|e| format!("write set-frame-subscription: {e}"))?;
+    stream
+        .flush()
+        .map_err(|e| format!("flush set-frame-subscription: {e}"))?;
+    Ok(())
+}
+
 pub fn drain_messages(stream: &mut UnixStream) {
     stream
         .set_read_timeout(Some(Duration::from_millis(200)))
