@@ -1822,11 +1822,11 @@ fn peer_server_rows(
         // greyed out and italic, the title struck through, the age where
         // latency would sit. The stale data stays visible; its styling says
         // "as of {age}".
-        // nf-md-link_off in the latency slot says no-conn; the age says how
-        // stale the ghosted stats are.
+        // nf-md-link_variant_off (broken chain) in the latency slot says
+        // no-conn; the age says how stale the ghosted stats are.
         let age = match peer.last_ok {
-            Some(at) => format!("  \u{f0337} {}", format_age(at.elapsed().as_secs())),
-            None => "  \u{f0337}".to_string(),
+            Some(at) => format!("  \u{f033a} {}", format_age(at.elapsed().as_secs())),
+            None => "  \u{f033a}".to_string(),
         };
         let title = Line::from(vec![
             Span::styled(
@@ -3047,7 +3047,7 @@ mod tests {
         // including the LAST-KNOWN stats, which stay visible.
         let text = line_text(&title);
         assert!(text.contains("ksb"), "{text:?}");
-        assert!(text.contains('\u{f0337}'), "broken-link icon: {text:?}");
+        assert!(text.contains('\u{f033a}'), "broken-link icon: {text:?}");
         for span in title.spans.iter().filter(|s| !s.content.trim().is_empty()) {
             assert_eq!(span.style.fg, Some(p.overlay0), "muted: {:?}", span.content);
             assert!(
