@@ -311,6 +311,42 @@ pub(crate) fn warm_all_targets(
     out
 }
 
+/// What the client loop should do with a slot-tagged event at APPLY time,
+/// decided by comparing the reader's slot key against the currently-active
+/// slot (#65). This is the apply-time check that makes warm-slot death silent
+/// and stale frames harmless — a frame queued by the old reader before a flip
+/// arrives tagged with the old slot's key and is [`Drop`](SlotRouting::Drop)ped
+/// instead of painting over the new slot's redraw (blocker 1 + 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SlotRouting {
+    /// The event is from the active slot: apply it normally.
+    Apply,
+    /// The event is from a non-active slot and carries no lifecycle meaning
+    /// (a frame, notify, etc.): drop it silently.
+    Drop,
+    /// The event is a non-active slot's transport/lifecycle death (its reader
+    /// disconnected, or its server sent ServerShutdown): demote that slot to
+    /// cold silently. The active session is untouched.
+    DemoteDead,
+}
+
+/// Route a slot-tagged event read by `event_slot` against the `active` slot.
+/// `is_lifecycle_death` is true for a reader disconnect or a `ServerShutdown`
+/// message (the two signals that a non-active slot's transport is gone).
+pub(crate) fn route_slot_event(
+    event_slot: &str,
+    active: &str,
+    is_lifecycle_death: bool,
+) -> SlotRouting {
+    if event_slot == active {
+        SlotRouting::Apply
+    } else if is_lifecycle_death {
+        SlotRouting::DemoteDead
+    } else {
+        SlotRouting::Drop
+    }
+}
+
 /// A live warm/active slot connection the client holds open: the writable
 /// stream half plus the slot's target. Frames arrive on the shared loop event
 /// channel (the reader half lives in a spawned thread); a paused slot's server
@@ -626,6 +662,91 @@ mod tests {
             ClientMessage::SetFrameSubscription { enabled: true }
         );
         assert_eq!(manager.registry.active_target(), Some(&SlotTarget::Home));
+    }
+
+    // --- Apply-time slot routing (#65 blockers 1 + 2) ---
+
+    #[test]
+    fn route_active_slot_frame_applies() {
+        // A frame tagged with the active slot's key paints normally.
+        assert_eq!(
+            route_slot_event(HOME_SWITCH_TARGET, HOME_SWITCH_TARGET, false),
+            SlotRouting::Apply
+        );
+    }
+
+    #[test]
+    fn route_stale_frame_from_old_slot_is_dropped() {
+        // The load-bearing apply-time check: after a flip to "anvil", a frame
+        // the OLD home reader had already queued arrives tagged "<home>". It is
+        // dropped, not painted over the new active slot's redraw (blocker 2).
+        assert_eq!(
+            route_slot_event(HOME_SWITCH_TARGET, "anvil", false),
+            SlotRouting::Drop
+        );
+    }
+
+    #[test]
+    fn route_non_active_slot_death_demotes_not_drops() {
+        // A non-active slot's lifecycle death (reader disconnect / ServerShutdown)
+        // demotes that slot — it never tears the active session down (blocker 1).
+        assert_eq!(
+            route_slot_event("anvil", HOME_SWITCH_TARGET, true),
+            SlotRouting::DemoteDead
+        );
+    }
+
+    #[test]
+    fn route_active_slot_death_applies_connection_lost() {
+        // The active slot's death routes to Apply — the loop then returns
+        // ConnectionLost, today's semantics for the slot driving the terminal.
+        assert_eq!(route_slot_event("anvil", "anvil", true), SlotRouting::Apply);
+    }
+
+    /// A warm slot's transport dying (its socketpair peer closes) must demote
+    /// the slot in the manager+registry while the ACTIVE slot is untouched —
+    /// the session survives (blocker 1). The loop drives this by routing the
+    /// dead warm reader's `ServerDisconnected` to `handle_dead`; here we invoke
+    /// `handle_dead` directly after killing the peer, asserting the registry
+    /// state the session depends on.
+    #[test]
+    fn warm_slot_death_demotes_and_session_survives() {
+        let (home_local, _home_peer) = UnixStream::pair().unwrap();
+        let mut manager = SlotManager::new(
+            SlotConnection {
+                target: SlotTarget::Home,
+                write_stream: home_local,
+            },
+            vec![ssh("anvil")],
+            8,
+        );
+        // Warm anvil over its own socketpair.
+        let (anvil_local, anvil_peer) = UnixStream::pair().unwrap();
+        manager
+            .add_warm(SlotConnection {
+                target: ssh("anvil"),
+                write_stream: anvil_local,
+            })
+            .unwrap();
+        assert_eq!(manager.registry.phase(&ssh("anvil")), Some(SlotPhase::Warm));
+
+        // Kill the warm slot's transport: drop its peer end (EOF on the reader).
+        drop(anvil_peer);
+        // The loop's reaction to that reader's ServerDisconnected:
+        manager.handle_dead(&ssh("anvil"));
+
+        // The warm slot is demoted to cold; the ACTIVE (home) slot is intact —
+        // the session did NOT tear down.
+        assert_eq!(
+            manager.registry.phase(&ssh("anvil")),
+            Some(SlotPhase::Cold { failed_at: None })
+        );
+        assert_eq!(manager.registry.active_target(), Some(&SlotTarget::Home));
+        // A later switch to the dead slot re-dials it (cold fallback).
+        assert_eq!(
+            manager.registry.request_switch(&ssh("anvil")),
+            SwitchOutcome::ColdDial(ssh("anvil"))
+        );
     }
 
     #[test]

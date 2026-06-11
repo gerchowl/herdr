@@ -38,6 +38,16 @@ pub(crate) const FLEET_SNAPSHOT_ENV_VAR: &str = "HERDR_FLEET_SNAPSHOT";
 /// attach — then home is the active slot.
 pub(crate) const ACTIVE_SSH_TARGET_ENV_VAR: &str = "HERDR_ACTIVE_SSH_TARGET";
 
+/// The actual local-forward socket path of the active leg's ssh-stdio bridge,
+/// handed from the LAUNCHER (`run_remote`, which created the bridge socket
+/// keyed on its own pid) to the spawned client child. The client and launcher
+/// are separate processes, so the client cannot recompute this path from
+/// `std::process::id()` — it must be passed explicitly (the `HERDR_FLEET_SNAPSHOT`
+/// precedent). The connection-slots manager (#65) uses it to warm-dial the
+/// active ssh slot's already-live bridge instead of a path that never exists.
+/// Unset for a local attach (home needs no bridge).
+pub(crate) const ACTIVE_BRIDGE_SOCKET_ENV_VAR: &str = "HERDR_ACTIVE_BRIDGE_SOCKET";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RemoteKeybindings {
     Local,
@@ -227,6 +237,7 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
         remote.keybindings,
         &fleet,
         &active_ssh_target,
+        &local_socket,
     )
 }
 
@@ -1645,6 +1656,7 @@ fn run_client_process(
     keybindings: RemoteKeybindings,
     fleet: &crate::protocol::FleetSnapshot,
     active_ssh_target: &str,
+    active_bridge_socket: &Path,
 ) -> io::Result<()> {
     let exe = std::env::current_exe()?;
     let fleet_json = serde_json::to_string(fleet).map_err(io::Error::other)?;
@@ -1659,6 +1671,7 @@ fn run_client_process(
         .env(REMOTE_KEYBINDINGS_ENV_VAR, keybindings.as_str())
         .env(FLEET_SNAPSHOT_ENV_VAR, fleet_json)
         .env(ACTIVE_SSH_TARGET_ENV_VAR, active_ssh_target)
+        .env(ACTIVE_BRIDGE_SOCKET_ENV_VAR, active_bridge_socket)
         .env_remove(crate::api::SOCKET_PATH_ENV_VAR)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
