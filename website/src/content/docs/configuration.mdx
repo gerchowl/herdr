@@ -100,6 +100,8 @@ Worktree actions are available from Git workspace rows. `New worktree` creates a
 
 Grouped worktrees still behave like normal Herdr workspaces: they can be focused, renamed, closed, and contain their own tabs and panes. The parent row is the original workspace. Closing the parent row closes the whole Herdr group, but it does not delete checkout folders or branches.
 
+External worktrees are adopted automatically: when a workspace sits in a linked checkout that Herdr didn't create (an agent ran `git worktree add`, you made one by hand, another tool did), it gains the managed worktree actions and groups under its parent repo workspace when that is open — membership is inferred from git, not from where the checkout lives. Set `adopt_external = false` under `[worktrees]` to keep the old explicit-adoption-only behavior.
+
 Deleting a worktree checkout is explicit. Use `Delete worktree checkout...` on a grouped child workspace to run `git worktree remove`. Herdr first asks Git to remove safely. If Git refuses because the checkout has modified or untracked files, Herdr asks again before running the forced remove. Branches are not deleted.
 
 ## Remote attach
@@ -180,8 +182,21 @@ next_workspace = "prefix+shift+right"
 last_pane = "prefix+tab"
 open_worktree = "prefix+shift+o"
 remove_worktree = "prefix+alt+d"
+branch_session = "prefix+shift+b"
+kill_worktree = "prefix+alt+k"
+focus_attention = "prefix+a"
+focus_attention_previous = "prefix+shift+a"
+toggle_float = "prefix+f"
 next_tab = ["prefix+n", "ctrl+alt+]"]
 ```
+
+`focus_attention` jumps to the agent most in need of attention: blocked agents first (oldest state change first), then agents that finished while you were elsewhere (oldest first). Repeated presses walk the queue; focusing a done agent marks it seen and drains it. When nothing needs attention the press chimes once (the all-clear sound, customizable via `[ui.sound] all_clear_path`) and falls back to cycling agents like `next_agent`. `focus_attention_previous` walks the same queue (or cycle) backwards. `focus_attention_project` (and `_previous`) restrict the queue to the active workspace's repo family — the main checkout plus every worktree workspace of the same git repo — falling back to cycling the family's agent panes. These never chime, since a scoped all-clear says nothing about other projects.
+
+`kill_worktree` deletes a linked worktree checkout **and its local branch** — but the branch only when a merge gate passes: Herdr asks `gh pr view <branch>` for a merged PR (also pinned to the origin remote's repo, so multi-remote fork checkouts resolve correctly), falling back to `git branch --merged <default-branch>`, then to remote containment — the branch tip being reachable from another pushed remote ref (e.g. merged into an integration branch) also counts as evidence. The confirm dialog shows the evidence ("PR #12 merged" / "merged into master") or, when there is none, downgrades to a checkout-only delete with the branch kept. This is the one deliberate exception to Herdr's "branches are never deleted" rule, and it never fires without positive evidence. Also available as `Kill worktree & branch...` in the workspace context menu.
+
+`branch_session` branches the focused pane's agent session into a new worktree: it opens the same dialog as `new_worktree`, but the created workspace's root pane resumes a fork of the agent conversation in the new checkout instead of starting a shell (Claude Code uses `--fork-session` so the original session is untouched; other supported agents resume the same session). The focused pane must have a resumable agent session reported through a Herdr integration, and the workspace must be a Git repo parent (same rule as `new_worktree`).
+
+`toggle_float` toggles a per-workspace ephemeral floating pane: a centered overlay (about 80% x 70% of the pane area) running your shell in the workspace's directory, for quick throwaway commands. The first press spawns and shows it; pressing the same binding while it is visible hides it without killing the shell, and the next press brings the same float back. The float closes when its process exits (`exit` or Ctrl-D), is never saved to the session, and does not survive a restart. While the float is visible all terminal input goes to it; `esc` is forwarded into the float's shell rather than dismissing it, so vi-mode and fzf keep working.
 
 `last_pane` switches back to the last focused pane across workspaces and tabs. It is unset by default because the tmux-style pane binding `prefix+l` is already used for pane-right focus.
 
@@ -233,7 +248,9 @@ name = "catppuccin"
 
 Built-in themes:
 
-`catppuccin`, `catppuccin-latte`, `terminal`, `tokyo-night`, `tokyo-night-day`, `dracula`, `nord`, `gruvbox`, `gruvbox-light`, `one-dark`, `one-light`, `solarized`, `solarized-light`, `kanagawa`, `kanagawa-lotus`, `rose-pine`, `rose-pine-dawn`, `vesper`.
+`catppuccin`, `catppuccin-latte`, `terminal`, `tokyo-night`, `tokyo-night-day`, `dracula`, `nord`, `gruvbox`, `gruvbox-light`, `one-dark`, `one-light`, `solarized`, `solarized-light`, `kanagawa`, `kanagawa-lotus`, `rose-pine`, `rose-pine-dawn`, `vesper`, `dalton`, `dalton-light`.
+
+`dalton` and `dalton-light` are colorblind-friendly palettes built on a blue-yellow primary axis (sourced from the dalton-colorscheme project). `dalton-dark` and `dalton-bright` are accepted aliases.
 
 Use `terminal` when you want Herdr UI colors to follow your host terminal's ANSI palette.
 
@@ -272,6 +289,8 @@ prompt_new_tab_name = true
 show_agent_labels_on_pane_borders = false
 agent_panel_scope = "all"
 accent = "cyan"
+sidebar_row_gap = 1
+sidebar_pane_gap = 0
 ```
 
 `sidebar_min_width` and `sidebar_max_width` control the expanded sidebar's resize bounds in columns. The defaults are 18 and 36.
@@ -291,6 +310,20 @@ Set `redraw_on_focus_gained = false` to avoid the visible full-screen refresh wh
 Set `mouse_scroll_lines` to change how many pane scrollback lines each mouse wheel notch scrolls. The default is 3. Pane apps that request mouse reporting still receive wheel events directly.
 
 Set `show_agent_labels_on_pane_borders = true` if you want detected agent labels in split pane borders when no manual pane label is set.
+
+The agent panel shows rows as `<agent> · <status>` using built-in short codes (`claude` → `cc`, `codex` → `cd`, `gemini` → `gm`, …). Override or extend them with `agent_aliases = { claude = "CC" }` under `[ui]`. While a Claude Code pane is working, the status text is replaced by the live activity from its own status line (e.g. `cc · Implementing the parser…`), scraped from the terminal in real time.
+
+`sidebar_row_gap` controls the blank rows between sidebar list entries (workspaces and agents). The default is 1; set 0 for a packed list. The maximum is 3.
+
+`pane_header` (default `true`) reserves a header strip at the top of agent panes — the pane's terminal shrinks so nothing is ever covered. Row 1 shows context: `project · worktree ·  branch`, unpushed/unpulled counts (`↑n`/`↓n`), and the branch's GitHub PR state (`#N ⊙` open, `◐` draft, `✓` merged, `✗` closed — polled via `gh` every two minutes, omitted when `gh` or a PR is absent). The remaining rows show the **last submitted prompt**; when it is collapsed or truncated a `▾` marker appears — **click the prompt rows** to expand the full text over the pane (click again to collapse). The prompt and header survive live-handoffs and restarts. The reservation latches the first time an agent is seen in a pane and stays stable from then on. Panes too small to give up rows skip the header.
+
+`status_line` (default `true`) shows a one-line machine HUD above the tab bar: cpu, memory, disk space, battery, network throughput, and best-effort GPU utilization (omitted where unreadable). Utilization colors shift to yellow at 60% and red at 85%.
+
+`prompt_float_lines` controls the prompt section of the pane header: prompts taller than the limit are collapsed in the **middle** — the start and the end survive, with a `⋯ +N lines ⋯` marker between them; overlong single lines are middle-truncated the same way. The default is 3 rows, the float never covers more than the top half of a pane, and `0` disables it. The prompt is reported by the Claude Code integration's `UserPromptSubmit` hook (reinstall the integration from the settings panel if it shows "update available"); other agents will gain support as their hooks expose the prompt.
+
+`sidebar_pane_gap` adds symmetric breathing room around the sidebar/pane divider: the configured number of blank columns appears on each side of the vertical divider line. The default is 0 (content and panes touch the divider); the maximum is 4.
+
+Both gaps can also be cycled live from the `sidebar` tab in the settings panel (`prefix+s`); changes are written back to `config.toml`.
 
 ## Notifications
 

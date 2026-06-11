@@ -407,6 +407,11 @@ impl GhosttyPaneTerminal {
         _response_writer: &mpsc::Sender<Bytes>,
     ) -> ProcessBytesResult {
         crate::render_prof::counter("pty.bytes", bytes.len() as u64);
+        // Latency timer: any new early-return path added below MUST call
+        // `pty_process_observed` before returning. Only the poisoned-lock
+        // exit skips it (terminal is unrecoverable at that point).
+        let watch = crate::logging::Stopwatch::start();
+        let byte_count = bytes.len();
         let Ok(mut core) = self.core.lock() else {
             error!(pane = pane_id.raw(), "ghostty core lock poisoned in reader");
             return ProcessBytesResult {
@@ -497,6 +502,7 @@ impl GhosttyPaneTerminal {
         if synchronized_output {
             crate::render_prof::event("pty.synchronized_output_suppressed");
         }
+        crate::logging::pty_process_observed(watch.elapsed(), pane_id.raw(), byte_count);
         ProcessBytesResult {
             request_render,
             render_delay,

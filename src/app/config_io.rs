@@ -1,6 +1,14 @@
 use super::App;
 
 impl App {
+    /// Transient, verbatim feedback for an action that could not run
+    /// (wrong target, nothing to do). Auto-expires after a few seconds.
+    pub(crate) fn show_action_notice(&mut self, message: impl Into<String>) {
+        self.state.action_notice = Some(message.into());
+        self.action_notice_deadline =
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(4));
+    }
+
     pub(super) fn update_config_file<F>(&mut self, error_context: &str, update: F) -> bool
     where
         F: FnOnce(&str) -> String,
@@ -81,6 +89,22 @@ impl App {
                 "show_agent_labels_on_pane_borders",
                 enabled,
             )
+        }) {
+            self.apply_config_from_disk(false);
+        }
+    }
+
+    pub(super) fn save_sidebar_row_gap(&mut self, gap: u16) {
+        if self.update_config_file("sidebar row gap", |content| {
+            crate::config::upsert_section_value(content, "ui", "sidebar_row_gap", &gap.to_string())
+        }) {
+            self.apply_config_from_disk(false);
+        }
+    }
+
+    pub(super) fn save_sidebar_pane_gap(&mut self, gap: u16) {
+        if self.update_config_file("sidebar pane gap", |content| {
+            crate::config::upsert_section_value(content, "ui", "sidebar_pane_gap", &gap.to_string())
         }) {
             self.apply_config_from_disk(false);
         }

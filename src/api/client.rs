@@ -53,11 +53,20 @@ impl ApiClient {
     }
 
     pub fn request_value(&self, request: &Request) -> Result<serde_json::Value, ApiClientError> {
-        let mut stream = self.connect()?;
-        write_request(&mut stream, request)?;
-
-        let mut reader = BufReader::new(stream);
-        read_json_line(&mut reader)
+        let method = crate::api::method_name(&request.method);
+        let watch = crate::logging::Stopwatch::start();
+        let result = (|| {
+            let mut stream = self.connect()?;
+            write_request(&mut stream, request)?;
+            let mut reader = BufReader::new(stream);
+            read_json_line(&mut reader)
+        })();
+        crate::logging::api_client_roundtrip_observed(
+            method,
+            client_outcome(&result),
+            watch.elapsed(),
+        );
+        result
     }
 
     pub fn request_value_with_timeout(
@@ -65,13 +74,22 @@ impl ApiClient {
         request: &Request,
         timeout: Duration,
     ) -> Result<serde_json::Value, ApiClientError> {
-        let mut stream = self.connect()?;
-        stream.set_write_timeout(Some(timeout))?;
-        stream.set_read_timeout(Some(timeout))?;
-        write_request(&mut stream, request)?;
-
-        let mut reader = BufReader::new(stream);
-        read_json_line(&mut reader)
+        let method = crate::api::method_name(&request.method);
+        let watch = crate::logging::Stopwatch::start();
+        let result = (|| {
+            let mut stream = self.connect()?;
+            stream.set_write_timeout(Some(timeout))?;
+            stream.set_read_timeout(Some(timeout))?;
+            write_request(&mut stream, request)?;
+            let mut reader = BufReader::new(stream);
+            read_json_line(&mut reader)
+        })();
+        crate::logging::api_client_roundtrip_observed(
+            method,
+            client_outcome(&result),
+            watch.elapsed(),
+        );
+        result
     }
 
     #[allow(dead_code)] // Kept as the typed subscription API; CLI wait paths use subscribe_value to preserve raw ack errors.
@@ -178,6 +196,17 @@ impl From<io::Error> for ApiClientError {
 impl From<serde_json::Error> for ApiClientError {
     fn from(err: serde_json::Error) -> Self {
         Self::Json(err)
+    }
+}
+
+fn client_outcome<T>(result: &Result<T, ApiClientError>) -> &'static str {
+    match result {
+        Ok(_) => "ok",
+        Err(ApiClientError::Io(_)) => "io_error",
+        Err(ApiClientError::Json(_)) => "json_error",
+        Err(ApiClientError::ErrorResponse(_)) => "error_response",
+        Err(ApiClientError::EmptyResponse) => "empty_response",
+        Err(ApiClientError::UnexpectedResult(_)) => "unexpected_result",
     }
 }
 

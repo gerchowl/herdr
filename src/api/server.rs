@@ -15,7 +15,10 @@ use crate::api::schema::{
 };
 use crate::api::subscriptions::ActiveSubscription;
 use crate::api::wait::wait_for_output;
-use crate::api::{request_changes_ui, socket_path, ApiRequestMessage, ApiRequestSender, EventHub};
+use crate::api::{
+    method_name as api_method_name, request_changes_ui, socket_path, ApiRequestMessage,
+    ApiRequestSender, EventHub,
+};
 use crate::ipc::{remove_socket_file_if_owned, socket_file_identity, SocketFileIdentity};
 
 const SOCKET_PERMISSION_MODE: u32 = 0o600;
@@ -133,6 +136,7 @@ fn handle_connection(
     running: &Arc<AtomicBool>,
     capabilities: Option<ServerCapabilities>,
 ) -> std::io::Result<()> {
+    let peer_pid = socket_peer_pid(&stream);
     if let Err(err) = stream.set_write_timeout(Some(STREAM_WRITE_TIMEOUT)) {
         debug!(err = %err, "api connection write timeout unavailable");
     }
@@ -218,6 +222,7 @@ fn handle_connection(
             result
         }
         method_body => {
+            let watch = crate::logging::Stopwatch::start();
             let response = handle_request(
                 Request {
                     id: request_id.clone(),
@@ -225,21 +230,75 @@ fn handle_connection(
                 },
                 api_tx,
                 capabilities,
+                peer_pid,
             );
             let result = write_text_line_allow_disconnect(&mut stream, &response);
-            match &result {
-                Ok(()) => crate::logging::api_request_completed(
-                    &request_id,
-                    method,
-                    api_response_outcome(&response),
-                    changes_ui,
-                ),
-                Err(err) => {
-                    crate::logging::api_request_failed(&request_id, method, &err.to_string())
+            let outcome = match &result {
+                Ok(()) => {
+                    let outcome = api_response_outcome(&response);
+                    crate::logging::api_request_completed(&request_id, method, outcome, changes_ui);
+                    outcome
                 }
-            }
+                Err(err) => {
+                    crate::logging::api_request_failed(&request_id, method, &err.to_string());
+                    "error"
+                }
+            };
+            crate::logging::api_server_roundtrip_observed(
+                &request_id,
+                method,
+                outcome,
+                watch.elapsed(),
+            );
             result
         }
+    }
+}
+
+/// PID of the process at the other end of the unix socket. macOS exposes it
+/// via LOCAL_PEERPID; Linux via SO_PEERCRED. None when unavailable.
+fn socket_peer_pid(stream: &UnixStream) -> Option<u32> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd;
+        let mut pid: libc::pid_t = 0;
+        let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+        // SOL_LOCAL = 0, LOCAL_PEERPID = 2 (sys/un.h)
+        let rc = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                0,
+                2,
+                &mut pid as *mut _ as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        return (rc == 0 && pid > 0).then_some(pid as u32);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let mut cred = libc::ucred {
+            pid: 0,
+            uid: 0,
+            gid: 0,
+        };
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        let rc = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                &mut cred as *mut _ as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        return (rc == 0 && cred.pid > 0).then_some(cred.pid as u32);
+    }
+    #[allow(unreachable_code)]
+    {
+        let _ = stream;
+        None
     }
 }
 
@@ -247,6 +306,7 @@ fn handle_request(
     request: Request,
     api_tx: &ApiRequestSender,
     capabilities: Option<ServerCapabilities>,
+    peer_pid: Option<u32>,
 ) -> String {
     match request.method {
         Method::Ping(_) => serde_json::to_string(&SuccessResponse {
@@ -261,58 +321,7 @@ fn handle_request(
             r#"{"id":"","error":{"code":"internal_error","message":"failed to encode response"}}"#
                 .to_string()
         }),
-        _ => dispatch_to_app(request, api_tx),
-    }
-}
-
-fn api_method_name(method: &Method) -> &'static str {
-    match method {
-        Method::Ping(_) => "ping",
-        Method::ServerStop(_) => "server.stop",
-        Method::ServerLiveHandoff(_) => "server.live_handoff",
-        Method::ServerReloadConfig(_) => "server.reload_config",
-        Method::WorkspaceCreate(_) => "workspace.create",
-        Method::WorkspaceList(_) => "workspace.list",
-        Method::WorkspaceGet(_) => "workspace.get",
-        Method::WorkspaceFocus(_) => "workspace.focus",
-        Method::WorkspaceRename(_) => "workspace.rename",
-        Method::WorkspaceClose(_) => "workspace.close",
-        Method::WorktreeList(_) => "worktree.list",
-        Method::WorktreeCreate(_) => "worktree.create",
-        Method::WorktreeOpen(_) => "worktree.open",
-        Method::WorktreeRemove(_) => "worktree.remove",
-        Method::TabCreate(_) => "tab.create",
-        Method::TabList(_) => "tab.list",
-        Method::TabGet(_) => "tab.get",
-        Method::TabFocus(_) => "tab.focus",
-        Method::TabRename(_) => "tab.rename",
-        Method::TabClose(_) => "tab.close",
-        Method::AgentList(_) => "agent.list",
-        Method::AgentGet(_) => "agent.get",
-        Method::AgentRead(_) => "agent.read",
-        Method::AgentSend(_) => "agent.send",
-        Method::AgentRename(_) => "agent.rename",
-        Method::AgentFocus(_) => "agent.focus",
-        Method::AgentStart(_) => "agent.start",
-        Method::PaneSplit(_) => "pane.split",
-        Method::PaneList(_) => "pane.list",
-        Method::PaneGet(_) => "pane.get",
-        Method::PaneRename(_) => "pane.rename",
-        Method::PaneSendText(_) => "pane.send_text",
-        Method::PaneSendKeys(_) => "pane.send_keys",
-        Method::PaneSendInput(_) => "pane.send_input",
-        Method::PaneRead(_) => "pane.read",
-        Method::PaneReportAgent(_) => "pane.report_agent",
-        Method::PaneReportAgentSession(_) => "pane.report_agent_session",
-        Method::PaneReportMetadata(_) => "pane.report_metadata",
-        Method::PaneClearAgentAuthority(_) => "pane.clear_agent_authority",
-        Method::PaneReleaseAgent(_) => "pane.release_agent",
-        Method::PaneClose(_) => "pane.close",
-        Method::EventsSubscribe(_) => "events.subscribe",
-        Method::EventsWait(_) => "events.wait",
-        Method::PaneWaitForOutput(_) => "pane.wait_for_output",
-        Method::IntegrationInstall(_) => "integration.install",
-        Method::IntegrationUninstall(_) => "integration.uninstall",
+        _ => dispatch_to_app(request, api_tx, peer_pid),
     }
 }
 
@@ -508,20 +517,22 @@ fn is_connection_closed_error(err: &std::io::Error) -> bool {
     )
 }
 
-fn dispatch_to_app(request: Request, api_tx: &ApiRequestSender) -> String {
-    dispatch_to_app_with_timeout(request, api_tx, None)
+fn dispatch_to_app(request: Request, api_tx: &ApiRequestSender, peer_pid: Option<u32>) -> String {
+    dispatch_to_app_with_timeout(request, api_tx, None, peer_pid)
 }
 
 pub(super) fn dispatch_to_app_with_timeout(
     request: Request,
     api_tx: &ApiRequestSender,
     timeout: Option<Duration>,
+    peer_pid: Option<u32>,
 ) -> String {
     let request_id = request.id.clone();
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     if let Err(err) = api_tx.send(ApiRequestMessage {
         request,
         respond_to,
+        peer_pid,
     }) {
         return error_response_json(
             request_id,
@@ -692,6 +703,7 @@ mod tests {
             },
             &tx,
             Some(ServerCapabilities { live_handoff: true }),
+            None,
         );
 
         let parsed: SuccessResponse = serde_json::from_str(&response).unwrap();
@@ -708,7 +720,8 @@ mod tests {
         };
 
         let request_for_thread = request.clone();
-        let thread = std::thread::spawn(move || handle_request(request_for_thread, &tx, None));
+        let thread =
+            std::thread::spawn(move || handle_request(request_for_thread, &tx, None, None));
 
         let msg = rx.blocking_recv().unwrap();
         assert_eq!(msg.request.id, "req_2");

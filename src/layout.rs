@@ -35,6 +35,8 @@ pub struct PaneInfo {
     /// Visible scrollbar lane, when scrollback is present. `inner_rect` may still
     /// exclude a stable hidden gutter when this is `None`.
     pub scrollbar_rect: Option<Rect>,
+    /// Reserved header strip above `inner_rect` (context + last prompt).
+    pub header_rect: Option<Rect>,
     pub is_focused: bool,
 }
 
@@ -116,8 +118,8 @@ impl TileLayout {
     /// Split the focused pane. Returns the new pane's id.
     pub fn split_focused(&mut self, direction: Direction) -> PaneId {
         let new_id = PaneId::alloc();
-        let placeholder = PaneId::from_raw(0);
-        let old = std::mem::replace(&mut self.root, Node::Pane(placeholder));
+        let tombstone = PaneId::from_raw(0);
+        let old = std::mem::replace(&mut self.root, Node::Pane(tombstone));
         self.root = split_at(old, self.focus, direction, new_id);
         self.focus = new_id;
         new_id
@@ -136,8 +138,8 @@ impl TileLayout {
         } else {
             ids[pos - 1]
         };
-        let placeholder = PaneId::from_raw(0);
-        let old = std::mem::replace(&mut self.root, Node::Pane(placeholder));
+        let tombstone = PaneId::from_raw(0);
+        let old = std::mem::replace(&mut self.root, Node::Pane(tombstone));
         if let Some(new_root) = remove_pane(old, target) {
             self.root = new_root;
             self.focus = new_focus;
@@ -305,6 +307,7 @@ fn collect_panes(node: &Node, area: Rect, focus: PaneId, result: &mut Vec<PaneIn
                 // inner_rect is set during render when we know if borders are shown
                 inner_rect: area,
                 scrollbar_rect: None,
+                header_rect: None,
                 is_focused: *id == focus,
             });
         }

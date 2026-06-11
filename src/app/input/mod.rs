@@ -97,14 +97,20 @@ impl App {
         if self.state.mode != Mode::Terminal {
             return;
         }
-        if let Some(ws_idx) = self.state.active {
-            if let Some(rt) = self
-                .state
-                .focused_runtime_in_workspace(&self.terminal_runtimes, ws_idx)
-            {
-                let _ = rt.send_paste(text).await;
-            }
+        if let Some(rt) = self.terminal_input_runtime() {
+            let _ = rt.send_paste(text).await;
         }
+    }
+
+    /// The runtime that owns terminal-mode input for the active workspace:
+    /// the visible float when one is up, otherwise the focused layout pane.
+    pub(crate) fn terminal_input_runtime(&self) -> Option<&crate::terminal::TerminalRuntime> {
+        let ws_idx = self.state.active?;
+        if let Some(float) = self.state.visible_float_for_active_workspace() {
+            return self.terminal_runtimes.get(&float.terminal_id);
+        }
+        self.state
+            .focused_runtime_in_workspace(&self.terminal_runtimes, ws_idx)
     }
 
     pub(crate) fn handle_onboarding_key(&mut self, key: KeyEvent) {
@@ -216,6 +222,8 @@ impl App {
                     SettingsAction::SaveAgentBorderLabels(enabled) => {
                         self.save_agent_border_labels(enabled)
                     }
+                    SettingsAction::SaveSidebarRowGap(gap) => self.save_sidebar_row_gap(gap),
+                    SettingsAction::SaveSidebarPaneGap(gap) => self.save_sidebar_pane_gap(gap),
                     SettingsAction::SavePaneHistory(enabled) => {
                         self.save_pane_history_persistence(enabled)
                     }
@@ -503,6 +511,7 @@ fn capture_snapshot(state: &AppState) -> crate::persist::SessionSnapshot {
         state.sidebar_width,
         state.sidebar_section_split,
         state.collapsed_space_keys.clone(),
+        std::collections::HashMap::new(),
     )
 }
 

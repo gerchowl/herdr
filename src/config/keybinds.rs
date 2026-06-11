@@ -263,6 +263,15 @@ pub struct Keybinds {
     pub settings: ActionKeybinds,
     pub new_workspace: ActionKeybinds,
     pub new_worktree: ActionKeybinds,
+    pub branch_session: ActionKeybinds,
+    pub toggle_collapse_all: ActionKeybinds,
+    pub toggle_prompt_expand: ActionKeybinds,
+    pub toggle_float: ActionKeybinds,
+    pub kill_worktree: ActionKeybinds,
+    pub focus_attention: ActionKeybinds,
+    pub focus_attention_previous: ActionKeybinds,
+    pub focus_attention_project: ActionKeybinds,
+    pub focus_attention_project_previous: ActionKeybinds,
     pub open_worktree: ActionKeybinds,
     pub remove_worktree: ActionKeybinds,
     pub rename_workspace: ActionKeybinds,
@@ -439,6 +448,30 @@ impl Config {
             settings: action!("keys.settings", &self.keys.settings),
             new_workspace: action!("keys.new_workspace", &self.keys.new_workspace),
             new_worktree: action!("keys.new_worktree", &self.keys.new_worktree),
+            branch_session: action!("keys.branch_session", &self.keys.branch_session),
+            toggle_collapse_all: action!(
+                "keys.toggle_collapse_all",
+                &self.keys.toggle_collapse_all
+            ),
+            toggle_prompt_expand: action!(
+                "keys.toggle_prompt_expand",
+                &self.keys.toggle_prompt_expand
+            ),
+            toggle_float: action!("keys.toggle_float", &self.keys.toggle_float),
+            kill_worktree: action!("keys.kill_worktree", &self.keys.kill_worktree),
+            focus_attention: action!("keys.focus_attention", &self.keys.focus_attention),
+            focus_attention_previous: action!(
+                "keys.focus_attention_previous",
+                &self.keys.focus_attention_previous
+            ),
+            focus_attention_project: action!(
+                "keys.focus_attention_project",
+                &self.keys.focus_attention_project
+            ),
+            focus_attention_project_previous: action!(
+                "keys.focus_attention_project_previous",
+                &self.keys.focus_attention_project_previous
+            ),
             open_worktree: action!("keys.open_worktree", &self.keys.open_worktree),
             remove_worktree: action!("keys.remove_worktree", &self.keys.remove_worktree),
             rename_workspace: action!("keys.rename_workspace", &self.keys.rename_workspace),
@@ -1771,5 +1804,20 @@ description = "say hello"
             keybinds.custom_commands[0].description,
             Some("say hello".to_string())
         );
+    }
+    #[test]
+    fn branch_session_parses_from_keys_table() {
+        let config: Config = toml::from_str(
+            r#"
+[keys]
+branch_session = "prefix+y"
+
+[worktrees]
+directory = "/tmp/x"
+"#,
+        )
+        .unwrap();
+        let kb = config.keybinds();
+        assert_eq!(kb.branch_session.label().as_deref(), Some("prefix+y"));
     }
 }

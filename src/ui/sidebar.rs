@@ -27,6 +27,7 @@ pub(crate) struct AgentPanelEntry {
     pub seen: bool,
     pub custom_status: Option<String>,
     pub state_labels: std::collections::HashMap<String, String>,
+    pub live_activity: Option<String>,
 }
 
 fn sidebar_section_heights(total_h: u16, split_ratio: f32) -> (u16, u16) {
@@ -46,8 +47,17 @@ fn sidebar_section_heights(total_h: u16, split_ratio: f32) -> (u16, u16) {
     (ws_h, detail_h)
 }
 
-pub(crate) fn expanded_sidebar_sections(area: Rect, split_ratio: f32) -> (Rect, Rect) {
-    let content = Rect::new(area.x, area.y, area.width.saturating_sub(1), area.height);
+pub(crate) fn expanded_sidebar_sections(
+    area: Rect,
+    split_ratio: f32,
+    pane_gap: u16,
+) -> (Rect, Rect) {
+    let content = Rect::new(
+        area.x,
+        area.y,
+        area.width.saturating_sub(1 + pane_gap),
+        area.height,
+    );
     if content.width == 0 || content.height == 0 {
         return (Rect::default(), Rect::default());
     }
@@ -58,8 +68,13 @@ pub(crate) fn expanded_sidebar_sections(area: Rect, split_ratio: f32) -> (Rect, 
     (ws_area, detail_area)
 }
 
-pub(crate) fn sidebar_section_divider_rect(area: Rect, split_ratio: f32) -> Rect {
-    let content = Rect::new(area.x, area.y, area.width.saturating_sub(1), area.height);
+pub(crate) fn sidebar_section_divider_rect(area: Rect, split_ratio: f32, pane_gap: u16) -> Rect {
+    let content = Rect::new(
+        area.x,
+        area.y,
+        area.width.saturating_sub(1 + pane_gap),
+        area.height,
+    );
     if content.width == 0 || content.height < 6 {
         return Rect::default();
     }
@@ -155,6 +170,7 @@ fn agent_panel_entries_with_runtimes(
                     seen: detail.seen,
                     custom_status: detail.custom_status,
                     state_labels: detail.state_labels,
+                    live_activity: detail.live_activity,
                 })
                 .collect()
         }
@@ -178,6 +194,7 @@ fn agent_panel_entries_with_runtimes(
                         seen: detail.seen,
                         custom_status: detail.custom_status,
                         state_labels: detail.state_labels,
+                        live_activity: detail.live_activity,
                     })
             })
             .collect(),
@@ -280,6 +297,52 @@ fn space_aggregate_state(app: &AppState, key: &str) -> (AgentState, bool) {
         .unwrap_or((AgentState::Unknown, true))
 }
 
+/// Pane counts per state bucket across a worktree space's members, in
+/// attention-priority order: blocked, done (unseen idle), working, idle.
+fn space_state_counts(app: &AppState, key: &str) -> Vec<(AgentState, bool, usize)> {
+    let mut blocked = 0usize;
+    let mut done = 0usize;
+    let mut working = 0usize;
+    let mut idle = 0usize;
+    for ws in app
+        .workspaces
+        .iter()
+        .filter(|ws| ws.worktree_space().is_some_and(|space| space.key == key))
+    {
+        for (state, seen) in ws.pane_states(&app.terminals) {
+            match (state, seen) {
+                (AgentState::Blocked, _) => blocked += 1,
+                (AgentState::Idle, false) => done += 1,
+                (AgentState::Working, _) => working += 1,
+                (AgentState::Idle, true) => idle += 1,
+                (AgentState::Unknown, _) => {}
+            }
+        }
+    }
+    [
+        (AgentState::Blocked, true, blocked),
+        (AgentState::Idle, false, done),
+        (AgentState::Working, true, working),
+        (AgentState::Idle, true, idle),
+    ]
+    .into_iter()
+    .filter(|(_, _, count)| *count > 0)
+    .collect()
+}
+
+/// Traffic-light count glyph: a filled circled digit for 1..=10, "\u{25cf}N"
+/// beyond that.
+fn circled_count(count: usize) -> String {
+    const CIRCLED: [&str; 10] = [
+        "\u{2776}", "\u{2777}", "\u{2778}", "\u{2779}", "\u{277a}", "\u{277b}", "\u{277c}",
+        "\u{277d}", "\u{277e}", "\u{277f}",
+    ];
+    match count {
+        1..=10 => CIRCLED[count - 1].to_string(),
+        other => format!("\u{25cf}{other}"),
+    }
+}
+
 pub(crate) fn workspace_parent_group_state(
     app: &AppState,
     ws_idx: usize,
@@ -319,18 +382,37 @@ fn grouped_child_display_label(label: &str, branch: Option<&str>, has_custom_nam
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum WorkspaceListEntry {
-    Workspace { ws_idx: usize, indented: bool },
+    Workspace {
+        ws_idx: usize,
+        indented: bool,
+    },
+    /// A workspace on a federated peer server, folded into the project group
+    /// it shares with local checkouts (indented) or trailing the list as its
+    /// own project (unindented). Selecting one switches servers.
+    Remote {
+        peer_idx: usize,
+        ws_idx: usize,
+        indented: bool,
+    },
 }
 
 fn next_entry_is_indented_workspace(entries: &[WorkspaceListEntry], idx: usize) -> bool {
     matches!(
         entries.get(idx.saturating_add(1)),
-        Some(WorkspaceListEntry::Workspace { indented: true, .. })
+        Some(
+            WorkspaceListEntry::Workspace { indented: true, .. }
+                | WorkspaceListEntry::Remote { indented: true, .. }
+        )
     )
 }
 
 pub(crate) fn normalized_workspace_scroll(app: &AppState, area: Rect, requested: usize) -> usize {
-    let ws_area = workspace_list_rect(area, app.sidebar_section_split);
+    let ws_area = workspace_list_rect(
+        area,
+        app.sidebar_section_split,
+        app.sidebar_pane_gap,
+        servers_section_height(app),
+    );
     let body = workspace_list_body_rect(ws_area, false);
     if body.height == 0 {
         return requested;
@@ -354,19 +436,7 @@ pub(crate) fn workspace_list_entries(app: &AppState) -> Vec<WorkspaceListEntry> 
                 .push(ws_idx);
         }
     }
-    let grouped_keys = members_by_key
-        .iter()
-        .filter(|(_, members)| {
-            members.len() >= 2
-                && members.iter().any(|idx| {
-                    app.workspaces
-                        .get(*idx)
-                        .and_then(|ws| ws.worktree_space())
-                        .is_some_and(|space| !space.is_linked_worktree)
-                })
-        })
-        .map(|(key, _)| key.clone())
-        .collect::<std::collections::HashSet<_>>();
+    let grouped_keys = app.collapsible_space_keys();
 
     let visible_group_idx = if matches!(app.mode, Mode::Navigate) {
         Some(app.selected)
@@ -441,12 +511,182 @@ pub(crate) fn workspace_list_entries(app: &AppState) -> Vec<WorkspaceListEntry> 
             }
         }
     }
+    fold_remote_entries(app, &mut entries);
     entries
 }
 
-pub(crate) fn workspace_list_rect(area: Rect, split_ratio: f32) -> Rect {
-    let (ws_area, _) = expanded_sidebar_sections(area, split_ratio);
-    ws_area
+/// Fold federated peer workspaces into the spaces list: rows whose
+/// project_key matches a local checkout splice in (indented) after that
+/// project's block; remote-only projects trail the list grouped together.
+/// Remote rows of a collapsed local group stay hidden with it.
+fn fold_remote_entries(app: &AppState, entries: &mut Vec<WorkspaceListEntry>) {
+    // project_key -> remote rows, in (config peer order, summary order).
+    let mut remotes_by_project = std::collections::HashMap::<&str, Vec<(usize, usize)>>::new();
+    let mut project_order = Vec::<&str>::new();
+    for (peer_idx, peer) in app.peer_summaries.iter().enumerate() {
+        for (ws_idx, ws) in peer.workspaces.iter().enumerate() {
+            let Some(project_key) = ws.project_key.as_deref() else {
+                continue;
+            };
+            let rows = remotes_by_project.entry(project_key).or_insert_with(|| {
+                project_order.push(project_key);
+                Vec::new()
+            });
+            rows.push((peer_idx, ws_idx));
+        }
+    }
+    if remotes_by_project.is_empty() {
+        return;
+    }
+
+    // Last entry index of each local project's block, and whether that block
+    // is a collapsed worktree group (remote rows hide with it).
+    let mut block_end = std::collections::HashMap::<&str, usize>::new();
+    let mut collapsed_projects = std::collections::HashSet::<&str>::new();
+    for (entry_idx, entry) in entries.iter().enumerate() {
+        let WorkspaceListEntry::Workspace { ws_idx, .. } = entry else {
+            continue;
+        };
+        let Some(ws) = app.workspaces.get(*ws_idx) else {
+            continue;
+        };
+        let Some(project_key) = ws.project_key() else {
+            continue;
+        };
+        block_end.insert(project_key, entry_idx);
+        if ws
+            .worktree_space()
+            .is_some_and(|space| app.collapsed_space_keys.contains(&space.key))
+        {
+            collapsed_projects.insert(project_key);
+        }
+    }
+
+    // Splice matched projects back-to-front so earlier indices stay valid.
+    let mut matched = project_order
+        .iter()
+        .filter_map(|project_key| block_end.get(project_key).map(|end| (*end, *project_key)))
+        .collect::<Vec<_>>();
+    matched.sort_by_key(|(end, _)| std::cmp::Reverse(*end));
+    for (end, project_key) in matched {
+        if collapsed_projects.contains(project_key) {
+            continue;
+        }
+        let rows = &remotes_by_project[project_key];
+        for (offset, (peer_idx, ws_idx)) in rows.iter().enumerate() {
+            entries.insert(
+                end + 1 + offset,
+                WorkspaceListEntry::Remote {
+                    peer_idx: *peer_idx,
+                    ws_idx: *ws_idx,
+                    indented: true,
+                },
+            );
+        }
+    }
+
+    // Remote-only projects trail the list; the first row of each project is
+    // unindented and labels the project, the rest indent under it.
+    for project_key in project_order {
+        if block_end.contains_key(project_key) {
+            continue;
+        }
+        for (offset, (peer_idx, ws_idx)) in remotes_by_project[project_key].iter().enumerate() {
+            entries.push(WorkspaceListEntry::Remote {
+                peer_idx: *peer_idx,
+                ws_idx: *ws_idx,
+                indented: offset > 0,
+            });
+        }
+    }
+}
+
+/// Status dot for remote rows, matching the local state_dot palette:
+/// blocked red, working yellow, done teal, idle green (settled), unknown dim.
+fn remote_status_dot(
+    status: crate::api::schema::AgentStatus,
+    p: &crate::app::state::Palette,
+) -> (&'static str, Style) {
+    use crate::api::schema::AgentStatus;
+    match status {
+        AgentStatus::Blocked => ("●", Style::default().fg(p.red)),
+        AgentStatus::Working => ("●", Style::default().fg(p.yellow)),
+        AgentStatus::Done => ("●", Style::default().fg(p.teal)),
+        AgentStatus::Idle => ("○", Style::default().fg(p.green)),
+        AgentStatus::Unknown => ("·", Style::default().fg(p.overlay0)),
+    }
+}
+
+/// Display label for a remote row: `host:branch` (matched/indented rows) or
+/// `project · host:branch` for rows that lead a remote-only project group.
+pub(crate) fn remote_entry_label(
+    app: &AppState,
+    peer_idx: usize,
+    ws_idx: usize,
+    indented: bool,
+) -> String {
+    let Some(peer) = app.peer_summaries.get(peer_idx) else {
+        return String::new();
+    };
+    let Some(ws) = peer.workspaces.get(ws_idx) else {
+        return String::new();
+    };
+    let host = peer.host.as_deref().unwrap_or(peer.peer.as_str());
+    let target = ws.branch.as_deref().unwrap_or(ws.workspace.as_str());
+    if indented {
+        format!("{host}:{target}")
+    } else {
+        let project = ws.project_label.as_deref().unwrap_or(ws.workspace.as_str());
+        format!("{project} · {host}:{target}")
+    }
+}
+
+/// Max peer rows shown in the `servers` section before it stops growing
+/// (extra peers still poll; the section just caps its height).
+const SERVERS_SECTION_MAX_ROWS: u16 = 8;
+
+/// Height the `servers` section wants: 0 with no peers, else a header row
+/// plus one row per peer (capped), or just the header when collapsed.
+pub(crate) fn servers_section_height(app: &AppState) -> u16 {
+    let peers = app.peer_summaries.len();
+    if peers == 0 {
+        return 0;
+    }
+    if app.servers_collapsed {
+        return 1;
+    }
+    1 + (peers as u16).min(SERVERS_SECTION_MAX_ROWS)
+}
+
+/// Split the spaces-section rect into the `servers` band (top) and the
+/// workspace-list area (below). The band never takes more than half the
+/// section, so the workspace list always keeps room.
+pub(crate) fn carve_servers_band(ws_area: Rect, servers_height: u16) -> (Rect, Rect) {
+    if servers_height == 0 || ws_area.height == 0 {
+        return (Rect::default(), ws_area);
+    }
+    let band_h = servers_height.min(ws_area.height / 2);
+    if band_h == 0 {
+        return (Rect::default(), ws_area);
+    }
+    let servers_area = Rect::new(ws_area.x, ws_area.y, ws_area.width, band_h);
+    let list_area = Rect::new(
+        ws_area.x,
+        ws_area.y + band_h,
+        ws_area.width,
+        ws_area.height - band_h,
+    );
+    (servers_area, list_area)
+}
+
+pub(crate) fn workspace_list_rect(
+    area: Rect,
+    split_ratio: f32,
+    pane_gap: u16,
+    servers_height: u16,
+) -> Rect {
+    let (ws_area, _) = expanded_sidebar_sections(area, split_ratio, pane_gap);
+    carve_servers_band(ws_area, servers_height).1
 }
 
 pub(crate) fn workspace_list_body_rect(area: Rect, has_scrollbar: bool) -> Rect {
@@ -481,10 +721,20 @@ fn workspace_list_visible_count(app: &AppState, area: Rect, scroll: usize) -> us
                 } else {
                     workspace_row_height(ws)
                 };
-                let gap = u16::from(
-                    !(*indented && next_entry_is_indented_workspace(&entries, entry_idx)),
-                );
+                let gap = if *indented && next_entry_is_indented_workspace(&entries, entry_idx) {
+                    0
+                } else {
+                    app.sidebar_row_gap
+                };
                 row_height.saturating_add(gap)
+            }
+            WorkspaceListEntry::Remote { indented, .. } => {
+                let gap = if *indented && next_entry_is_indented_workspace(&entries, entry_idx) {
+                    0
+                } else {
+                    app.sidebar_row_gap
+                };
+                1u16.saturating_add(gap)
             }
         };
         if used_rows.saturating_add(needed) > body.height {
@@ -538,7 +788,7 @@ pub(crate) fn agent_panel_body_rect(area: Rect, has_scrollbar: bool) -> Rect {
     Rect::new(area.x, body_y, body_width, body_height)
 }
 
-fn agent_panel_visible_count(area: Rect) -> usize {
+fn agent_panel_visible_count(area: Rect, row_gap: u16) -> usize {
     let body = agent_panel_body_rect(area, false);
     if body.width == 0 || body.height < 2 {
         return 0;
@@ -550,14 +800,14 @@ fn agent_panel_visible_count(area: Rect) -> usize {
         used_rows = used_rows.saturating_add(2);
         visible += 1;
         if used_rows < body.height {
-            used_rows = used_rows.saturating_add(1);
+            used_rows = used_rows.saturating_add(row_gap);
         }
     }
     visible
 }
 
 pub(crate) fn agent_panel_scroll_metrics(app: &AppState, area: Rect) -> crate::pane::ScrollMetrics {
-    let viewport_rows = agent_panel_visible_count(area);
+    let viewport_rows = agent_panel_visible_count(area, app.sidebar_row_gap);
     let total_rows = agent_panel_entries(app).len();
     let max_offset_from_bottom = total_rows.saturating_sub(viewport_rows);
     let offset_from_bottom = total_rows
@@ -585,8 +835,16 @@ pub(crate) fn agent_panel_scrollbar_rect(app: &AppState, area: Rect) -> Option<R
 pub(crate) fn compute_workspace_list_areas(
     app: &AppState,
     area: Rect,
-) -> (Vec<crate::app::state::WorkspaceCardArea>, Vec<()>) {
-    let ws_area = workspace_list_rect(area, app.sidebar_section_split);
+) -> (
+    Vec<crate::app::state::WorkspaceCardArea>,
+    Vec<crate::app::state::RemoteCardArea>,
+) {
+    let ws_area = workspace_list_rect(
+        area,
+        app.sidebar_section_split,
+        app.sidebar_pane_gap,
+        servers_section_height(app),
+    );
     if ws_area == Rect::default() {
         return (Vec::new(), Vec::new());
     }
@@ -601,7 +859,7 @@ pub(crate) fn compute_workspace_list_areas(
     let mut row_y = body.y;
     let body_bottom = body.y + body.height;
     let mut cards = Vec::new();
-    let headers = Vec::new();
+    let mut remote_cards = Vec::new();
 
     let entries = workspace_list_entries(app);
     for (entry_idx, entry) in entries.iter().enumerate().skip(scroll) {
@@ -615,9 +873,11 @@ pub(crate) fn compute_workspace_list_areas(
                 } else {
                     workspace_row_height(ws)
                 };
-                let gap = u16::from(
-                    !(*indented && next_entry_is_indented_workspace(&entries, entry_idx)),
-                );
+                let gap = if *indented && next_entry_is_indented_workspace(&entries, entry_idx) {
+                    0
+                } else {
+                    app.sidebar_row_gap
+                };
                 if row_y.saturating_add(row_height).saturating_add(gap) > body_bottom {
                     break;
                 }
@@ -628,10 +888,31 @@ pub(crate) fn compute_workspace_list_areas(
                 });
                 row_y = row_y.saturating_add(row_height + gap);
             }
+            WorkspaceListEntry::Remote {
+                peer_idx,
+                ws_idx,
+                indented,
+            } => {
+                let gap = if *indented && next_entry_is_indented_workspace(&entries, entry_idx) {
+                    0
+                } else {
+                    app.sidebar_row_gap
+                };
+                if row_y.saturating_add(1).saturating_add(gap) > body_bottom {
+                    break;
+                }
+                remote_cards.push(crate::app::state::RemoteCardArea {
+                    peer_idx: *peer_idx,
+                    ws_idx: *ws_idx,
+                    rect: Rect::new(body.x, row_y, body.width, 1),
+                    indented: *indented,
+                });
+                row_y = row_y.saturating_add(1 + gap);
+            }
         }
     }
 
-    (cards, headers)
+    (cards, remote_cards)
 }
 
 pub(crate) fn compute_workspace_card_areas(
@@ -642,8 +923,13 @@ pub(crate) fn compute_workspace_card_areas(
 }
 
 /// Auto-scale sidebar width based on workspace identity + agent summary.
-pub(crate) fn collapsed_sidebar_sections(area: Rect) -> (Rect, Option<u16>, Rect) {
-    let content = Rect::new(area.x, area.y, area.width.saturating_sub(1), area.height);
+pub(crate) fn collapsed_sidebar_sections(area: Rect, pane_gap: u16) -> (Rect, Option<u16>, Rect) {
+    let content = Rect::new(
+        area.x,
+        area.y,
+        area.width.saturating_sub(1 + pane_gap),
+        area.height,
+    );
     if content.width == 0 || content.height == 0 {
         return (Rect::default(), None, Rect::default());
     }
@@ -673,7 +959,7 @@ pub(super) fn render_sidebar_collapsed(app: &AppState, frame: &mut Frame, area: 
     let sep_style = if is_navigating {
         Style::default().fg(p.accent)
     } else {
-        Style::default().fg(p.surface_dim)
+        Style::default().fg(p.divider_color())
     };
     let sep_x = area.x + area.width.saturating_sub(1);
     let buf = frame.buffer_mut();
@@ -682,7 +968,7 @@ pub(super) fn render_sidebar_collapsed(app: &AppState, frame: &mut Frame, area: 
         buf[(sep_x, y)].set_style(sep_style);
     }
 
-    let (ws_area, divider_y, detail_area) = collapsed_sidebar_sections(area);
+    let (ws_area, divider_y, detail_area) = collapsed_sidebar_sections(area, app.sidebar_pane_gap);
     if ws_area == Rect::default() {
         render_sidebar_toggle(app, frame, area, true, p);
         return;
@@ -733,7 +1019,7 @@ pub(super) fn render_sidebar_collapsed(app: &AppState, frame: &mut Frame, area: 
         let buf = frame.buffer_mut();
         for x in ws_area.x..ws_area.x + ws_area.width {
             buf[(x, divider_y)].set_symbol("─");
-            buf[(x, divider_y)].set_style(Style::default().fg(p.surface_dim));
+            buf[(x, divider_y)].set_style(Style::default().fg(p.divider_color()));
         }
     }
 
@@ -820,7 +1106,7 @@ pub(super) fn render_sidebar(
     let sep_style = if is_navigating {
         Style::default().fg(p.accent)
     } else {
-        Style::default().fg(p.surface_dim)
+        Style::default().fg(p.divider_color())
     };
 
     let sep_x = area.x + area.width.saturating_sub(1);
@@ -830,11 +1116,214 @@ pub(super) fn render_sidebar(
         buf[(sep_x, y)].set_style(sep_style);
     }
 
-    let (ws_area, detail_area) = expanded_sidebar_sections(area, app.sidebar_section_split);
+    let (ws_area, detail_area) =
+        expanded_sidebar_sections(area, app.sidebar_section_split, app.sidebar_pane_gap);
 
-    render_workspace_list(app, terminal_runtimes, frame, ws_area, is_navigating);
+    let (servers_area, list_area) = carve_servers_band(ws_area, servers_section_height(app));
+    if servers_area != Rect::default() {
+        render_servers_section(app, frame, servers_area, is_navigating);
+    }
+    render_workspace_list(app, terminal_runtimes, frame, list_area, is_navigating);
     render_agent_detail(app, terminal_runtimes, frame, detail_area);
     render_sidebar_toggle(app, frame, area, false, p);
+}
+
+/// Compute hit areas for the `servers` section: the header rect (toggles
+/// collapse) and one rect per visible peer row (switches to that peer).
+pub(crate) fn compute_server_section_areas(
+    app: &AppState,
+    area: Rect,
+) -> (Rect, Vec<crate::app::state::ServerCardArea>) {
+    let (servers_area, _) = carve_servers_band(
+        workspace_list_rect(area, app.sidebar_section_split, app.sidebar_pane_gap, 0),
+        servers_section_height(app),
+    );
+    if servers_area == Rect::default() || servers_area.height == 0 {
+        return (Rect::default(), Vec::new());
+    }
+    let header_rect = Rect::new(servers_area.x, servers_area.y, servers_area.width, 1);
+    let mut cards = Vec::new();
+    if !app.servers_collapsed {
+        let max_rows = servers_area.height.saturating_sub(1);
+        for (peer_idx, _) in app
+            .peer_summaries
+            .iter()
+            .enumerate()
+            .take(max_rows as usize)
+        {
+            cards.push(crate::app::state::ServerCardArea {
+                peer_idx,
+                rect: Rect::new(
+                    servers_area.x,
+                    servers_area.y + 1 + peer_idx as u16,
+                    servers_area.width,
+                    1,
+                ),
+            });
+        }
+    }
+    (header_rect, cards)
+}
+
+fn render_servers_section(app: &AppState, frame: &mut Frame, area: Rect, is_navigating: bool) {
+    let p = &app.palette;
+    let chevron = if app.servers_collapsed { "▸" } else { "▾" };
+    let down = app
+        .peer_summaries
+        .iter()
+        .filter(|peer| peer.reachability() == crate::peers::PeerReachability::Down)
+        .count();
+    let header = if down > 0 {
+        format!("{chevron} servers ({down} down)")
+    } else {
+        format!("{chevron} servers")
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![Span::styled(
+            header,
+            Style::default().fg(p.overlay0).add_modifier(Modifier::BOLD),
+        )])),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+    let _ = is_navigating;
+
+    if app.servers_collapsed {
+        return;
+    }
+
+    let body_bottom = area.y + area.height;
+    for card in &app.view.server_card_areas {
+        if card.rect.y >= body_bottom {
+            break;
+        }
+        let Some(peer) = app.peer_summaries.get(card.peer_idx) else {
+            continue;
+        };
+        frame.render_widget(
+            Paragraph::new(server_row_line(peer, card.rect.width, p)),
+            card.rect,
+        );
+    }
+}
+
+/// One `servers` row: ● host  12ms  cpu 19% mem 13/16G  ·  3 agents.
+fn server_row_line<'a>(
+    peer: &'a crate::peers::PeerSummaryState,
+    width: u16,
+    p: &crate::app::state::Palette,
+) -> Line<'a> {
+    use crate::peers::PeerReachability;
+    let reach = peer.reachability();
+    let (dot, dot_color) = match reach {
+        PeerReachability::Live => ("●", p.green),
+        PeerReachability::Slow => ("●", p.yellow),
+        PeerReachability::Down => ("○", p.red),
+    };
+    let host = peer.host.clone().unwrap_or_else(|| peer.peer.clone());
+    let mut spans = vec![
+        Span::styled(" ", Style::default()),
+        Span::styled(dot, Style::default().fg(dot_color)),
+        Span::styled(" ", Style::default()),
+        Span::styled(host, Style::default().fg(p.subtext0)),
+    ];
+
+    if reach == PeerReachability::Down {
+        let detail = match peer.last_ok {
+            Some(at) => format!("  unreachable {}", format_age(at.elapsed().as_secs())),
+            None => "  unreachable".to_string(),
+        };
+        spans.push(Span::styled(detail, Style::default().fg(p.overlay0)));
+        return clamp_line(Line::from(spans), width);
+    }
+
+    if let Some(ms) = peer.latency_ms {
+        let color = if ms > crate::peers::PEER_SLOW_LATENCY_MS {
+            p.yellow
+        } else {
+            p.overlay0
+        };
+        spans.push(Span::styled(
+            format!("  {ms}ms"),
+            Style::default().fg(color),
+        ));
+    }
+    if let Some(system) = peer.system.as_ref() {
+        if let Some(cpu) = system.cpu_percent {
+            spans.push(Span::styled(
+                format!("  cpu {cpu}%"),
+                Style::default().fg(p.overlay0),
+            ));
+        }
+        if let (Some(used), Some(total)) = (system.mem_used, system.mem_total) {
+            spans.push(Span::styled(
+                format!(" mem {}/{}", format_gib(used), format_gib(total)),
+                Style::default().fg(p.overlay0),
+            ));
+        }
+    }
+    let agents = peer.workspaces.len();
+    if agents > 0 {
+        let blocked = peer
+            .workspaces
+            .iter()
+            .filter(|ws| ws.status == crate::api::schema::AgentStatus::Blocked)
+            .count();
+        let (text, color) = if blocked > 0 {
+            (format!("  {blocked} ● blocked"), p.red)
+        } else {
+            (format!("  {agents} agents"), p.overlay0)
+        };
+        spans.push(Span::styled(text, Style::default().fg(color)));
+    }
+    clamp_line(Line::from(spans), width)
+}
+
+fn format_gib(bytes: u64) -> String {
+    let gib = bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+    if gib >= 10.0 {
+        format!("{gib:.0}G")
+    } else {
+        format!("{gib:.1}G")
+    }
+}
+
+fn format_age(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{}h", secs / 3600)
+    }
+}
+
+/// Truncate a single-line span list to `width` columns with an ellipsis.
+fn clamp_line(line: Line<'_>, width: u16) -> Line<'_> {
+    let total: usize = line
+        .spans
+        .iter()
+        .map(|span| span.content.chars().count())
+        .sum();
+    if total <= width as usize {
+        return line;
+    }
+    let mut budget = (width as usize).saturating_sub(1);
+    let mut out = Vec::new();
+    for span in line.spans {
+        if budget == 0 {
+            break;
+        }
+        let len = span.content.chars().count();
+        if len <= budget {
+            budget -= len;
+            out.push(span);
+        } else {
+            let truncated: String = span.content.chars().take(budget).collect();
+            out.push(Span::styled(format!("{truncated}…"), span.style));
+            budget = 0;
+        }
+    }
+    Line::from(out)
 }
 
 fn render_workspace_list(
@@ -914,6 +1403,7 @@ fn render_workspace_list(
         let label = ws.display_name_from(&app.terminals, terminal_runtimes);
         let mut line1 = Vec::new();
         let mut show_workspace_icon = true;
+        let mut collapsed_group_key: Option<String> = None;
         if card.indented {
             line1.push(Span::styled("   ", Style::default()));
         } else if let Some((key, collapsed)) = workspace_parent_group_state(app, i) {
@@ -929,6 +1419,7 @@ fn render_workspace_list(
                 line1.push(Span::styled(" ", Style::default()));
                 line1.push(Span::styled(state_icon, state_style));
                 show_workspace_icon = false;
+                collapsed_group_key = Some(key);
             }
             line1.push(Span::styled(" ", Style::default()));
         } else {
@@ -947,6 +1438,17 @@ fn render_workspace_list(
             line1.push(Span::styled(display_label, name_style));
         } else {
             line1.push(Span::styled(label, name_style));
+        }
+        // Collapsed groups summarize their hidden members as a traffic
+        // light: per-state counts in attention-priority order.
+        if let Some(key) = collapsed_group_key.as_deref() {
+            for (state, seen, count) in space_state_counts(app, key) {
+                line1.push(Span::styled(" ", Style::default()));
+                line1.push(Span::styled(
+                    circled_count(count),
+                    Style::default().fg(state_label_color(state, seen, p)),
+                ));
+            }
         }
 
         frame.render_widget(
@@ -1005,6 +1507,45 @@ fn render_workspace_list(
         }
     }
 
+    for card in &app.view.remote_card_areas {
+        let Some(peer) = app.peer_summaries.get(card.peer_idx) else {
+            continue;
+        };
+        let Some(remote_ws) = peer.workspaces.get(card.ws_idx) else {
+            continue;
+        };
+        if card.rect.y >= list_bottom {
+            continue;
+        }
+        let stale = peer.is_stale() || peer.error.is_some();
+        let (icon, icon_style) = remote_status_dot(remote_ws.status, p);
+        let label = remote_entry_label(app, card.peer_idx, card.ws_idx, card.indented);
+        let max_label =
+            (card.rect.width as usize).saturating_sub(if card.indented { 5 } else { 3 });
+        let label = if label.len() > max_label {
+            format!("{}…", &label[..max_label.saturating_sub(1)])
+        } else {
+            label
+        };
+        let mut label_style = Style::default().fg(p.subtext0);
+        let mut final_icon_style = icon_style;
+        if stale {
+            label_style = label_style.add_modifier(Modifier::DIM);
+            final_icon_style = final_icon_style.add_modifier(Modifier::DIM);
+        }
+        let indent = if card.indented { "   " } else { " " };
+        let line = Line::from(vec![
+            Span::styled(indent, Style::default()),
+            Span::styled(icon, final_icon_style),
+            Span::styled(" ", Style::default()),
+            Span::styled(label, label_style),
+        ]);
+        frame.render_widget(
+            Paragraph::new(line),
+            Rect::new(card.rect.x, card.rect.y, card.rect.width, 1),
+        );
+    }
+
     if let Some(y) = insertion_row.filter(|y| *y < list_bottom) {
         let indicator_right = scrollbar_rect
             .map(|rect| rect.x)
@@ -1060,7 +1601,10 @@ fn render_agent_detail(
 
     let sep_line = "─".repeat(area.width as usize);
     frame.render_widget(
-        Paragraph::new(Span::styled(&sep_line, Style::default().fg(p.surface_dim))),
+        Paragraph::new(Span::styled(
+            &sep_line,
+            Style::default().fg(p.divider_color()),
+        )),
         Rect::new(area.x, area.y, area.width, 1),
     );
 
@@ -1120,10 +1664,16 @@ fn render_agent_detail(
         } else {
             Style::default().fg(p.subtext0).add_modifier(Modifier::BOLD)
         };
-        let status_style = if is_active {
-            Style::default().fg(label_color)
-        } else {
+        // Status colors render at full strength regardless of selection —
+        // blocked/working/done are attention signals, not decoration. Only a
+        // settled idle (seen, nothing to report) stays toned down; the row
+        // highlight bar already marks the selected entry.
+        let settled_idle =
+            matches!(detail.state, AgentState::Idle | AgentState::Unknown) && detail.seen;
+        let status_style = if settled_idle && !is_active {
             Style::default().fg(label_color).add_modifier(Modifier::DIM)
+        } else {
+            Style::default().fg(label_color)
         };
         let agent_style = Style::default().fg(p.overlay0).add_modifier(Modifier::DIM);
 
@@ -1141,13 +1691,21 @@ fn render_agent_detail(
         );
         row_y += 1;
 
-        let mut status_spans = vec![
-            Span::styled("   ", Style::default()),
-            Span::styled(label, status_style),
-        ];
+        // '<agent> · <activity-or-status>': the short agent code leads so the
+        // (potentially long) live activity text gets the remaining width.
+        let mut status_spans = vec![Span::styled("   ", Style::default())];
         if let Some(agent_label) = &detail.agent_label {
+            status_spans.push(Span::styled(
+                app.agent_alias(agent_label).to_string(),
+                agent_style,
+            ));
             status_spans.push(Span::styled(" · ", agent_style));
-            status_spans.push(Span::styled(agent_label, agent_style));
+        }
+        match &detail.live_activity {
+            Some(activity) => {
+                status_spans.push(Span::styled(format!("{activity}…"), status_style));
+            }
+            None => status_spans.push(Span::styled(label, status_style)),
         }
         if let Some(custom_status) = &detail.custom_status {
             status_spans.push(Span::styled(" · ", agent_style));
@@ -1160,7 +1718,7 @@ fn render_agent_detail(
         row_y += 1;
 
         if row_y < body_bottom {
-            row_y += 1;
+            row_y = row_y.saturating_add(app.sidebar_row_gap);
         }
     }
 
@@ -1220,6 +1778,322 @@ mod tests {
     use super::*;
     use crate::{detect::Agent, workspace::Workspace};
     use ratatui::{backend::TestBackend, Terminal};
+
+    fn remote_summary(
+        workspace: &str,
+        project_key: Option<&str>,
+        project_label: Option<&str>,
+        branch: Option<&str>,
+    ) -> crate::api::schema::PeerWorkspaceSummary {
+        crate::api::schema::PeerWorkspaceSummary {
+            id: format!("ws_{workspace}"),
+            workspace: workspace.into(),
+            project_key: project_key.map(str::to_string),
+            project_label: project_label.map(str::to_string),
+            branch: branch.map(str::to_string),
+            is_linked_worktree: branch.is_some(),
+            agent: Some("cc".into()),
+            status: crate::api::schema::AgentStatus::Working,
+            status_age_secs: Some(10),
+            activity: None,
+        }
+    }
+
+    fn peer_with_workspaces(
+        name: &str,
+        workspaces: Vec<crate::api::schema::PeerWorkspaceSummary>,
+    ) -> crate::peers::PeerSummaryState {
+        let mut peer = crate::peers::PeerSummaryState::new(&crate::config::PeerConfig {
+            name: name.into(),
+            ..Default::default()
+        });
+        peer.workspaces = workspaces;
+        peer.last_ok = Some(std::time::Instant::now());
+        peer
+    }
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn servers_section_height_tracks_peers_and_collapse() {
+        let mut app = crate::app::state::AppState::test_new();
+        assert_eq!(servers_section_height(&app), 0);
+        app.peer_summaries = vec![
+            peer_with_workspaces("anvil", vec![]),
+            peer_with_workspaces("sage", vec![]),
+        ];
+        assert_eq!(servers_section_height(&app), 3); // header + 2 rows
+        app.servers_collapsed = true;
+        assert_eq!(servers_section_height(&app), 1); // header only
+    }
+
+    #[test]
+    fn compute_server_section_areas_lays_out_header_and_rows() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.peer_summaries = vec![
+            peer_with_workspaces("anvil", vec![]),
+            peer_with_workspaces("sage", vec![]),
+        ];
+        let area = Rect::new(0, 0, 30, 30);
+        let (header, cards) = compute_server_section_areas(&app, area);
+        assert_ne!(header, Rect::default());
+        assert_eq!(cards.len(), 2);
+        assert_eq!(cards[0].peer_idx, 0);
+        assert_eq!(cards[1].rect.y, cards[0].rect.y + 1);
+
+        app.servers_collapsed = true;
+        let (header, cards) = compute_server_section_areas(&app, area);
+        assert_ne!(header, Rect::default());
+        assert!(cards.is_empty());
+    }
+
+    #[test]
+    fn server_row_line_shows_health_for_live_peer() {
+        let p = crate::app::state::AppState::test_new().palette;
+        let mut peer = peer_with_workspaces(
+            "anvil",
+            vec![remote_summary(
+                "herdr",
+                Some("github.com/gerchowl/herdr"),
+                Some("herdr"),
+                Some("fix/pty"),
+            )],
+        );
+        peer.host = Some("anvil".into());
+        peer.latency_ms = Some(34);
+        peer.system = Some(crate::api::schema::PeerSystemSummary {
+            cpu_percent: Some(71),
+            mem_used: Some(48 * 1024 * 1024 * 1024),
+            mem_total: Some(64 * 1024 * 1024 * 1024),
+            disk_free: None,
+        });
+        let text = line_text(&server_row_line(&peer, 60, &p));
+        assert!(text.contains("anvil"), "{text}");
+        assert!(text.contains("34ms"), "{text}");
+        assert!(text.contains("cpu 71%"), "{text}");
+        assert!(text.contains("mem 48G/64G"), "{text}");
+        assert!(
+            text.contains("blocked") || text.contains("agents"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn server_row_line_marks_unreachable_peer() {
+        let p = crate::app::state::AppState::test_new().palette;
+        let mut peer = peer_with_workspaces("ksb", vec![]);
+        peer.last_ok = None;
+        peer.error = Some("connect timed out".into());
+        let text = line_text(&server_row_line(&peer, 40, &p));
+        assert!(text.contains("ksb"), "{text}");
+        assert!(text.contains("unreachable"), "{text}");
+    }
+
+    fn workspace_with_project_key(name: &str, project_key: &str) -> Workspace {
+        let mut ws = Workspace::test_new(name);
+        ws.cached_git_space = Some(crate::workspace::GitSpaceMetadata {
+            key: format!("/repo/{name}/.git"),
+            checkout_key: format!("/repo/{name}"),
+            label: name.into(),
+            repo_root: std::path::PathBuf::from(format!("/repo/{name}")),
+            is_linked_worktree: false,
+            project_key: project_key.into(),
+        });
+        ws
+    }
+
+    #[test]
+    fn remote_rows_fold_under_matching_local_project() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![
+            workspace_with_project_key("herdr", "github.com/gerchowl/herdr"),
+            workspace_with_project_key("other", "github.com/gerchowl/other"),
+        ];
+        app.peer_summaries = vec![peer_with_workspaces(
+            "anvil",
+            vec![remote_summary(
+                "herdr",
+                Some("github.com/gerchowl/herdr"),
+                Some("herdr"),
+                Some("fix/pty"),
+            )],
+        )];
+
+        let entries = workspace_list_entries(&app);
+        assert_eq!(
+            entries,
+            vec![
+                WorkspaceListEntry::Workspace {
+                    ws_idx: 0,
+                    indented: false
+                },
+                WorkspaceListEntry::Remote {
+                    peer_idx: 0,
+                    ws_idx: 0,
+                    indented: true
+                },
+                WorkspaceListEntry::Workspace {
+                    ws_idx: 1,
+                    indented: false
+                },
+            ]
+        );
+        assert_eq!(remote_entry_label(&app, 0, 0, true), "anvil:fix/pty");
+    }
+
+    #[test]
+    fn remote_only_projects_trail_the_list_with_project_leader() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![workspace_with_project_key(
+            "herdr",
+            "github.com/gerchowl/herdr",
+        )];
+        app.peer_summaries = vec![peer_with_workspaces(
+            "sage",
+            vec![
+                remote_summary(
+                    "dotfiles",
+                    Some("github.com/gerchowl/dotfiles"),
+                    Some("dotfiles"),
+                    None,
+                ),
+                remote_summary(
+                    "dotfiles-wt",
+                    Some("github.com/gerchowl/dotfiles"),
+                    Some("dotfiles"),
+                    Some("vm-dev"),
+                ),
+            ],
+        )];
+
+        let entries = workspace_list_entries(&app);
+        assert_eq!(
+            entries,
+            vec![
+                WorkspaceListEntry::Workspace {
+                    ws_idx: 0,
+                    indented: false
+                },
+                WorkspaceListEntry::Remote {
+                    peer_idx: 0,
+                    ws_idx: 0,
+                    indented: false
+                },
+                WorkspaceListEntry::Remote {
+                    peer_idx: 0,
+                    ws_idx: 1,
+                    indented: true
+                },
+            ]
+        );
+        // The leader row carries the project label.
+        assert_eq!(
+            remote_entry_label(&app, 0, 0, false),
+            "dotfiles · sage:dotfiles"
+        );
+        assert_eq!(remote_entry_label(&app, 0, 1, true), "sage:vm-dev");
+    }
+
+    #[test]
+    fn collapsed_local_group_hides_matched_remote_rows() {
+        let mut app = crate::app::state::AppState::test_new();
+        let space = |linked: bool| crate::workspace::WorktreeSpaceMembership {
+            key: "family-key".into(),
+            label: "herdr".into(),
+            repo_root: "/repo/herdr".into(),
+            checkout_path: if linked {
+                "/repo/herdr-wt".into()
+            } else {
+                "/repo/herdr".into()
+            },
+            is_linked_worktree: linked,
+        };
+        let mut parent = workspace_with_project_key("herdr", "github.com/gerchowl/herdr");
+        parent.worktree_space = Some(space(false));
+        let mut child = workspace_with_project_key("herdr-wt", "github.com/gerchowl/herdr");
+        child.worktree_space = Some(space(true));
+        app.workspaces = vec![parent, child];
+        app.peer_summaries = vec![peer_with_workspaces(
+            "anvil",
+            vec![remote_summary(
+                "herdr",
+                Some("github.com/gerchowl/herdr"),
+                Some("herdr"),
+                Some("fix/pty"),
+            )],
+        )];
+
+        let expanded = workspace_list_entries(&app);
+        assert!(expanded
+            .iter()
+            .any(|entry| matches!(entry, WorkspaceListEntry::Remote { .. })));
+
+        app.collapsed_space_keys.insert("family-key".into());
+        let collapsed = workspace_list_entries(&app);
+        assert!(!collapsed
+            .iter()
+            .any(|entry| matches!(entry, WorkspaceListEntry::Remote { .. })));
+    }
+
+    #[test]
+    fn space_state_counts_buckets_panes_by_attention_state() {
+        use crate::detect::AgentState;
+        use crate::workspace::WorktreeSpaceMembership;
+
+        let space = |idx: usize, linked: bool| WorktreeSpaceMembership {
+            key: "grp".into(),
+            label: "herdr".into(),
+            repo_root: "/repo/herdr".into(),
+            checkout_path: format!("/repo/ws-{idx}").into(),
+            is_linked_worktree: linked,
+        };
+
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces.push(Workspace::test_new("parent"));
+        app.workspaces.push(Workspace::test_new("child"));
+        app.workspaces[0].worktree_space = Some(space(0, false));
+        app.workspaces[1].worktree_space = Some(space(1, true));
+        app.ensure_test_terminals();
+
+        // parent pane is Blocked; child pane is Idle+unseen (a "done" light).
+        let parent_tid = {
+            let tab = &app.workspaces[0].tabs[0];
+            tab.panes
+                .values()
+                .next()
+                .unwrap()
+                .attached_terminal_id
+                .clone()
+        };
+        let (child_tid, child_pane) = {
+            let tab = &app.workspaces[1].tabs[0];
+            let pane = tab.panes.keys().next().copied().unwrap();
+            (app.workspaces[1].terminal_id(pane).unwrap().clone(), pane)
+        };
+        app.terminals.get_mut(&parent_tid).unwrap().state = AgentState::Blocked;
+        app.terminals.get_mut(&child_tid).unwrap().state = AgentState::Idle;
+        app.workspaces[1].tabs[0]
+            .panes
+            .get_mut(&child_pane)
+            .unwrap()
+            .seen = false;
+
+        let counts = space_state_counts(&app, "grp");
+
+        assert!(counts.contains(&(AgentState::Blocked, true, 1)));
+        assert!(counts.contains(&(AgentState::Idle, false, 1)));
+        // No Working/Idle-seen panes → those buckets are filtered out.
+        assert_eq!(counts.len(), 2);
+    }
+
+    #[test]
+    fn circled_count_uses_filled_digits_through_ten_then_falls_back() {
+        assert_eq!(circled_count(1), "\u{2776}");
+        assert_eq!(circled_count(10), "\u{277f}");
+        assert_eq!(circled_count(11), "\u{25cf}11");
+    }
 
     #[test]
     fn render_sidebar_toggle_draws_expanded_collapse_icon() {
@@ -1393,6 +2267,7 @@ mod tests {
             state: AgentState::Idle,
             seen: true,
             custom_status: None,
+            live_activity: None,
             state_labels: std::collections::HashMap::new(),
         };
 
@@ -1403,7 +2278,7 @@ mod tests {
 
     #[test]
     fn expanded_sidebar_sections_handle_tiny_heights() {
-        let (ws_area, detail_area) = expanded_sidebar_sections(Rect::new(0, 0, 20, 5), 0.9);
+        let (ws_area, detail_area) = expanded_sidebar_sections(Rect::new(0, 0, 20, 5), 0.9, 0);
 
         assert_eq!(ws_area, Rect::new(0, 0, 19, 3));
         assert_eq!(detail_area, Rect::new(0, 3, 19, 2));
@@ -1411,7 +2286,7 @@ mod tests {
 
     #[test]
     fn sidebar_section_divider_is_hidden_for_tiny_heights() {
-        let divider = sidebar_section_divider_rect(Rect::new(0, 0, 20, 5), 0.5);
+        let divider = sidebar_section_divider_rect(Rect::new(0, 0, 20, 5), 0.5, 0);
 
         assert_eq!(divider, Rect::default());
     }
@@ -1458,6 +2333,7 @@ mod tests {
             label: "herdr".into(),
             repo_root: std::path::PathBuf::from(format!("/repo/{name}")),
             is_linked_worktree: false,
+            project_key: format!("dir:{key}"),
         });
         ws
     }
@@ -1478,6 +2354,53 @@ mod tests {
         assert_eq!(cards[1].ws_idx, 1);
         assert!(cards[1].indented);
         assert_eq!(cards[1].rect.y, cards[0].rect.y + cards[0].rect.height + 1);
+    }
+
+    #[test]
+    fn sidebar_pane_gap_shrinks_content_symmetrically() {
+        let area = Rect::new(0, 0, 26, 20);
+
+        // gap 0: content is everything except the divider column (legacy behavior).
+        let (ws_area, detail_area) = expanded_sidebar_sections(area, 0.5, 0);
+        assert_eq!(ws_area.width, 25);
+        assert_eq!(detail_area.width, 25);
+
+        // gap 2: content also leaves two blank columns before the divider.
+        let (ws_area, detail_area) = expanded_sidebar_sections(area, 0.5, 2);
+        assert_eq!(ws_area.width, 23);
+        assert_eq!(detail_area.width, 23);
+
+        let divider = sidebar_section_divider_rect(area, 0.5, 2);
+        assert_eq!(divider.width, 23);
+
+        let (ws_area, _, detail_area) = collapsed_sidebar_sections(Rect::new(0, 0, 6, 20), 2);
+        assert_eq!(ws_area.width, 3);
+        assert_eq!(detail_area.width, 3);
+    }
+
+    #[test]
+    fn sidebar_row_gap_zero_packs_workspace_cards_adjacent() {
+        let mut app = AppState::test_new();
+        app.workspaces = vec![
+            crate::workspace::Workspace::test_new("one"),
+            crate::workspace::Workspace::test_new("two"),
+        ];
+        let area = Rect::new(0, 0, 30, 20);
+
+        let (cards, _) = compute_workspace_list_areas(&app, area);
+        assert_eq!(
+            cards[1].rect.y,
+            cards[0].rect.y + cards[0].rect.height + 1,
+            "default gap is one blank row"
+        );
+
+        app.sidebar_row_gap = 0;
+        let (cards, _) = compute_workspace_list_areas(&app, area);
+        assert_eq!(
+            cards[1].rect.y,
+            cards[0].rect.y + cards[0].rect.height,
+            "gap 0 packs cards adjacent"
+        );
     }
 
     #[test]

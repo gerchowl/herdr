@@ -55,6 +55,10 @@ impl App {
                 let previous_mode = self.state.mode;
                 self.launch_focused_scrollback_editor();
                 finish_action_context(&mut self.state, ActionContext::Prefix, previous_mode);
+            } else if action == NavigateAction::ToggleFloat {
+                let previous_mode = self.state.mode;
+                self.toggle_float_pane();
+                finish_action_context(&mut self.state, ActionContext::Prefix, previous_mode);
             } else {
                 execute_navigate_action_in_context(
                     &mut self.state,
@@ -91,6 +95,9 @@ impl App {
         if let Some(action) = navigate_mode_action_for_key(&self.state, raw_key) {
             if action == NavigateAction::EditScrollback {
                 self.launch_focused_scrollback_editor();
+            } else if action == NavigateAction::ToggleFloat {
+                self.toggle_float_pane();
+                leave_navigate_mode(&mut self.state);
             } else {
                 execute_navigate_action_in_context(
                     &mut self.state,
@@ -112,10 +119,16 @@ impl App {
         let Some(ws_idx) = self.state.active else {
             return false;
         };
-        let Some(rt) = self
+        // A visible float owns terminal input: double-prefix passthrough
+        // lands in the float's shell, not the focused layout pane.
+        let float_rt = self
             .state
-            .focused_runtime_in_workspace(&self.terminal_runtimes, ws_idx)
-        else {
+            .visible_float_for_active_workspace()
+            .and_then(|float| self.terminal_runtimes.get(&float.terminal_id));
+        let Some(rt) = float_rt.or_else(|| {
+            self.state
+                .focused_runtime_in_workspace(&self.terminal_runtimes, ws_idx)
+        }) else {
             return false;
         };
 
@@ -477,6 +490,12 @@ pub(crate) fn handle_navigate_key(state: &mut AppState, key: KeyEvent) {
 pub(crate) enum NavigateAction {
     NewWorkspace,
     NewWorktree,
+    BranchSession,
+    KillWorktree,
+    FocusAttention,
+    FocusAttentionPrevious,
+    FocusAttentionProject,
+    FocusAttentionProjectPrevious,
     OpenWorktree,
     RemoveWorktree,
     RenameWorkspace,
@@ -503,10 +522,13 @@ pub(crate) enum NavigateAction {
     SplitHorizontal,
     ClosePane,
     EditScrollback,
+    ToggleFloat,
     CopyMode,
     Zoom,
     EnterResizeMode,
     ToggleSidebar,
+    ToggleCollapseAll,
+    TogglePromptExpand,
     CyclePaneNext,
     CyclePanePrevious,
     LastPane,
@@ -581,14 +603,29 @@ fn action_for_key(
         (&kb.workspace_picker, NavigateAction::WorkspacePicker),
         (&kb.new_workspace, NavigateAction::NewWorkspace),
         (&kb.new_worktree, NavigateAction::NewWorktree),
+        (&kb.branch_session, NavigateAction::BranchSession),
         (&kb.open_worktree, NavigateAction::OpenWorktree),
         (&kb.remove_worktree, NavigateAction::RemoveWorktree),
+        (&kb.kill_worktree, NavigateAction::KillWorktree),
         (&kb.rename_workspace, NavigateAction::RenameWorkspace),
         (&kb.close_workspace, NavigateAction::CloseWorkspace),
         (&kb.previous_workspace, NavigateAction::PreviousWorkspace),
         (&kb.next_workspace, NavigateAction::NextWorkspace),
         (&kb.previous_agent, NavigateAction::PreviousAgent),
         (&kb.next_agent, NavigateAction::NextAgent),
+        (&kb.focus_attention, NavigateAction::FocusAttention),
+        (
+            &kb.focus_attention_previous,
+            NavigateAction::FocusAttentionPrevious,
+        ),
+        (
+            &kb.focus_attention_project,
+            NavigateAction::FocusAttentionProject,
+        ),
+        (
+            &kb.focus_attention_project_previous,
+            NavigateAction::FocusAttentionProjectPrevious,
+        ),
         (&kb.new_tab, NavigateAction::NewTab),
         (&kb.rename_tab, NavigateAction::RenameTab),
         (&kb.previous_tab, NavigateAction::PreviousTab),
@@ -596,6 +633,7 @@ fn action_for_key(
         (&kb.close_tab, NavigateAction::CloseTab),
         (&kb.rename_pane, NavigateAction::RenamePane),
         (&kb.edit_scrollback, NavigateAction::EditScrollback),
+        (&kb.toggle_float, NavigateAction::ToggleFloat),
         (&kb.copy_mode, NavigateAction::CopyMode),
         (&kb.focus_pane_left, NavigateAction::FocusPaneLeft),
         (&kb.focus_pane_down, NavigateAction::FocusPaneDown),
@@ -610,6 +648,8 @@ fn action_for_key(
         (&kb.zoom, NavigateAction::Zoom),
         (&kb.resize_mode, NavigateAction::EnterResizeMode),
         (&kb.toggle_sidebar, NavigateAction::ToggleSidebar),
+        (&kb.toggle_collapse_all, NavigateAction::ToggleCollapseAll),
+        (&kb.toggle_prompt_expand, NavigateAction::TogglePromptExpand),
         (&kb.reload_config, NavigateAction::ReloadConfig),
         (
             &kb.open_notification_target,
@@ -670,6 +710,14 @@ pub(super) fn execute_navigate_action_in_context(
                 leave_navigate_mode(state);
             }
         }
+        NavigateAction::BranchSession => {
+            if let Some(ws_idx) = workspace_action_target(state, context)
+                .filter(|idx| workspace_can_start_worktree_action(state, terminal_runtimes, *idx))
+            {
+                state.request_branch_session = Some(ws_idx);
+                leave_navigate_mode(state);
+            }
+        }
         NavigateAction::OpenWorktree => {
             if let Some(ws_idx) = workspace_action_target(state, context)
                 .filter(|idx| workspace_can_start_worktree_action(state, terminal_runtimes, *idx))
@@ -681,6 +729,12 @@ pub(super) fn execute_navigate_action_in_context(
         NavigateAction::RemoveWorktree => {
             if let Some(ws_idx) = workspace_action_target(state, context) {
                 state.request_remove_linked_worktree = Some(ws_idx);
+                leave_navigate_mode(state);
+            }
+        }
+        NavigateAction::KillWorktree => {
+            if let Some(ws_idx) = workspace_action_target(state, context) {
+                state.request_kill_worktree = Some(ws_idx);
                 leave_navigate_mode(state);
             }
         }
@@ -741,6 +795,22 @@ pub(super) fn execute_navigate_action_in_context(
             state.next_agent();
             leave_navigate_mode(state);
         }
+        NavigateAction::FocusAttention => {
+            state.focus_attention_agent();
+            leave_navigate_mode(state);
+        }
+        NavigateAction::FocusAttentionPrevious => {
+            state.focus_attention_agent_previous();
+            leave_navigate_mode(state);
+        }
+        NavigateAction::FocusAttentionProject => {
+            state.focus_attention_project();
+            leave_navigate_mode(state);
+        }
+        NavigateAction::FocusAttentionProjectPrevious => {
+            state.focus_attention_project_previous();
+            leave_navigate_mode(state);
+        }
         NavigateAction::NewTab => {
             if state.active.is_some() {
                 if state.prompt_new_tab_name {
@@ -792,6 +862,9 @@ pub(super) fn execute_navigate_action_in_context(
             }
         }
         NavigateAction::EditScrollback => {}
+        // Handled at the App level (PTY spawn needs event_tx/runtimes),
+        // mirroring EditScrollback above.
+        NavigateAction::ToggleFloat => {}
         NavigateAction::CopyMode => state.enter_copy_mode(terminal_runtimes),
         NavigateAction::Zoom => {
             state.toggle_zoom();
@@ -800,6 +873,14 @@ pub(super) fn execute_navigate_action_in_context(
         NavigateAction::EnterResizeMode => state.mode = Mode::Resize,
         NavigateAction::ToggleSidebar => {
             state.sidebar_collapsed = !state.sidebar_collapsed;
+            leave_navigate_mode(state);
+        }
+        NavigateAction::ToggleCollapseAll => {
+            state.toggle_all_space_groups();
+            leave_navigate_mode(state);
+        }
+        NavigateAction::TogglePromptExpand => {
+            state.toggle_focused_prompt_expand();
             leave_navigate_mode(state);
         }
         NavigateAction::CyclePaneNext => {
@@ -1111,6 +1192,66 @@ mod tests {
         );
 
         assert_eq!(state.request_new_linked_worktree, Some(1));
+        assert_eq!(state.mode, Mode::Terminal);
+    }
+
+    #[test]
+    fn prefix_branch_session_key_dispatches_from_parsed_config() {
+        let config: crate::config::Config =
+            toml::from_str("[keys]\nbranch_session = \"prefix+y\"\n").unwrap();
+        let mut app = super::super::app_for_mouse_test();
+        app.state.keybinds = config.keybinds();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("main")];
+        // Pin a non-git identity cwd: the test process may itself run inside a
+        // linked worktree checkout, where worktree actions are refused.
+        app.state.workspaces[0].identity_cwd = unique_temp_path("navigate-branch-session-prefix");
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Prefix;
+
+        app.handle_prefix_key(crate::input::TerminalKey::new(
+            KeyCode::Char('y'),
+            KeyModifiers::empty(),
+        ));
+
+        assert_eq!(app.state.request_branch_session, Some(0));
+    }
+
+    #[test]
+    fn prefix_branch_session_key_requests_active_workspace() {
+        let mut app = super::super::app_for_mouse_test();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("main")];
+        // Pin a non-git identity cwd: the test process may itself run inside a
+        // linked worktree checkout, where worktree actions are refused.
+        app.state.workspaces[0].identity_cwd = unique_temp_path("navigate-branch-session-prefix");
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Prefix;
+        app.state.keybinds.branch_session = crate::config::ActionKeybinds::prefix("y");
+
+        app.handle_prefix_key(crate::input::TerminalKey::new(
+            KeyCode::Char('y'),
+            KeyModifiers::empty(),
+        ));
+
+        assert_eq!(app.state.request_branch_session, Some(0));
+    }
+
+    #[test]
+    fn custom_branch_session_key_requests_selected_workspace() {
+        let mut state = state_with_workspaces(&["main", "scratch"]);
+        state.workspaces[1].identity_cwd = unique_temp_path("navigate-branch-session-selected");
+        state.mode = Mode::Navigate;
+        state.selected = 1;
+        state.active = Some(0);
+        state.keybinds.branch_session = crate::config::ActionKeybinds::prefix("y");
+
+        handle_navigate_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::empty()),
+        );
+
+        assert_eq!(state.request_branch_session, Some(1));
         assert_eq!(state.mode, Mode::Terminal);
     }
 

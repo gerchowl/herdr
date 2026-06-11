@@ -443,6 +443,13 @@ impl HeadlessServer {
                 crate::render_prof::event("full_render_cause.deferred_worktree_dialog");
             }
 
+            if let Some(ws_idx) = self.app.state.request_branch_session.take() {
+                self.app.open_branch_session_dialog(ws_idx);
+                needs_render = true;
+                needs_full_render = true;
+                crate::render_prof::event("full_render_cause.deferred_worktree_dialog");
+            }
+
             if let Some(ws_idx) = self.app.state.request_open_existing_worktree.take() {
                 self.app.open_existing_worktree_dialog(ws_idx);
                 needs_render = true;
@@ -465,6 +472,34 @@ impl HeadlessServer {
                 needs_render = true;
                 needs_full_render = true;
                 crate::render_prof::event("full_render_cause.deferred_worktree_dialog");
+            }
+
+            if let Some(ws_idx) = self.app.state.request_kill_worktree.take() {
+                self.app.open_kill_worktree_confirmation(ws_idx);
+                needs_render = true;
+                needs_full_render = true;
+                crate::render_prof::event("full_render_cause.deferred_worktree_dialog");
+            }
+
+            if self.app.state.pending_attention_chime {
+                self.app.state.pending_attention_chime = false;
+                if self.app.state.sound_enabled() {
+                    self.send_to_foreground_client(ServerMessage::Notify {
+                        kind: protocol::NotifyKind::Sound,
+                        message: "attention clear".to_owned(),
+                    });
+                }
+            }
+
+            if let Some((peer_idx, ws_idx)) = self.app.state.request_peer_switch.take() {
+                if let Some((ssh_target, peer_label)) =
+                    self.app.prepare_peer_switch(peer_idx, ws_idx)
+                {
+                    self.app
+                        .show_action_notice(format!("switching to {peer_label}…"));
+                    self.send_to_foreground_client(ServerMessage::SwitchServer { ssh_target });
+                }
+                needs_render = true;
             }
 
             if self.app.state.request_submit_worktree_create {
@@ -769,6 +804,12 @@ impl HeadlessServer {
             self.app.state.sidebar_width,
             self.app.state.sidebar_section_split,
             self.app.state.collapsed_space_keys.clone(),
+            self.app
+                .state
+                .pane_id_aliases
+                .iter()
+                .map(|(old, pane)| (*old, pane.raw()))
+                .collect(),
         );
 
         let mut handoff_entries = Vec::new();
@@ -1353,6 +1394,7 @@ impl HeadlessServer {
                         let msg = match sound {
                             crate::sound::Sound::Done => "agent done",
                             crate::sound::Sound::Request => "agent attention",
+                            crate::sound::Sound::AllClear => "attention clear",
                         };
                         self.send_to_foreground_client(ServerMessage::Notify {
                             kind: protocol::NotifyKind::Sound,
@@ -1438,6 +1480,7 @@ impl HeadlessServer {
                         let msg = match sound {
                             crate::sound::Sound::Done => "agent done",
                             crate::sound::Sound::Request => "agent attention",
+                            crate::sound::Sound::AllClear => "attention clear",
                         };
                         self.send_to_foreground_client(ServerMessage::Notify {
                             kind: protocol::NotifyKind::Sound,
@@ -2198,8 +2241,12 @@ impl HeadlessServer {
                 .unwrap_or_else(|_| "{}".to_string())
             })
         } else {
-            self.app
-                .handle_api_request_after_internal_events_drained(msg.request)
+            self.app.current_api_peer_pid = msg.peer_pid;
+            let response = self
+                .app
+                .handle_api_request_after_internal_events_drained(msg.request);
+            self.app.current_api_peer_pid = None;
+            response
         };
         let _ = msg.respond_to.send(response);
 
@@ -2327,6 +2374,7 @@ impl HeadlessServer {
                     let msg_text = match sound {
                         crate::sound::Sound::Done => "agent done",
                         crate::sound::Sound::Request => "agent attention",
+                        crate::sound::Sound::AllClear => "attention clear",
                     };
                     debug!(sound = ?sound, "forwarding sound notification from API request");
                     self.send_to_foreground_client(ServerMessage::Notify {
@@ -2896,6 +2944,16 @@ impl HeadlessServer {
 
         if self
             .app
+            .action_notice_deadline
+            .is_some_and(|deadline| now >= deadline)
+        {
+            self.app.action_notice_deadline = None;
+            self.app.state.action_notice = None;
+            changed = true;
+        }
+
+        if self
+            .app
             .toast_deadline
             .is_some_and(|deadline| now >= deadline)
         {
@@ -3433,6 +3491,7 @@ mod tests {
                     method: api::schema::Method::ServerStop(api::schema::EmptyParams::default()),
                 },
                 respond_to,
+                peer_pid: None,
             })
         );
         let response = response_rx
@@ -6243,6 +6302,7 @@ next_tab = ""
                 }),
             },
             respond_to,
+            peer_pid: None,
         });
 
         assert!(changed);

@@ -63,7 +63,9 @@ impl App {
     ) -> bool {
         let previous_mode = self.state.mode;
         let changed = crate::api::request_changes_ui(&msg.request);
+        self.current_api_peer_pid = msg.peer_pid;
         let response = self.handle_api_request(msg.request);
+        self.current_api_peer_pid = None;
         let _ = msg.respond_to.send(response);
         self.sync_prefix_input_source(previous_mode);
         changed
@@ -73,11 +75,16 @@ impl App {
         &mut self,
         first: crate::raw_input::RawInputEvent,
     ) -> bool {
+        let watch = crate::logging::Stopwatch::start();
+        let mut events = 1usize;
         let mut changed = self.handle_raw_input_event(first).await;
 
         while let Some(rx) = self.input_rx.as_mut() {
             match rx.try_recv() {
-                Ok(event) => changed |= self.handle_raw_input_event(event).await,
+                Ok(event) => {
+                    events += 1;
+                    changed |= self.handle_raw_input_event(event).await;
+                }
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
                 Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
                     self.input_rx = None;
@@ -86,6 +93,7 @@ impl App {
             }
         }
 
+        crate::logging::input_batch_observed(watch.elapsed(), events);
         changed
     }
 
@@ -643,6 +651,7 @@ mod tests {
             rect: ratatui::layout::Rect::new(0, 0, 80, 24),
             inner_rect: ratatui::layout::Rect::new(0, 0, 80, 24),
             scrollbar_rect: None,
+            header_rect: None,
             is_focused: true,
         });
         (app, pane_id)
@@ -879,6 +888,7 @@ mod tests {
             rect: ratatui::layout::Rect::new(0, 0, cols, rows),
             inner_rect: ratatui::layout::Rect::new(0, 0, cols, rows),
             scrollbar_rect: None,
+            header_rect: None,
             is_focused: true,
         });
         (app, pane_id)
