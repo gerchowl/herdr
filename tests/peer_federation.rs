@@ -15,9 +15,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use serde::Deserialize;
 use support::{
-    cleanup_test_base, client_handshake, decode_varint_u32, read_server_message,
-    register_runtime_dir, register_spawned_herdr_pid, send_input, unregister_spawned_herdr_pid,
-    wait_for_file, wait_for_socket,
+    cleanup_test_base, client_handshake, client_handshake_with_fleet, decode_varint_u32,
+    read_server_message, register_runtime_dir, register_spawned_herdr_pid, send_input,
+    unregister_spawned_herdr_pid, wait_for_file, wait_for_socket,
 };
 
 /// ServerMessage bincode variant indices (declaration order in wire.rs).
@@ -228,8 +228,49 @@ fn wait_for_frame_row(
     ))
 }
 
-/// Wait for a SwitchServer message and return its ssh_target.
-fn wait_for_switch_server(stream: &mut UnixStream, timeout: Duration) -> Result<String, String> {
+/// Read frames until one satisfies every needle; return that frame's rows.
+/// (Sequential single-needle waits would consume frames between checks and
+/// stall when the server has no reason to re-render.)
+fn wait_for_frame_matching(
+    stream: &mut UnixStream,
+    needles: &[&str],
+    timeout: Duration,
+) -> Result<Vec<String>, String> {
+    stream
+        .set_read_timeout(Some(Duration::from_millis(300)))
+        .map_err(|e| e.to_string())?;
+    let deadline = Instant::now() + timeout;
+    let mut last_screen = String::new();
+    while Instant::now() < deadline {
+        match read_server_message(stream) {
+            Ok((VARIANT_FRAME, payload)) => {
+                if let Some(frame) = decode_frame_payload(&payload) {
+                    let rows = frame_rows(&frame);
+                    last_screen = rows.join("\n");
+                    if needles
+                        .iter()
+                        .all(|needle| rows.iter().any(|row| row.contains(needle)))
+                    {
+                        return Ok(rows);
+                    }
+                }
+            }
+            Ok(_) => continue,
+            Err(_) => continue,
+        }
+    }
+    Err(format!(
+        "timed out waiting for {needles:?} in one frame; last screen:\n{last_screen}"
+    ))
+}
+
+/// Wait for a SwitchServer message and return its ssh_target plus the raw
+/// trailing `fleet: Option<FleetSnapshot>` bytes. A switching client carries
+/// those bytes verbatim into its next Hello, so tests can splice them too.
+fn wait_for_switch_server(
+    stream: &mut UnixStream,
+    timeout: Duration,
+) -> Result<(String, Vec<u8>), String> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         match read_server_message(stream) {
@@ -239,7 +280,8 @@ fn wait_for_switch_server(stream: &mut UnixStream, timeout: Duration) -> Result<
                 let bytes = payload
                     .get(offset..end)
                     .ok_or_else(|| "truncated SwitchServer payload".to_string())?;
-                return String::from_utf8(bytes.to_vec()).map_err(|e| e.to_string());
+                let target = String::from_utf8(bytes.to_vec()).map_err(|e| e.to_string())?;
+                return Ok((target, payload[end..].to_vec()));
             }
             Ok(_) => continue,
             Err(_) => continue,
@@ -309,7 +351,7 @@ fn peer_summary_folds_into_sidebar_and_click_switches_server() {
 
     // --- Attach a protocol client to A and wait for the folded remote row.
     let mut stream = UnixStream::connect(&client_socket_a).expect("client socket should connect");
-    let (_, error) = client_handshake(&mut stream, 13, 90, 30).expect("handshake should complete");
+    let (_, error) = client_handshake(&mut stream, 14, 90, 30).expect("handshake should complete");
     assert!(error.is_none(), "handshake rejected: {error:?}");
 
     // The first poll fires ~3s after A starts; allow generous slack. The
@@ -327,11 +369,143 @@ fn peer_summary_folds_into_sidebar_and_click_switches_server() {
     send_input(&mut stream, format!("\x1b[<0;{col};{sgr_row}m").as_bytes())
         .expect("mouse release should send");
 
-    let target = wait_for_switch_server(&mut stream, Duration::from_secs(10))
+    let (target, fleet_bytes) = wait_for_switch_server(&mut stream, Duration::from_secs(10))
         .expect("click on remote row should yield SwitchServer");
     assert_eq!(target, "peerb");
+    // The switch carries a fleet snapshot (down-gossip): Some(...) tag.
+    assert_eq!(fleet_bytes.first(), Some(&1u8));
 
     drop(stream);
+    drop(server_a);
+    drop(server_b);
+    cleanup_test_base(&base);
+}
+
+/// E2E (hub-and-spoke, issue #36): a switch off the hub carries a fleet
+/// snapshot; re-attaching to the spoke with that snapshot in the handshake
+/// renders the pinned home row plus the carried peer rows in the servers
+/// band, and selecting home yields a SwitchServer with the reserved home
+/// target — the way back needs zero spoke-side ssh config.
+#[test]
+fn switch_snapshot_renders_home_row_on_spoke_and_home_switches_back() {
+    let base = unique_test_dir();
+    let bin_dir = PathBuf::from(env!("CARGO_BIN_EXE_herdr"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
+
+    // --- Server B: the spoke the client leaps into.
+    let repo_b = base.join("proj");
+    init_repo_with_origin(&repo_b, "git@github.com:peer-fed-home/proj.git");
+    let config_home_b = base.join("config-b");
+    let runtime_b = base.join("runtime-b");
+    let socket_b = base.join("herdr-b.sock");
+    write_config(&config_home_b, "onboarding = false\n");
+    let server_b = spawn_server(&config_home_b, &runtime_b, &socket_b, &repo_b, None);
+    wait_for_socket(&socket_b, Duration::from_secs(10));
+    create_workspace(&socket_b, &repo_b);
+
+    // --- Fake ssh: target "ghost" is unreachable, anything else hits B.
+    let shim_dir = base.join("bin");
+    fs::create_dir_all(&shim_dir).unwrap();
+    let shim = shim_dir.join("ssh");
+    fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\nprev=\"\"; target=\"\"\nfor a; do target=\"$prev\"; prev=\"$a\"; done\nif [ \"$target\" = \"ghost\" ]; then exit 255; fi\nHERDR_SOCKET_PATH='{}' XDG_CONFIG_HOME='{}' PATH='{}':\"$PATH\" exec sh -c \"$prev\"\n",
+            socket_b.display(),
+            config_home_b.display(),
+            bin_dir.display(),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
+
+    // --- Server A: the hub. Two peers, so the snapshot still carries one
+    // entry (ghost) after the hop target (peerb) is excluded.
+    let repo_a = base.join("alpha");
+    init_repo_with_origin(&repo_a, "git@github.com:peer-fed-home/alpha.git");
+    let config_home_a = base.join("config-a");
+    let runtime_a = base.join("runtime-a");
+    let socket_a = base.join("herdr-a.sock");
+    write_config(
+        &config_home_a,
+        "onboarding = false\n\n[[peers]]\nname = \"peerb\"\n\n[[peers]]\nname = \"ghost\"\n",
+    );
+    let server_a = spawn_server(
+        &config_home_a,
+        &runtime_a,
+        &socket_a,
+        &repo_a,
+        Some(&shim_dir),
+    );
+    wait_for_socket(&socket_a, Duration::from_secs(10));
+    create_workspace(&socket_a, &repo_a);
+    let client_socket_a = base.join("herdr-a-client.sock");
+    wait_for_file(&client_socket_a, Duration::from_secs(10));
+
+    // --- Leap off the hub: click peerb's folded remote row.
+    let mut stream = UnixStream::connect(&client_socket_a).expect("client socket should connect");
+    let (_, error) = client_handshake(&mut stream, 14, 90, 30).expect("handshake should complete");
+    assert!(error.is_none(), "handshake rejected: {error:?}");
+    let row = wait_for_frame_row(&mut stream, "proj · ", Duration::from_secs(45))
+        .expect("peer workspace should fold into the sidebar");
+    let sgr_row = (row as u16) + 1;
+    send_input(&mut stream, format!("\x1b[<0;4;{sgr_row}M").as_bytes()).expect("mouse press");
+    send_input(&mut stream, format!("\x1b[<0;4;{sgr_row}m").as_bytes()).expect("mouse release");
+
+    let (target, fleet_bytes) = wait_for_switch_server(&mut stream, Duration::from_secs(10))
+        .expect("click on remote row should yield SwitchServer");
+    assert_eq!(target, "peerb");
+    // Down-gossip: the switch carries Some(fleet) with the ghost peer in it
+    // (the hop target itself is excluded from its own snapshot).
+    assert_eq!(fleet_bytes.first(), Some(&1u8));
+    assert!(
+        fleet_bytes.windows(5).any(|w| w == b"ghost"),
+        "snapshot should carry the ghost peer"
+    );
+    assert!(
+        !fleet_bytes.windows(5).any(|w| w == b"peerb"),
+        "snapshot must exclude the hop target"
+    );
+    drop(stream);
+
+    // --- Re-attach to the spoke carrying the snapshot bytes verbatim —
+    // exactly what the launcher's next leg does.
+    let client_socket_b = base.join("herdr-b-client.sock");
+    wait_for_file(&client_socket_b, Duration::from_secs(10));
+    let mut stream_b =
+        UnixStream::connect(&client_socket_b).expect("spoke client socket should connect");
+    let (_, error) = client_handshake_with_fleet(&mut stream_b, 14, 90, 30, &fleet_bytes)
+        .expect("spoke handshake should complete");
+    assert!(error.is_none(), "spoke handshake rejected: {error:?}");
+
+    // The spoke renders the carried fleet in one frame: the pinned home
+    // row plus the carried (render-only) ghost row.
+    let rows = wait_for_frame_matching(&mut stream_b, &["←", "ghost"], Duration::from_secs(30))
+        .expect("home row and snapshot peer should render on the spoke");
+    let home_row = rows
+        .iter()
+        .position(|row| row.contains('←'))
+        .expect("home row present");
+    assert!(
+        rows[home_row].contains(" home"),
+        "home row should be marked: {}",
+        rows[home_row]
+    );
+
+    // --- Select home: the spoke answers with the reserved home target and
+    // no fleet — the client re-attaches locally.
+    let sgr_row = (home_row as u16) + 1;
+    send_input(&mut stream_b, format!("\x1b[<0;4;{sgr_row}M").as_bytes()).expect("mouse press");
+    send_input(&mut stream_b, format!("\x1b[<0;4;{sgr_row}m").as_bytes()).expect("mouse release");
+
+    let (target, fleet_bytes) = wait_for_switch_server(&mut stream_b, Duration::from_secs(10))
+        .expect("selecting home should yield SwitchServer");
+    assert_eq!(target, "<home>"); // protocol::HOME_SWITCH_TARGET
+    assert_eq!(fleet_bytes.first(), Some(&0u8), "home carries no fleet");
+
+    drop(stream_b);
     drop(server_a);
     drop(server_b);
     cleanup_test_base(&base);

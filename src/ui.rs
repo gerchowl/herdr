@@ -759,7 +759,7 @@ mod tests {
         );
         assert!(self_title.contains('\u{2726}'), "{self_title}"); // ✦
         let self_health = buffer_row_text(buffer, header, header.y + 2);
-        assert!(self_health.contains("cpu 42%"), "{self_health}");
+        assert!(self_health.contains("\u{f0ee0} 42%"), "{self_health}");
 
         // The peer renders below on its two-line hit-area; the self rows
         // above it carry no card, so clicking them stays a no-op.

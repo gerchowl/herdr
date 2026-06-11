@@ -648,14 +648,27 @@ pub struct WorkspaceCardArea {
     pub indented: bool,
 }
 
-/// Hit area of a two-line peer row in the `servers` section. Clicking one
-/// switches to that peer's first workspace; clicking the header toggles the
-/// section. The local server's row deliberately has no card: clicking
+/// Where a requested server switch points. Set by sidebar clicks and the
+/// switch_home keybind; consumed by both the monolithic and headless loops.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerSwitchRequest {
+    /// A config-owned peer: (peer_idx, ws_idx) into `peer_summaries`.
+    ConfigPeer { peer_idx: usize, ws_idx: usize },
+    /// A carried fleet-snapshot row: index into `fleet_snapshot.peers`.
+    SnapshotPeer { entry_idx: usize },
+    /// The origin row / switch_home keybind: re-attach to the client's
+    /// local server via the reserved home target.
+    Home,
+}
+
+/// Hit area of a two-line server row in the `servers` section. Clicking one
+/// requests the switch its `target` describes; clicking the header toggles
+/// the section. The local server's row deliberately has no card: clicking
 /// yourself never requests a server switch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerCardArea {
-    /// Index into `state.peer_summaries`.
-    pub peer_idx: usize,
+    /// Switch request this row stands for (home, snapshot, or config peer).
+    pub target: PeerSwitchRequest,
     pub rect: Rect,
 }
 
@@ -1406,9 +1419,13 @@ pub struct AppState {
     pub peers: Vec<crate::config::PeerConfig>,
     /// Latest polled summary per configured peer (sidebar remote rows).
     pub peer_summaries: Vec<crate::peers::PeerSummaryState>,
-    /// A remote row was selected: switch the client to this peer workspace.
-    /// (peer_idx, ws_idx) into peer_summaries. Consumed by both loops.
-    pub request_peer_switch: Option<(usize, usize)>,
+    /// Fleet snapshot carried by the attached client's handshake
+    /// (hub-and-spoke down-gossip): origin/home label + render-only peer
+    /// rows. None when the client attached locally — no home row then.
+    pub fleet_snapshot: Option<crate::peers::FleetSnapshotState>,
+    /// A server row was selected (or switch_home pressed): switch the
+    /// client to this target. Consumed by both loops.
+    pub request_peer_switch: Option<PeerSwitchRequest>,
     /// Whether the `servers` sidebar section is collapsed to its header.
     pub servers_collapsed: bool,
     pub request_open_existing_worktree: Option<usize>,
@@ -1778,6 +1795,7 @@ impl AppState {
             adopt_external_worktrees: true,
             peers: Vec::new(),
             peer_summaries: Vec::new(),
+            fleet_snapshot: None,
             request_peer_switch: None,
             servers_collapsed: false,
             request_open_existing_worktree: None,

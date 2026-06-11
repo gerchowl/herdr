@@ -472,6 +472,7 @@ impl App {
                 .iter()
                 .map(crate::peers::PeerSummaryState::new)
                 .collect(),
+            fleet_snapshot: None,
             request_peer_switch: None,
             servers_collapsed: false,
             request_open_existing_worktree: None,
@@ -850,11 +851,13 @@ impl App {
                 needs_render = true;
             }
 
-            if self.state.request_peer_switch.take().is_some() {
+            if let Some(request) = self.state.request_peer_switch.take() {
                 // Monolithic --no-session mode has no client to re-point.
-                self.show_action_notice(
-                    "peer switch requires client/server mode (run without --no-session)",
-                );
+                self.show_action_notice(match request {
+                    // No client ever attaches here, so no origin exists.
+                    crate::app::state::PeerSwitchRequest::Home => "already home",
+                    _ => "peer switch requires client/server mode (run without --no-session)",
+                });
                 needs_render = true;
             }
 

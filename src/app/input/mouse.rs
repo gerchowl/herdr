@@ -519,7 +519,7 @@ impl AppState {
                     if let Some(card) = self.view.server_card_areas.iter().find(|card| {
                         mouse.row >= card.rect.y && mouse.row < card.rect.y + card.rect.height
                     }) {
-                        self.request_peer_switch = Some((card.peer_idx, 0));
+                        self.request_peer_switch = Some(card.target.clone());
                         return None;
                     }
 
@@ -562,7 +562,11 @@ impl AppState {
                         .iter()
                         .find(|card| mouse.row == card.rect.y)
                     {
-                        self.request_peer_switch = Some((card.peer_idx, card.ws_idx));
+                        self.request_peer_switch =
+                            Some(crate::app::state::PeerSwitchRequest::ConfigPeer {
+                                peer_idx: card.peer_idx,
+                                ws_idx: card.ws_idx,
+                            });
                         return None;
                     }
 
@@ -1868,7 +1872,13 @@ mod tests {
             card.rect.x + 2,
             card.rect.y + 1,
         ));
-        assert_eq!(app.state.request_peer_switch, Some((0, 0)));
+        assert_eq!(
+            app.state.request_peer_switch,
+            Some(crate::app::state::PeerSwitchRequest::ConfigPeer {
+                peer_idx: 0,
+                ws_idx: 0,
+            })
+        );
     }
 
     #[tokio::test]

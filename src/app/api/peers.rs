@@ -38,7 +38,78 @@ fn system_summary(stats: &crate::system_stats::SystemStats) -> PeerSystemSummary
     }
 }
 
+/// A resolved server switch ready to send to the foreground client:
+/// the next attach target plus the fleet snapshot that leg carries.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PreparedServerSwitch {
+    pub(crate) ssh_target: String,
+    pub(crate) label: String,
+    pub(crate) fleet: Option<crate::protocol::FleetSnapshot>,
+}
+
 impl App {
+    /// Resolve a server-switch request from the sidebar or the switch_home
+    /// keybind into the SwitchServer payload. Returns None when the request
+    /// no longer resolves (rows changed) — or for Home without an origin.
+    pub(crate) fn prepare_switch_server(
+        &mut self,
+        request: crate::app::state::PeerSwitchRequest,
+    ) -> Option<PreparedServerSwitch> {
+        use crate::app::state::PeerSwitchRequest;
+        match request {
+            PeerSwitchRequest::ConfigPeer { peer_idx, ws_idx } => {
+                let (ssh_target, label) = self.prepare_peer_switch(peer_idx, ws_idx)?;
+                let fleet = Some(self.outgoing_fleet_snapshot(&ssh_target));
+                Some(PreparedServerSwitch {
+                    ssh_target,
+                    label,
+                    fleet,
+                })
+            }
+            PeerSwitchRequest::SnapshotPeer { entry_idx } => {
+                let entry = self.state.fleet_snapshot.as_ref()?.peers.get(entry_idx)?;
+                let ssh_target = entry.ssh_target.clone();
+                let label = entry.host.clone().unwrap_or_else(|| entry.peer.clone());
+                let fleet = Some(self.outgoing_fleet_snapshot(&ssh_target));
+                Some(PreparedServerSwitch {
+                    ssh_target,
+                    label,
+                    fleet,
+                })
+            }
+            PeerSwitchRequest::Home => {
+                let origin = self.state.fleet_snapshot.as_ref()?.origin.clone();
+                Some(PreparedServerSwitch {
+                    ssh_target: crate::protocol::HOME_SWITCH_TARGET.to_string(),
+                    label: format!("{origin} (home)"),
+                    fleet: None,
+                })
+            }
+        }
+    }
+
+    /// The fleet snapshot the next attach leg carries. Pass-through, never
+    /// re-stamp: a server that itself received a snapshot forwards it with
+    /// the ORIGINAL origin (nested leaps keep the real home); only a server
+    /// the client reached directly (the hub) stamps a fresh snapshot from
+    /// its own identity and polled peer summaries. The hop target is
+    /// excluded — it becomes the self row on the receiving end.
+    fn outgoing_fleet_snapshot(&self, exclude_ssh_target: &str) -> crate::protocol::FleetSnapshot {
+        match self.state.fleet_snapshot.as_ref() {
+            Some(snapshot) => snapshot.to_wire(exclude_ssh_target),
+            None => crate::protocol::FleetSnapshot {
+                origin: short_host_name(),
+                peers: self
+                    .state
+                    .peer_summaries
+                    .iter()
+                    .filter(|peer| peer.ssh_target != exclude_ssh_target)
+                    .map(crate::peers::peer_to_wire)
+                    .collect(),
+            },
+        }
+    }
+
     /// Resolve a requested peer switch: returns the SSH target for the
     /// client's next attach leg and a display label, and best-effort
     /// pre-focuses the chosen workspace on the peer (off-thread).
@@ -175,5 +246,112 @@ fn workspace_peer_summary(
         status: super::super::api_helpers::pane_agent_status(state, seen),
         status_age_secs,
         activity,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::app::state::PeerSwitchRequest;
+    use crate::app::App;
+
+    fn test_app() -> App {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        )
+    }
+
+    fn summary(name: &str, ssh_target: &str) -> crate::peers::PeerSummaryState {
+        crate::peers::PeerSummaryState {
+            peer: name.to_string(),
+            ssh_target: ssh_target.to_string(),
+            host: Some(name.to_string()),
+            version: None,
+            system: None,
+            latency_ms: Some(10),
+            // Deliberately empty: prepare_peer_switch must not spawn the
+            // remote pre-focus ssh in tests.
+            workspaces: Vec::new(),
+            last_ok: Some(std::time::Instant::now()),
+            error: None,
+        }
+    }
+
+    fn carried_snapshot() -> crate::peers::FleetSnapshotState {
+        crate::peers::FleetSnapshotState {
+            origin: "mba22".to_string(),
+            peers: vec![summary("anvil", "lars@anvil"), summary("ksb", "lars@ksb")],
+            received_at: std::time::Instant::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn home_request_resolves_to_reserved_target_without_fleet() {
+        let mut app = test_app();
+        app.state.fleet_snapshot = Some(carried_snapshot());
+
+        let prepared = app
+            .prepare_switch_server(PeerSwitchRequest::Home)
+            .expect("home resolves when an origin was carried");
+        assert_eq!(prepared.ssh_target, crate::protocol::HOME_SWITCH_TARGET);
+        assert!(prepared.label.contains("mba22"));
+        // Going home carries nothing: the local server needs no snapshot.
+        assert!(prepared.fleet.is_none());
+    }
+
+    #[tokio::test]
+    async fn home_request_without_origin_resolves_to_none() {
+        let mut app = test_app();
+        assert!(app.prepare_switch_server(PeerSwitchRequest::Home).is_none());
+    }
+
+    #[tokio::test]
+    async fn snapshot_row_switch_passes_snapshot_through_with_original_origin() {
+        let mut app = test_app();
+        app.state.fleet_snapshot = Some(carried_snapshot());
+
+        let prepared = app
+            .prepare_switch_server(PeerSwitchRequest::SnapshotPeer { entry_idx: 0 })
+            .expect("snapshot row resolves");
+        assert_eq!(prepared.ssh_target, "lars@anvil");
+        let fleet = prepared.fleet.expect("nested leap carries the snapshot");
+        // Pass-through, not re-stamp: the ORIGINAL origin survives, and the
+        // hop target drops out (it becomes the self row over there).
+        assert_eq!(fleet.origin, "mba22");
+        assert_eq!(fleet.peers.len(), 1);
+        assert_eq!(fleet.peers[0].ssh_target, "lars@ksb");
+    }
+
+    #[tokio::test]
+    async fn config_peer_switch_from_hub_stamps_own_origin_and_peers() {
+        let mut app = test_app();
+        app.state.peer_summaries =
+            vec![summary("anvil", "lars@anvil"), summary("sage", "lars@sage")];
+
+        let prepared = app
+            .prepare_switch_server(PeerSwitchRequest::ConfigPeer {
+                peer_idx: 1,
+                ws_idx: 0,
+            })
+            .expect("config peer resolves");
+        assert_eq!(prepared.ssh_target, "lars@sage");
+        let fleet = prepared.fleet.expect("hub leap stamps a fresh snapshot");
+        assert_eq!(fleet.origin, crate::app::short_host_name());
+        // The hop target is excluded from its own snapshot.
+        assert_eq!(fleet.peers.len(), 1);
+        assert_eq!(fleet.peers[0].ssh_target, "lars@anvil");
+    }
+
+    #[tokio::test]
+    async fn stale_snapshot_row_index_resolves_to_none() {
+        let mut app = test_app();
+        app.state.fleet_snapshot = Some(carried_snapshot());
+        assert!(app
+            .prepare_switch_server(PeerSwitchRequest::SnapshotPeer { entry_idx: 99 })
+            .is_none());
     }
 }

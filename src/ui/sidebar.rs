@@ -649,20 +649,45 @@ const SERVERS_SECTION_MAX_ROWS: u16 = 8;
 /// first, compact health on the second.
 const SERVER_ROW_LINES: u16 = 2;
 
-/// Height the `servers` section wants: 0 with no peers, else a header row
-/// plus two lines per server — the local server renders first, then one
-/// row per peer (capped) — or just the header when collapsed.
+/// The band's two-line rows in render order: the home/origin row pinned
+/// first when the attached client carried a fleet snapshot, then the local
+/// server (`None` — it never gets a switch hit-area), then the carried
+/// snapshot rows, then the server's own configured peers. A locally
+/// attached client has no snapshot: just self + config peers, as before.
+fn server_band_slots(app: &AppState) -> Vec<Option<crate::app::state::PeerSwitchRequest>> {
+    use crate::app::state::PeerSwitchRequest;
+    let mut slots = Vec::new();
+    if let Some(snapshot) = app.fleet_snapshot.as_ref() {
+        slots.push(Some(PeerSwitchRequest::Home));
+        slots.push(None);
+        slots.extend(
+            (0..snapshot.peers.len())
+                .map(|entry_idx| Some(PeerSwitchRequest::SnapshotPeer { entry_idx })),
+        );
+    } else {
+        slots.push(None);
+    }
+    slots.extend((0..app.peer_summaries.len()).map(|peer_idx| {
+        Some(PeerSwitchRequest::ConfigPeer {
+            peer_idx,
+            ws_idx: 0,
+        })
+    }));
+    slots
+}
+
+/// Height the `servers` section wants: 0 with nothing but the self row,
+/// else a header row plus two lines per server row (capped) — or just the
+/// header when collapsed.
 pub(crate) fn servers_section_height(app: &AppState) -> u16 {
-    let peers = app.peer_summaries.len();
-    if peers == 0 {
+    let slots = server_band_slots(app).len() as u16;
+    if slots <= 1 {
         return 0;
     }
     if app.servers_collapsed {
         return 1;
     }
-    let rows = (peers as u16)
-        .saturating_add(1)
-        .min(SERVERS_SECTION_MAX_ROWS);
+    let rows = slots.min(SERVERS_SECTION_MAX_ROWS);
     1 + rows * SERVER_ROW_LINES
 }
 
@@ -1147,9 +1172,10 @@ fn server_slot_rect(servers_area: Rect, slot: u16) -> Option<Rect> {
 }
 
 /// Compute hit areas for the `servers` section: the header rect (toggles
-/// collapse) and one two-line rect per visible peer row (switches to that
-/// peer). The local server occupies slot 0 but deliberately gets NO card —
-/// clicking yourself must never request a server switch.
+/// collapse) and one two-line rect per visible switchable row (home,
+/// snapshot, config peer — see [`server_band_slots`] for the order). The
+/// local server's slot deliberately gets NO card — clicking yourself must
+/// never request a server switch.
 pub(crate) fn compute_server_section_areas(
     app: &AppState,
     area: Rect,
@@ -1164,12 +1190,15 @@ pub(crate) fn compute_server_section_areas(
     let header_rect = Rect::new(servers_area.x, servers_area.y, servers_area.width, 1);
     let mut cards = Vec::new();
     if !app.servers_collapsed {
-        for (peer_idx, _) in app.peer_summaries.iter().enumerate() {
-            // Slot 0 is the self row; peers start at slot 1.
-            let Some(rect) = server_slot_rect(servers_area, peer_idx as u16 + 1) else {
+        for (slot, target) in server_band_slots(app).into_iter().enumerate() {
+            // The self row (None) gets no card.
+            let Some(target) = target else {
+                continue;
+            };
+            let Some(rect) = server_slot_rect(servers_area, slot as u16) else {
                 break;
             };
-            cards.push(crate::app::state::ServerCardArea { peer_idx, rect });
+            cards.push(crate::app::state::ServerCardArea { target, rect });
         }
     }
     (header_rect, cards)
@@ -1201,19 +1230,50 @@ fn render_servers_section(app: &AppState, frame: &mut Frame, area: Rect, is_navi
         return;
     }
 
-    // The local server anchors the band: slot 0, no hit-area.
-    if let Some(rect) = server_slot_rect(area, 0) {
-        render_server_rows(frame, rect, self_server_rows(app));
-    }
-    let body_bottom = area.y + area.height;
-    for card in &app.view.server_card_areas {
-        if card.rect.y + card.rect.height > body_bottom {
+    for (slot, target) in server_band_slots(app).into_iter().enumerate() {
+        let Some(rect) = server_slot_rect(area, slot as u16) else {
             break;
-        }
-        let Some(peer) = app.peer_summaries.get(card.peer_idx) else {
-            continue;
         };
-        render_server_rows(frame, card.rect, peer_server_rows(peer, p));
+        // The currently-attached machine reads like the active workspace row —
+        // the standard highlight fill, one visual language for "current"
+        // across workspaces, agents, and servers.
+        let is_current = target.is_none();
+        let rows = match target {
+            // The local server: no hit-area, anchors the band.
+            None => self_server_rows(app),
+            Some(crate::app::state::PeerSwitchRequest::Home) => {
+                let Some(snapshot) = app.fleet_snapshot.as_ref() else {
+                    continue;
+                };
+                home_server_rows(snapshot, p)
+            }
+            Some(crate::app::state::PeerSwitchRequest::SnapshotPeer { entry_idx }) => {
+                let Some(peer) = app
+                    .fleet_snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.peers.get(entry_idx))
+                else {
+                    continue;
+                };
+                snapshot_server_rows(peer, p)
+            }
+            Some(crate::app::state::PeerSwitchRequest::ConfigPeer { peer_idx, .. }) => {
+                let Some(peer) = app.peer_summaries.get(peer_idx) else {
+                    continue;
+                };
+                peer_server_rows(peer, p)
+            }
+        };
+        if is_current {
+            let buf = frame.buffer_mut();
+            let fill = Style::default().bg(p.surface_dim);
+            for y in rect.y..rect.y.saturating_add(2).min(area.y + area.height) {
+                for x in rect.x..rect.x.saturating_add(rect.width) {
+                    buf[(x, y)].set_style(fill);
+                }
+            }
+        }
+        render_server_rows(frame, rect, rows);
     }
 }
 
@@ -1272,6 +1332,55 @@ fn self_server_rows(app: &AppState) -> [Line<'static>; 2] {
     [title, Line::from(health)]
 }
 
+/// The pinned origin row of a carried fleet snapshot: `← mba22 home` over a
+/// dim snapshot-age line. Selecting it re-attaches the client locally.
+fn home_server_rows(
+    snapshot: &crate::peers::FleetSnapshotState,
+    p: &crate::app::state::Palette,
+) -> [Line<'static>; 2] {
+    let title = Line::from(vec![
+        Span::styled(" ", Style::default()),
+        Span::styled("←", Style::default().fg(p.accent)),
+        Span::styled(" ", Style::default()),
+        Span::styled(
+            snapshot.origin.clone(),
+            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" home", Style::default().fg(p.accent)),
+    ]);
+    let health = Line::from(vec![
+        Span::styled(SERVER_HEALTH_INDENT, Style::default()),
+        Span::styled(
+            format!(
+                "snapshot {} old",
+                format_age(snapshot.received_at.elapsed().as_secs())
+            ),
+            Style::default().fg(p.overlay0),
+        ),
+    ]);
+    [title, health]
+}
+
+/// A carried fleet-snapshot row: the regular peer row plus an explicit
+/// staleness-age chip. These rows are render-only — the server never polls
+/// them, so their age only grows until the next leap refreshes the snapshot.
+fn snapshot_server_rows(
+    peer: &crate::peers::PeerSummaryState,
+    p: &crate::app::state::Palette,
+) -> [Line<'static>; 2] {
+    let [mut title, health] = peer_server_rows(peer, p);
+    // The down form already renders `unreachable {age}` on the health line.
+    if peer.reachability() != crate::peers::PeerReachability::Down {
+        if let Some(at) = peer.last_ok {
+            title.spans.push(Span::styled(
+                format!("  {} old", format_age(at.elapsed().as_secs())),
+                Style::default().fg(p.overlay0),
+            ));
+        }
+    }
+    [title, health]
+}
+
 /// One peer's two `servers` lines:
 /// `● anvil  34ms` over `   cpu 71% · mem 48G/64G ❶`, or the compact
 /// `unreachable {age}` form when the peer is down.
@@ -1313,7 +1422,7 @@ fn peer_server_rows(
             p.overlay0
         };
         title.push(Span::styled(
-            format!("  {ms}ms"),
+            format!("  \u{f04c5} {ms}ms"), // nf-md-speedometer
             Style::default().fg(color),
         ));
     }
@@ -1357,7 +1466,7 @@ fn server_health_spans(
     if let Some(cpu) = cpu_percent {
         push_metric(
             &mut spans,
-            "cpu",
+            "\u{f0ee0}", // nf-md-cpu_64_bit
             format!("{cpu:.0}%"),
             utilization_style(cpu, p),
             p,
@@ -1366,7 +1475,7 @@ fn server_health_spans(
     if let (Some(used), Some(total)) = (mem_used, mem_total) {
         push_metric(
             &mut spans,
-            "mem",
+            "\u{f035b}", // nf-md-memory
             format!(
                 "{}/{}",
                 crate::system_stats::human_bytes(used),
@@ -1379,7 +1488,7 @@ fn server_health_spans(
     if let Some(free) = disk_free {
         push_metric(
             &mut spans,
-            "disk",
+            "\u{f02ca}", // nf-md-harddisk
             crate::system_stats::human_bytes(free),
             Style::default().fg(p.text),
             p,
@@ -1968,14 +2077,26 @@ mod tests {
         // Slot 0 (the two lines under the header) belongs to the local
         // server and has NO hit-area, so clicking it can never request a
         // SwitchServer; the first peer card starts below it.
-        assert_eq!(cards[0].peer_idx, 0);
+        assert_eq!(
+            cards[0].target,
+            crate::app::state::PeerSwitchRequest::ConfigPeer {
+                peer_idx: 0,
+                ws_idx: 0,
+            }
+        );
         assert_eq!(cards[0].rect.y, header.y + 1 + SERVER_ROW_LINES);
         assert!(cards
             .iter()
             .all(|card| card.rect.y > header.y + SERVER_ROW_LINES));
         // Each peer row spans two lines and stacks below the previous one.
         assert_eq!(cards[0].rect.height, SERVER_ROW_LINES);
-        assert_eq!(cards[1].peer_idx, 1);
+        assert_eq!(
+            cards[1].target,
+            crate::app::state::PeerSwitchRequest::ConfigPeer {
+                peer_idx: 1,
+                ws_idx: 0,
+            }
+        );
         assert_eq!(cards[1].rect.y, cards[0].rect.y + SERVER_ROW_LINES);
         assert_eq!(cards[1].rect.height, SERVER_ROW_LINES);
 
@@ -1983,6 +2104,101 @@ mod tests {
         let (header, cards) = compute_server_section_areas(&app, area);
         assert_ne!(header, Rect::default());
         assert!(cards.is_empty());
+    }
+
+    fn carried_snapshot(origin: &str, peers: Vec<&str>) -> crate::peers::FleetSnapshotState {
+        crate::peers::FleetSnapshotState {
+            origin: origin.to_string(),
+            peers: peers
+                .into_iter()
+                .map(|name| peer_with_workspaces(name, vec![]))
+                .collect(),
+            received_at: std::time::Instant::now(),
+        }
+    }
+
+    #[test]
+    fn server_band_orders_home_then_self_then_snapshot_then_config_peers() {
+        use crate::app::state::PeerSwitchRequest;
+        let mut app = crate::app::state::AppState::test_new();
+        app.fleet_snapshot = Some(carried_snapshot("mba22", vec!["anvil", "ksb"]));
+        app.peer_summaries = vec![peer_with_workspaces("ownpeer", vec![])];
+
+        assert_eq!(
+            server_band_slots(&app),
+            vec![
+                Some(PeerSwitchRequest::Home),
+                None, // self — no switch hit-area
+                Some(PeerSwitchRequest::SnapshotPeer { entry_idx: 0 }),
+                Some(PeerSwitchRequest::SnapshotPeer { entry_idx: 1 }),
+                Some(PeerSwitchRequest::ConfigPeer {
+                    peer_idx: 0,
+                    ws_idx: 0,
+                }),
+            ]
+        );
+
+        // Header + five two-line rows.
+        assert_eq!(servers_section_height(&app), 1 + 5 * SERVER_ROW_LINES);
+
+        // The hit-areas skip the self slot: home sits directly under the
+        // header, the first snapshot row two lines below the self row.
+        let (header, cards) = compute_server_section_areas(&app, Rect::new(0, 0, 30, 80));
+        assert_eq!(cards.len(), 4);
+        assert_eq!(cards[0].target, PeerSwitchRequest::Home);
+        assert_eq!(cards[0].rect.y, header.y + 1);
+        assert_eq!(
+            cards[1].target,
+            PeerSwitchRequest::SnapshotPeer { entry_idx: 0 }
+        );
+        assert_eq!(cards[1].rect.y, header.y + 1 + 2 * SERVER_ROW_LINES);
+    }
+
+    #[test]
+    fn no_home_row_without_carried_origin() {
+        let mut app = crate::app::state::AppState::test_new();
+        // Locally-attached client: no snapshot, no peers — band hidden.
+        assert!(server_band_slots(&app).iter().all(Option::is_none));
+        assert_eq!(servers_section_height(&app), 0);
+
+        // Config peers alone keep the pre-federation order: self first.
+        app.peer_summaries = vec![peer_with_workspaces("anvil", vec![])];
+        let slots = server_band_slots(&app);
+        assert_eq!(slots[0], None);
+        assert!(!slots.contains(&Some(crate::app::state::PeerSwitchRequest::Home)));
+    }
+
+    #[test]
+    fn snapshot_only_spoke_shows_band_with_home_row() {
+        let mut app = crate::app::state::AppState::test_new();
+        // The typical spoke: zero config peers, but a carried snapshot.
+        app.fleet_snapshot = Some(carried_snapshot("mba22", vec!["anvil"]));
+        // Header + home + self + one snapshot row.
+        assert_eq!(servers_section_height(&app), 1 + 3 * SERVER_ROW_LINES);
+    }
+
+    #[test]
+    fn home_server_rows_mark_origin_and_snapshot_age() {
+        let app = crate::app::state::AppState::test_new();
+        let snapshot = carried_snapshot("mba22", vec![]);
+        let [title, health] = home_server_rows(&snapshot, &app.palette);
+        let title = line_text(&title);
+        let health = line_text(&health);
+        assert!(title.contains('←'), "{title}");
+        assert!(title.contains("mba22"), "{title}");
+        assert!(title.contains("home"), "{title}");
+        assert!(health.contains("snapshot"), "{health}");
+        assert!(health.contains("old"), "{health}");
+    }
+
+    #[test]
+    fn snapshot_server_rows_show_staleness_age() {
+        let app = crate::app::state::AppState::test_new();
+        let mut peer = peer_with_workspaces("anvil", vec![]);
+        peer.last_ok = Some(std::time::Instant::now() - std::time::Duration::from_secs(30));
+        let [title, _] = snapshot_server_rows(&peer, &app.palette);
+        let title = line_text(&title);
+        assert!(title.contains("30s old"), "{title}");
     }
 
     #[test]
@@ -2000,9 +2216,9 @@ mod tests {
         let health = line_text(&health);
         assert!(title.contains(&crate::app::short_host_name()), "{title}");
         assert!(title.contains('\u{2726}'), "{title}"); // ✦ current marker
-        assert!(health.contains("cpu 42%"), "{health}");
-        assert!(health.contains("mem 13G/16G"), "{health}");
-        assert!(health.contains("disk 213G"), "{health}");
+        assert!(health.contains("\u{f0ee0} 42%"), "{health}");
+        assert!(health.contains("\u{f035b} 13G/16G"), "{health}");
+        assert!(health.contains("\u{f02ca} 213G"), "{health}");
     }
 
     #[test]
@@ -2032,8 +2248,8 @@ mod tests {
         assert!(title.contains("34ms"), "{title}");
         // The second line speaks the status line's glyph language and rolls
         // the one working agent up as a circled count.
-        assert!(health.contains("cpu 71%"), "{health}");
-        assert!(health.contains("mem 48G/64G"), "{health}");
+        assert!(health.contains("\u{f0ee0} 71%"), "{health}");
+        assert!(health.contains("\u{f035b} 48G/64G"), "{health}");
         assert!(health.contains('\u{2776}'), "{health}"); // ❶ working
         assert!(!health.contains("anvil"), "{health}");
     }
