@@ -869,23 +869,22 @@ impl AppState {
         self.project_section_keys().into_iter().nth(ws_idx)?
     }
 
-    /// Keys of every project section rendered as a collapsible sidebar
-    /// group: at least two member workspaces, one of them the non-linked
-    /// main checkout. Canonical source for collapse-all and auto-collapse.
+    /// Keys of every project section rendered as a collapsible sidebar group:
+    /// at least two member workspaces. It does NOT require the main checkout to
+    /// be present (#62): closing main must not disband the space — the surviving
+    /// members keep it grouped on their shared project-section key. Grouping is
+    /// the base's project-section notion (origin-key folds plain same-repo
+    /// checkouts + federated rows in), not the narrower worktree-membership key.
     pub(crate) fn collapsible_space_keys(&self) -> std::collections::HashSet<String> {
         let keys = self.project_section_keys();
-        let mut members = std::collections::HashMap::<&str, (usize, bool)>::new();
-        for (ws, key) in self.workspaces.iter().zip(keys.iter()) {
-            if let Some(key) = key.as_deref() {
-                let entry = members.entry(key).or_insert((0, false));
-                entry.0 += 1;
-                entry.1 |= !ws.is_linked_checkout();
-            }
+        let mut counts = std::collections::HashMap::<String, usize>::new();
+        for key in keys.into_iter().flatten() {
+            *counts.entry(key).or_insert(0) += 1;
         }
-        members
+        counts
             .into_iter()
-            .filter(|(_, (count, has_parent))| *count >= 2 && *has_parent)
-            .map(|(key, _)| key.to_string())
+            .filter(|(_, count)| *count >= 2)
+            .map(|(key, _)| key)
             .collect()
     }
 
@@ -1245,6 +1244,68 @@ impl AppState {
 
     pub(crate) fn workspace_at_visible_position(&self, position: usize) -> Option<usize> {
         self.visible_workspace_order().get(position).copied()
+    }
+
+    /// The unindented section heads of the spaces list, in render order (#62):
+    /// one per project group (its primary/anchor row) plus each ungrouped
+    /// standalone workspace. This is the index space `switch_space` jumps over.
+    pub(crate) fn space_section_heads(&self) -> Vec<usize> {
+        crate::ui::workspace_list_entries(self)
+            .into_iter()
+            .filter_map(|entry| match entry {
+                crate::ui::WorkspaceListEntry::Workspace {
+                    ws_idx,
+                    indented: false,
+                } => Some(ws_idx),
+                // Skip indented members and remote rows — keyboard
+                // space-switching cycles local project sections only
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Resolve `switch_space(position)` to the workspace to focus: the Nth
+    /// project section's active member when one is live, else the section's
+    /// primary head (the local main checkout when present — already what
+    /// `workspace_list_entries` emits as the unindented head — else its
+    /// most-recent / first member). Returns `None` when there is no Nth
+    /// section.
+    pub(crate) fn space_switch_target(&self, position: usize) -> Option<usize> {
+        let heads = self.space_section_heads();
+        let head_idx = heads.get(position).copied()?;
+
+        // The project key this section groups on (None for an ungrouped
+        // standalone, which is its own single-member section).
+        let Some(section_key) = self
+            .workspaces
+            .get(head_idx)
+            .and_then(|ws| ws.worktree_space())
+            .map(|space| space.key.clone())
+        else {
+            return Some(head_idx);
+        };
+
+        // Members of this section, in workspace order.
+        let members: Vec<usize> = self
+            .workspaces
+            .iter()
+            .enumerate()
+            .filter(|(_, ws)| {
+                ws.worktree_space()
+                    .is_some_and(|space| space.key == section_key)
+            })
+            .map(|(idx, _)| idx)
+            .collect();
+
+        // Preserve muscle memory: if the active workspace already belongs to
+        // this section, keep it focused (re-pressing the section index is a
+        // no-op rather than yanking focus to main).
+        if let Some(active) = self.active.filter(|idx| members.contains(idx)) {
+            return Some(active);
+        }
+        // Otherwise the section head — main when present, else its first
+        // member — exactly the row the sidebar draws as the section.
+        Some(head_idx)
     }
 
     pub(crate) fn move_selected_workspace_by_visible_delta(&mut self, delta: isize) {
@@ -1694,17 +1755,29 @@ impl AppState {
     }
 
     pub fn close_selected_workspace(&mut self) {
+        // Close ONLY the selected workspace (#62): closing the main checkout no
+        // longer tears down the whole space — the remaining worktree members and
+        // remote rows keep the space alive on their own membership keys. The
+        // close-whole-space affordance lives on the space row's context menu
+        // (`close_selected_space`).
         if self.workspaces.is_empty() {
             return;
         }
-        self.selection = None;
-        self.selection_autoscroll = None;
-        self.mark_session_dirty();
-        let close_indices = self
+        self.close_workspace_indices(vec![self.selected]);
+    }
+
+    /// Close every member of the selected workspace's space (#62) — the
+    /// explicit close-whole-space affordance from the space row's context menu.
+    /// Falls back to closing just the selected workspace when it has no space
+    /// membership.
+    pub fn close_selected_space(&mut self) {
+        if self.workspaces.is_empty() {
+            return;
+        }
+        let indices = self
             .workspaces
             .get(self.selected)
             .and_then(|ws| ws.worktree_space())
-            .filter(|space| !space.is_linked_worktree)
             .map(|space| {
                 self.workspaces
                     .iter()
@@ -1716,8 +1789,21 @@ impl AppState {
                     })
                     .collect::<Vec<_>>()
             })
-            .filter(|indices| indices.len() >= 2)
+            .filter(|indices| !indices.is_empty())
             .unwrap_or_else(|| vec![self.selected]);
+        self.close_workspace_indices(indices);
+    }
+
+    /// Remove the given workspace indices, dropping their unattached terminals
+    /// and re-anchoring selection/active/scroll. Shared by single-workspace and
+    /// whole-space closes (#62).
+    fn close_workspace_indices(&mut self, close_indices: Vec<usize>) {
+        if close_indices.is_empty() {
+            return;
+        }
+        self.selection = None;
+        self.selection_autoscroll = None;
+        self.mark_session_dirty();
 
         let mut terminal_ids = Vec::new();
         for idx in &close_indices {
@@ -1726,6 +1812,9 @@ impl AppState {
                 crate::logging::workspace_closed(&workspace_id);
             }
         }
+        let mut close_indices = close_indices;
+        close_indices.sort_unstable();
+        close_indices.dedup();
         for idx in close_indices.iter().rev() {
             self.workspaces.remove(*idx);
         }
@@ -4250,7 +4339,9 @@ mod tests {
     }
 
     #[test]
-    fn close_parent_worktree_workspace_closes_group() {
+    fn close_main_checkout_keeps_the_space_alive() {
+        // #62: closing the main checkout closes ONLY main — the worktree member
+        // survives and keeps the space; the unrelated "notes" workspace stays.
         let mut state = app_with_workspaces(&["main", "issue", "notes"]);
         state.workspaces[0].worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
             key: "repo-key".into(),
@@ -4271,10 +4362,63 @@ mod tests {
 
         state.close_selected_workspace();
 
+        assert_eq!(state.workspaces.len(), 2);
+        assert_eq!(state.workspaces[0].display_name(), "issue");
+        assert_eq!(state.workspaces[1].display_name(), "notes");
+        // The surviving worktree still anchors a (now single-member) space.
+        assert!(state.workspaces[0].worktree_space().is_some());
+    }
+
+    #[test]
+    fn close_selected_space_closes_every_member() {
+        // #62: the explicit whole-space affordance closes all members of the
+        // selected workspace's space, leaving unrelated workspaces intact.
+        let mut state = app_with_workspaces(&["main", "issue", "notes"]);
+        state.workspaces[0].worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: "repo-key".into(),
+            label: "herdr".into(),
+            repo_root: "/repo/herdr".into(),
+            checkout_path: "/repo/herdr".into(),
+            is_linked_worktree: false,
+        });
+        state.workspaces[1].worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: "repo-key".into(),
+            label: "herdr".into(),
+            repo_root: "/repo/herdr".into(),
+            checkout_path: "/repo/herdr-issue".into(),
+            is_linked_worktree: true,
+        });
+        state.selected = 0;
+        state.active = Some(0);
+
+        state.close_selected_space();
+
         assert_eq!(state.workspaces.len(), 1);
         assert_eq!(state.workspaces[0].display_name(), "notes");
-        assert_eq!(state.active, Some(0));
-        assert_eq!(state.selected, 0);
+    }
+
+    #[test]
+    fn close_selected_space_from_a_worktree_member_after_main_closed() {
+        // Main already gone: the space lives on its worktree members. Closing
+        // the space from a surviving worktree still closes all members.
+        let mut state = app_with_workspaces(&["issue", "fix", "notes"]);
+        for idx in [0usize, 1] {
+            state.workspaces[idx].worktree_space =
+                Some(crate::workspace::WorktreeSpaceMembership {
+                    key: "repo-key".into(),
+                    label: "herdr".into(),
+                    repo_root: "/repo/herdr".into(),
+                    checkout_path: format!("/repo/herdr-{idx}").into(),
+                    is_linked_worktree: true,
+                });
+        }
+        state.selected = 0;
+        state.active = Some(0);
+
+        state.close_selected_space();
+
+        assert_eq!(state.workspaces.len(), 1);
+        assert_eq!(state.workspaces[0].display_name(), "notes");
     }
 
     #[test]
@@ -5182,7 +5326,9 @@ mod tests {
     }
 
     #[test]
-    fn close_pane_last_pane_in_parent_worktree_group_closes_when_confirmation_disabled() {
+    fn close_pane_last_pane_in_main_checkout_closes_only_that_workspace() {
+        // #62: closing the last pane of the main checkout closes only main —
+        // the worktree child survives (keeping the space) and "notes" stays.
         let mut state = app_with_workspaces(&["parent", "child", "notes"]);
         mark_parent_worktree(&mut state, 0);
         mark_linked_worktree(&mut state, 1);
@@ -5193,8 +5339,9 @@ mod tests {
         let deferred = state.close_pane();
 
         assert!(!deferred);
-        assert_eq!(state.workspaces.len(), 1);
-        assert_eq!(state.workspaces[0].display_name(), "notes");
+        assert_eq!(state.workspaces.len(), 2);
+        assert_eq!(state.workspaces[0].display_name(), "child");
+        assert_eq!(state.workspaces[1].display_name(), "notes");
     }
 
     #[test]
@@ -5231,7 +5378,7 @@ mod tests {
     }
 
     #[test]
-    fn collapsible_space_keys_needs_two_members_and_a_parent() {
+    fn collapsible_space_keys_needs_two_members() {
         let mut state = app_with_workspaces(&["parent", "child"]);
         mark_parent_worktree(&mut state, 0);
         mark_linked_worktree(&mut state, 1);
@@ -5242,13 +5389,16 @@ mod tests {
     }
 
     #[test]
-    fn collapsible_space_keys_excludes_groups_without_a_parent() {
-        // Two linked worktrees sharing a key but no non-linked parent present.
+    fn collapsible_space_keys_group_survives_without_a_parent() {
+        // #62: two linked worktrees sharing a key but no non-linked parent
+        // (main closed) STILL group — the space lives on members alone.
         let mut state = app_with_workspaces(&["child-a", "child-b"]);
         mark_linked_worktree(&mut state, 0);
         mark_linked_worktree(&mut state, 1);
 
-        assert!(state.collapsible_space_keys().is_empty());
+        let keys = state.collapsible_space_keys();
+        assert_eq!(keys.len(), 1);
+        assert!(keys.contains("repo-key"));
     }
 
     #[test]

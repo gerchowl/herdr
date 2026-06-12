@@ -534,10 +534,11 @@ impl AppState {
         rect_contains(header, col, row)
     }
 
-    pub(super) fn agent_detail_target_at(
-        &self,
-        row: u16,
-    ) -> Option<(usize, usize, crate::layout::PaneId)> {
+    /// Resolve the agents-panel row at `row` to its activation target. Local
+    /// rows focus a pane in the workspace; remote rows (#62) request the same
+    /// server switch their workspace row would. Entries are single-row (#62),
+    /// so each occupies one row plus the inter-row gap.
+    pub(super) fn agent_detail_target_at(&self, row: u16) -> Option<AgentDetailTarget> {
         if self.sidebar_collapsed {
             return None;
         }
@@ -548,7 +549,7 @@ impl AppState {
             detail_area,
             crate::ui::should_show_scrollbar(metrics),
         );
-        if body.height < 2 || row < body.y || row >= body.y + body.height {
+        if body.height < 1 || row < body.y || row >= body.y + body.height {
             return None;
         }
 
@@ -557,19 +558,36 @@ impl AppState {
             .into_iter()
             .skip(self.agent_panel_scroll)
         {
-            if row_y.saturating_add(1) >= body.y + body.height {
+            if row_y >= body.y + body.height {
                 break;
             }
-            if row == row_y || row == row_y + 1 {
-                return Some((detail.ws_idx, detail.tab_idx, detail.pane_id));
+            if row == row_y {
+                return Some(match detail.remote {
+                    Some((peer, ws_idx)) => AgentDetailTarget::Remote(peer.switch_request(ws_idx)),
+                    None => AgentDetailTarget::Local {
+                        ws_idx: detail.ws_idx,
+                        pane_id: detail.pane_id,
+                    },
+                });
             }
-            row_y = row_y.saturating_add(2);
+            row_y = row_y.saturating_add(1);
             if row_y < body.y + body.height {
                 row_y = row_y.saturating_add(self.sidebar_row_gap);
             }
         }
         None
     }
+}
+
+/// What clicking an agents-panel row does: focus a local pane, or request a
+/// switch to a remote peer's workspace (#62).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AgentDetailTarget {
+    Local {
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+    },
+    Remote(crate::app::state::PeerSwitchRequest),
 }
 
 #[cfg(test)]
@@ -580,6 +598,7 @@ mod tests {
     use ratatui::layout::Rect;
 
     use super::super::{app_for_mouse_test, capture_snapshot, mouse, unique_temp_path};
+    use super::AgentDetailTarget;
     use crate::{
         app::state::{AgentPanelScope, DragTarget, Mode, PanelScope},
         detect::Agent,
@@ -804,7 +823,20 @@ mod tests {
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
 
-        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 2, 16));
+        // Single-row entries (#62): the second agent row sits one row + the
+        // inter-row gap below the first. Click it directly.
+        let detail_area = app.state.agent_panel_rect();
+        let metrics = crate::ui::agent_panel_scroll_metrics(&app.state, detail_area);
+        let body = crate::ui::agent_panel_body_rect(
+            detail_area,
+            crate::ui::should_show_scrollbar(metrics),
+        );
+        let second_row = body.y + 1 + app.state.sidebar_row_gap;
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            2,
+            second_row,
+        ));
 
         assert_eq!(app.state.workspaces[0].active_tab, 1);
         assert_eq!(
@@ -849,20 +881,23 @@ mod tests {
             crate::ui::should_show_scrollbar(metrics),
         );
 
-        // Default gap 1: entries are 2 rows + 1 blank, so the second entry
-        // starts at body.y + 3 and body.y + 2 is the blank row.
-        assert_eq!(
-            app.state.agent_detail_target_at(body.y + 3),
-            Some((0, second_tab, second_pane))
-        );
-        assert_eq!(app.state.agent_detail_target_at(body.y + 2), None);
+        let second = AgentDetailTarget::Local {
+            ws_idx: 0,
+            pane_id: second_pane,
+        };
+        let _ = second_tab;
 
-        // Gap 0: rows pack, second entry starts at body.y + 2.
-        app.state.sidebar_row_gap = 0;
+        // Default gap 1: single-row entries (#62) are 1 row + 1 blank, so the
+        // second entry starts at body.y + 2 and body.y + 1 is the blank row.
         assert_eq!(
             app.state.agent_detail_target_at(body.y + 2),
-            Some((0, second_tab, second_pane))
+            Some(second.clone())
         );
+        assert_eq!(app.state.agent_detail_target_at(body.y + 1), None);
+
+        // Gap 0: rows pack, second entry starts at body.y + 1.
+        app.state.sidebar_row_gap = 0;
+        assert_eq!(app.state.agent_detail_target_at(body.y + 1), Some(second));
     }
 
     #[test]
@@ -1061,15 +1096,19 @@ mod tests {
         app.state.mode = Mode::Terminal;
         app.state.agent_panel_scope = AgentPanelScope::AllWorkspaces;
 
-        let (_, detail_area) = crate::ui::expanded_sidebar_sections(
-            app.state.view.sidebar_rect,
-            app.state.sidebar_section_split,
-            app.state.sidebar_pane_gap,
+        let detail_area = app.state.agent_panel_rect();
+        // Single-row entries (#62): the second agent row is one row + gap below
+        // the first. Click it directly rather than at a fixed two-line offset.
+        let metrics = crate::ui::agent_panel_scroll_metrics(&app.state, detail_area);
+        let body = crate::ui::agent_panel_body_rect(
+            detail_area,
+            crate::ui::should_show_scrollbar(metrics),
         );
+        let second_row = body.y + 1 + app.state.sidebar_row_gap;
         app.handle_mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
-            detail_area.x + 2,
-            detail_area.y + 6,
+            body.x + 2,
+            second_row,
         ));
 
         assert_eq!(app.state.active, Some(1));
@@ -1626,7 +1665,7 @@ mod tests {
     }
 
     #[test]
-    fn top_drop_slot_is_distinct_from_gap_below_first_workspace() {
+    fn workspace_drop_slot_maps_card_rows_to_insert_indices() {
         let mut app = app_for_mouse_test();
         let first_repo = temp_git_repo("main");
         let second_repo = temp_git_repo("main");
@@ -1657,10 +1696,21 @@ mod tests {
             .cwd = second_repo.clone();
         crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
 
-        assert_eq!(app.state.workspace_drop_index_at_row(0), Some(0));
-        assert_eq!(app.state.workspace_drop_index_at_row(1), Some(0));
-        assert_eq!(app.state.workspace_drop_index_at_row(2), Some(0));
-        assert_eq!(app.state.workspace_drop_index_at_row(3), Some(1));
+        // Single-line rows (#62). The drop indicator for inserting before a
+        // card sits on the row just above it, so the row above card 0 resolves
+        // to drop-index 0, and the row just below card 1 (its trailing slot)
+        // resolves to the append index (2).
+        let card0 = app.state.view.workspace_card_areas[0].rect;
+        let card1 = app.state.view.workspace_card_areas[1].rect;
+        assert_eq!(card0.height, 1);
+        if let Some(above) = card0.y.checked_sub(1) {
+            assert_eq!(app.state.workspace_drop_index_at_row(above), Some(0));
+        }
+        assert_eq!(
+            app.state
+                .workspace_drop_index_at_row(card1.y + card1.height),
+            Some(2)
+        );
 
         let _ = fs::remove_dir_all(first_repo);
         let _ = fs::remove_dir_all(second_repo);

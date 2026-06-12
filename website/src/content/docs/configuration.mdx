@@ -98,7 +98,9 @@ Herdr creates checkouts under `<directory>/<repo>/<branch-slug>`. For sibling-st
 
 Worktree actions are available from Git workspace rows. `New worktree` creates a branch and checkout, opens it as a new Herdr workspace, and groups it under the source workspace. `Open worktree...` lists existing Git worktree checkouts for that repo; choosing an already-open checkout focuses it, and choosing a closed checkout opens it in the same group.
 
-Grouped worktrees still behave like normal Herdr workspaces: they can be focused, renamed, closed, and contain their own tabs and panes. The parent row is the original workspace. Closing the parent row closes the whole Herdr group, but it does not delete checkout folders or branches.
+Grouped worktrees still behave like normal Herdr workspaces: they can be focused, renamed, closed, and contain their own tabs and panes. The section header row is the project's main checkout when it's open, otherwise the first remaining member.
+
+Closing a workspace closes **only that workspace**. Closing the main checkout no longer tears down the project group — its worktree members (and any remote rows) stay grouped and functional; the group simply re-anchors on a surviving member. To close the whole group at once, use `Close group` in the section row's right-click context menu. Neither close deletes checkout folders or branches. A session whose main checkout was closed restores from its remaining members alone, with the group intact.
 
 External worktrees are adopted automatically: when a workspace sits in a linked checkout that Herdr didn't create (an agent ran `git worktree add`, you made one by hand, another tool did), it gains the managed worktree actions and groups under its parent repo workspace when that is open — membership is inferred from git, not from where the checkout lives. Set `adopt_external = false` under `[worktrees]` to keep the old explicit-adoption-only behavior.
 
@@ -212,8 +214,13 @@ Indexed keybindings use `1..9` in normal keybinding fields:
 [keys]
 switch_tab = "prefix+1..9"
 switch_workspace = "prefix+shift+1..9"
+switch_space = "ctrl+1..9"
 focus_agent = "prefix+alt+1..9"
 ```
+
+`switch_tab` jumps to the Nth tab of the active workspace, `switch_workspace` to the Nth row of the spaces list, and `focus_agent` to the Nth agent in the agents panel.
+
+`switch_space` jumps to the Nth **project section** of the spaces list — a project's main checkout grouped with its worktree workspaces counts as one section, regardless of how many rows it spans. Selecting a section focuses the member you last had active there; otherwise it lands on the section's primary row (the local main checkout when present, else its first member). It is unset by default. When bound, each section row shows its 1-based index for discoverability. This pairs naturally with `switch_workspace`/`switch_tab` as a three-level quick-jump: space, then row, then tab.
 
 The legacy `[keys.indexed]` table is still parsed for compatibility, but new configs should prefer the explicit action fields.
 

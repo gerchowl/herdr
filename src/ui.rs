@@ -7,6 +7,7 @@ use ratatui::{
 
 mod dialogs;
 mod float;
+mod grammar;
 mod keybind_help;
 mod medallion;
 mod menus;
@@ -814,15 +815,18 @@ mod tests {
         terminal.draw(|frame| render(&app, frame)).unwrap();
         let buffer = terminal.backend().buffer();
 
+        // Single-line member row (#62): ` <icon> <server>:<target>`, no row
+        // number (switch_space is unbound by default). The custom name "one"
+        // is the target half of the uniform <server>:<target> grammar.
         let card = app.view.workspace_card_areas[0].rect;
+        assert_eq!(card.height, 1);
         let line1 = buffer_row_text(buffer, card, card.y);
-        let line2 = buffer_row_text(buffer, card, card.y + 1);
 
-        assert!(line1.starts_with(" · one"));
-        assert!(!line1.contains("1 one"));
-        // The branch line leads with the pane-header's git glyph so it
-        // reads as the row's git metadata, not a sibling workspace.
-        assert_eq!(line2, "   \u{e0a0} main");
+        // State icon leads the name, before the <server>:one label.
+        assert!(line1.trim_start().contains(":one"), "{line1}");
+        assert!(line1.contains("one"), "{line1}");
+        // No leading row number on the member row.
+        assert!(!line1.contains("1 "), "{line1}");
 
         std::fs::remove_dir_all(repo).ok();
     }

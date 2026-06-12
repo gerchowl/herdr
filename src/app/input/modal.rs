@@ -596,11 +596,23 @@ pub(crate) fn handle_resize_key(state: &mut AppState, raw_key: TerminalKey) {
 }
 
 pub(super) fn open_confirm_close(state: &mut AppState) {
+    state.confirm_close_whole_space = false;
+    state.mode = Mode::ConfirmClose;
+}
+
+/// Confirm-close for the whole-space affordance (#62): on accept, close every
+/// member of the selected workspace's space.
+pub(super) fn open_confirm_close_space(state: &mut AppState) {
+    state.confirm_close_whole_space = true;
     state.mode = Mode::ConfirmClose;
 }
 
 pub(super) fn confirm_close_accept(state: &mut AppState) {
-    state.close_selected_workspace();
+    if std::mem::take(&mut state.confirm_close_whole_space) {
+        state.close_selected_space();
+    } else {
+        state.close_selected_workspace();
+    }
     if state.workspaces.is_empty() {
         state.mode = Mode::Navigate;
     } else {
@@ -609,6 +621,7 @@ pub(super) fn confirm_close_accept(state: &mut AppState) {
 }
 
 pub(super) fn confirm_close_cancel(state: &mut AppState) {
+    state.confirm_close_whole_space = false;
     state.mode = Mode::Navigate;
 }
 
@@ -673,13 +686,25 @@ pub(super) fn apply_context_menu_action(
         }
         (
             ContextMenuKind::Workspace { ws_idx } | ContextMenuKind::GitWorkspace { ws_idx, .. },
-            Some("Close" | "Close group"),
+            Some("Close"),
         ) => {
             state.selected = ws_idx;
             if state.confirm_close {
                 open_confirm_close(state);
             } else {
                 state.close_selected_workspace();
+                state.mode = Mode::Navigate;
+            }
+        }
+        // "Close group" is the close-WHOLE-space affordance (#62): it lives on
+        // the space-row (group head) context menu and closes every member,
+        // unlike plain "Close" which now closes only the selected workspace.
+        (ContextMenuKind::GitWorkspace { ws_idx, .. }, Some("Close group")) => {
+            state.selected = ws_idx;
+            if state.confirm_close {
+                open_confirm_close_space(state);
+            } else {
+                state.close_selected_space();
                 state.mode = Mode::Navigate;
             }
         }

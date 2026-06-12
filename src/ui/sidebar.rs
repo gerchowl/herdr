@@ -9,10 +9,10 @@ use ratatui::{
 use super::medallion::{ring_medallion, MedallionStyle};
 use super::scrollbar::{render_scrollbar, should_show_scrollbar};
 use super::state_signal::{
-    join_states, leading_count_spans, medallion_rings, packed_rects, pr_state_glyph, tally_states,
-    StateClass, StateJoin, StateTally,
+    join_states, leading_count_spans, medallion_rings, packed_rects, tally_states, StateClass,
+    StateJoin, StateTally,
 };
-use super::status::{agent_icon, state_dot, state_label, state_label_color};
+use super::status::{agent_icon, remote_agent_icon, state_label_color};
 use crate::app::state::{AgentPanelScope, Palette, PanelScope};
 use crate::app::{AppState, Mode};
 use crate::detect::AgentState;
@@ -38,12 +38,16 @@ pub(crate) struct AgentPanelEntry {
     pub state_labels: std::collections::HashMap<String, String>,
     /// Session-promoted header fields (chips), non-expired, insertion order.
     pub header_fields: Vec<(String, String)>,
-    pub live_activity: Option<String>,
+    /// Single-row location grammar (#62), matching the spaces list:
+    /// `<server> <proj> <workspace|branch>`. `server` is the local host for
+    /// local panes, the peer host for remote ones.
+    pub server: String,
+    pub project: Option<String>,
+    pub target: String,
+    /// `Some((peer, ws_idx))` for a REMOTE agent row — selecting it requests
+    /// the same server switch the workspace row would. `None` for local panes.
+    pub remote: Option<(crate::app::state::RemotePeerRef, usize)>,
 }
-
-/// Agent-panel width budget for a promoted field value (header > agent
-/// panel > nav list).
-const AGENT_PANEL_HEADER_FIELD_VALUE_COLS: usize = 24;
 
 fn sidebar_section_heights(total_h: u16, split_ratio: f32) -> (u16, u16) {
     if total_h == 0 {
@@ -212,6 +216,7 @@ fn agent_panel_entries_with_runtimes(
         }
     };
 
+    let local_server = super::grammar::local_server_name();
     match app.agent_panel_scope {
         AgentPanelScope::CurrentWorkspace => {
             let Some(ws_idx) = agent_panel_current_workspace_idx(app) else {
@@ -220,6 +225,10 @@ fn agent_panel_entries_with_runtimes(
             let Some(ws) = app.workspaces.get(ws_idx) else {
                 return Vec::new();
             };
+            let project = ws.project_key().map(super::grammar::project_identity_label);
+            let target = super::grammar::local_member_target(app, ws, terminal_runtimes);
+            // Current scope is local-by-definition (it follows the focused
+            // local workspace); no remote rows fold in here.
             ws.pane_details(&app.terminals)
                 .into_iter()
                 .map(|detail| AgentPanelEntry {
@@ -228,42 +237,112 @@ fn agent_panel_entries_with_runtimes(
                     pane_id: detail.pane_id,
                     primary_label: detail.label,
                     primary_tab_label: None,
-                    agent_label: None,
+                    agent_label: Some(detail.agent_label),
                     state: detail.state,
                     seen: detail.seen,
                     custom_status: detail.custom_status,
                     state_labels: detail.state_labels,
                     header_fields: detail.header_fields,
-                    live_activity: detail.live_activity,
+                    server: local_server.clone(),
+                    project: project.clone(),
+                    target: target.clone(),
+                    remote: None,
                 })
                 .collect()
         }
-        AgentPanelScope::AllWorkspaces => app
-            .workspaces
-            .iter()
-            .enumerate()
-            .flat_map(|(ws_idx, ws)| {
-                let multi_tab = ws.tabs.len() > 1;
-                let workspace_label = ws.display_name_from(&app.terminals, terminal_runtimes);
-                ws.pane_details(&app.terminals)
-                    .into_iter()
-                    .map(move |detail| AgentPanelEntry {
-                        ws_idx,
-                        tab_idx: detail.tab_idx,
-                        pane_id: detail.pane_id,
-                        primary_label: workspace_label.clone(),
-                        primary_tab_label: multi_tab.then_some(detail.tab_label),
-                        agent_label: Some(detail.agent_label),
-                        state: detail.state,
-                        seen: detail.seen,
-                        custom_status: detail.custom_status,
-                        state_labels: detail.state_labels,
-                        header_fields: detail.header_fields,
-                        live_activity: detail.live_activity,
-                    })
-            })
-            .collect(),
+        AgentPanelScope::AllWorkspaces => {
+            let mut entries: Vec<AgentPanelEntry> = app
+                .workspaces
+                .iter()
+                .enumerate()
+                .flat_map(|(ws_idx, ws)| {
+                    let multi_tab = ws.tabs.len() > 1;
+                    let workspace_label = ws.display_name_from(&app.terminals, terminal_runtimes);
+                    let project = ws.project_key().map(super::grammar::project_identity_label);
+                    let target = super::grammar::local_member_target(app, ws, terminal_runtimes);
+                    let server = local_server.clone();
+                    ws.pane_details(&app.terminals)
+                        .into_iter()
+                        .map(move |detail| AgentPanelEntry {
+                            ws_idx,
+                            tab_idx: detail.tab_idx,
+                            pane_id: detail.pane_id,
+                            primary_label: workspace_label.clone(),
+                            primary_tab_label: multi_tab.then_some(detail.tab_label),
+                            agent_label: Some(detail.agent_label),
+                            state: detail.state,
+                            seen: detail.seen,
+                            custom_status: detail.custom_status,
+                            state_labels: detail.state_labels,
+                            header_fields: detail.header_fields,
+                            server: server.clone(),
+                            project: project.clone(),
+                            target: target.clone(),
+                            remote: None,
+                        })
+                })
+                .collect();
+            // REMOTE agents (#62): the all-scope panel folds in peer agents
+            // from the SAME summaries that feed the spaces list, scope-
+            // respecting via the server filter. Selecting one requests the
+            // server switch its workspace row would. The server filter is
+            // honored: `Local` hides remote rows, `Peer` keeps only that peer.
+            entries.extend(remote_agent_panel_entries(app));
+            entries
+        }
     }
+}
+
+/// Remote agent rows for the all-scope agents panel: one per peer workspace
+/// summary that carries an agent, in the same (peer, summary) order the spaces
+/// list folds them, honoring the active server filter. `pane_id`/`tab_idx` are
+/// placeholders (remote rows are selected by their peer switch, not a local
+/// pane focus).
+fn remote_agent_panel_entries(app: &AppState) -> Vec<AgentPanelEntry> {
+    use crate::app::state::ServerFilter;
+    let peers: Vec<_> = match app.server_filter.as_ref() {
+        Some(ServerFilter::Local) => return Vec::new(),
+        Some(ServerFilter::Peer { ssh_target }) => app
+            .remote_peers()
+            .into_iter()
+            .filter(|(_, peer)| peer.ssh_target == *ssh_target)
+            .collect(),
+        None => app.remote_peers(),
+    };
+
+    let mut entries = Vec::new();
+    for (peer_ref, peer) in peers {
+        let server = peer.host.clone().unwrap_or_else(|| peer.peer.clone());
+        for (ws_idx, summary) in peer.workspaces.iter().enumerate() {
+            // Only workspaces actually running an agent surface here.
+            let Some(agent) = summary.agent.as_deref() else {
+                continue;
+            };
+            let (state, seen) = super::status::remote_state(summary.status);
+            entries.push(AgentPanelEntry {
+                ws_idx,
+                tab_idx: 0,
+                pane_id: crate::layout::PaneId::from_raw(0),
+                primary_label: summary.workspace.clone(),
+                primary_tab_label: None,
+                agent_label: Some(agent.to_string()),
+                state,
+                seen,
+                custom_status: None,
+                state_labels: std::collections::HashMap::new(),
+                header_fields: Vec::new(),
+                server: server.clone(),
+                project: summary
+                    .project_key
+                    .as_deref()
+                    .map(super::grammar::project_identity_label)
+                    .or_else(|| summary.project_label.clone()),
+                target: super::grammar::remote_member_target(summary),
+                remote: Some((peer_ref, ws_idx)),
+            });
+        }
+    }
+    entries
 }
 
 pub(super) fn agent_panel_status_key(state: AgentState, seen: bool) -> &'static str {
@@ -276,71 +355,13 @@ pub(super) fn agent_panel_status_key(state: AgentState, seen: bool) -> &'static 
     }
 }
 
-fn truncate_text(text: &str, max_width: usize) -> String {
-    let len = text.chars().count();
-    if len <= max_width {
-        return text.to_string();
-    }
-    if max_width == 0 {
-        return String::new();
-    }
-    if max_width == 1 {
-        return "…".to_string();
-    }
-    let prefix: String = text.chars().take(max_width.saturating_sub(1)).collect();
-    format!("{prefix}…")
-}
-
-fn format_agent_panel_primary_label(entry: &AgentPanelEntry, max_width: usize) -> String {
-    let Some(tab_label) = entry.primary_tab_label.as_deref() else {
-        return truncate_text(&entry.primary_label, max_width);
-    };
-
-    let separator = " · ";
-    let separator_width = separator.chars().count();
-    if max_width <= separator_width + 2 {
-        return truncate_text(
-            &format!("{}{}{}", entry.primary_label, separator, tab_label),
-            max_width,
-        );
-    }
-
-    let available = max_width.saturating_sub(separator_width);
-    let min_tab = 4.min(available.saturating_sub(1)).max(1);
-    let preferred_workspace = ((available * 2) / 3).max(1);
-    let mut workspace_budget = preferred_workspace
-        .min(available.saturating_sub(min_tab))
-        .max(1);
-    let mut tab_budget = available.saturating_sub(workspace_budget);
-
-    let workspace_len = entry.primary_label.chars().count();
-    let tab_len = tab_label.chars().count();
-
-    if workspace_len < workspace_budget {
-        let spare = workspace_budget - workspace_len;
-        workspace_budget = workspace_len;
-        tab_budget = (tab_budget + spare).min(available.saturating_sub(workspace_budget));
-    }
-    if tab_len < tab_budget {
-        let spare = tab_budget - tab_len;
-        tab_budget = tab_len;
-        workspace_budget = (workspace_budget + spare).min(available.saturating_sub(tab_budget));
-    }
-
-    format!(
-        "{}{}{}",
-        truncate_text(&entry.primary_label, workspace_budget),
-        separator,
-        truncate_text(tab_label, tab_budget)
-    )
-}
-
-fn workspace_row_height(ws: &crate::workspace::Workspace) -> u16 {
-    if ws.branch().is_some() {
-        2
-    } else {
-        1
-    }
+/// Every member row is a single line now (#62): the branch IS the label
+/// (`<server>:<branch>`), ahead/behind and the PR glyph append inline, so the
+/// old two-line name+branch form collapses. Kept as a named function so the
+/// layout passes read intent and any future multi-line member can reinstate
+/// height here in one place.
+fn workspace_row_height(_ws: &crate::workspace::Workspace) -> u16 {
+    1
 }
 
 /// Member workspaces of one project section (#33), by section key.
@@ -434,21 +455,37 @@ fn space_state_counts(app: &AppState, key: &str) -> Vec<(AgentState, bool, usize
     .collect()
 }
 
+/// The section-head workspace index for a project-section key: the local main
+/// checkout (non-linked) when present, else the first remaining member (#62).
+/// One place derives the head so grouping, the triangle, and selection agree
+/// even after main closes — the space must NOT disband when main goes away.
+pub(crate) fn space_head_idx(app: &AppState, key: &str) -> Option<usize> {
+    let members = section_member_indices(app, key);
+    members
+        .iter()
+        .copied()
+        .find(|idx| !app.workspaces[*idx].is_linked_checkout())
+        .or_else(|| members.first().copied())
+}
+
 /// The group affordances (key + collapsed flag) a workspace row carries —
-/// only the section's PRIMARY row (the first non-linked member, i.e. the
-/// main checkout) of a multi-member project section gets them (#33).
+/// only the section's HEAD row (the main checkout when present, else the first
+/// remaining member after main closes) of a multi-member project section gets
+/// them (#33, #62).
 pub(crate) fn workspace_parent_group_state(
     app: &AppState,
     ws_idx: usize,
 ) -> Option<(String, bool)> {
     let key = app.project_section_key(ws_idx)?;
     let members = section_member_indices(app, &key);
-    let primary = members
-        .iter()
-        .copied()
-        .find(|idx| !app.workspaces[*idx].is_linked_checkout())?;
-    (primary == ws_idx && members.len() >= 2)
-        .then(|| (key.clone(), app.collapsed_space_keys.contains(&key)))
+    // Only the section HEAD carries the group triangle/collapse affordance.
+    // With main present that's the main row; with main closed (#62) it's the
+    // first remaining member — never an indented member row, and the space
+    // does NOT disband when main goes away.
+    if space_head_idx(app, &key) != Some(ws_idx) {
+        return None;
+    }
+    (members.len() >= 2).then(|| (key.clone(), app.collapsed_space_keys.contains(&key)))
 }
 
 pub(super) fn grouped_child_display_label(
@@ -575,10 +612,16 @@ pub(crate) fn workspace_list_entries(app: &AppState) -> Vec<WorkspaceListEntry> 
         let Some(members) = members_by_key.get(key) else {
             continue;
         };
+        // Section head = the local main checkout (non-linked) when present, so
+        // the space row keeps its identity and muscle memory. When main has
+        // been closed (#62) the space must NOT disband: fall back to the first
+        // remaining member of the project section. Nothing dereferences main as
+        // the group's anchor.
         let Some(parent_idx) = members
             .iter()
             .copied()
             .find(|idx| !app.workspaces[*idx].is_linked_checkout())
+            .or_else(|| members.first().copied())
         else {
             entries.push(WorkspaceListEntry::Workspace {
                 ws_idx,
@@ -827,25 +870,6 @@ fn fold_remote_entries(app: &AppState, entries: &mut Vec<WorkspaceListEntry>) {
     }
 }
 
-/// Status dot for remote rows: the same shape language as the local
-/// `state_dot` (`●` live signal, `○` settled idle, `·` none), colored by
-/// the shared severity mapping.
-fn remote_status_dot(
-    status: crate::api::schema::AgentStatus,
-    p: &crate::app::state::Palette,
-) -> (&'static str, Style) {
-    use crate::api::schema::AgentStatus;
-    let glyph = match status {
-        AgentStatus::Blocked | AgentStatus::Working | AgentStatus::Done => "●",
-        AgentStatus::Idle => "○",
-        AgentStatus::Unknown => "·",
-    };
-    (
-        glyph,
-        Style::default().fg(StateClass::of_remote(status).color(p)),
-    )
-}
-
 /// Display name of the active server filter for the spaces header, if one
 /// is set: the local host name, or the filtered peer's host (ssh target
 /// when the peer no longer resolves — the filter still narrows the list).
@@ -877,12 +901,19 @@ pub(crate) fn remote_entry_label(
         return String::new();
     };
     let host = peer.host.as_deref().unwrap_or(peer.peer.as_str());
-    let target = ws.branch.as_deref().unwrap_or(ws.workspace.as_str());
+    let member = super::grammar::member_label(host, &super::grammar::remote_member_target(ws));
     if indented {
-        format!("{host}:{target}")
+        member
     } else {
-        let project = ws.project_label.as_deref().unwrap_or(ws.workspace.as_str());
-        format!("{project} · {host}:{target}")
+        // A remote-only project group: the leader row carries the project
+        // identity (#27 owner/repo when known) then the member grammar.
+        let project = ws
+            .project_key
+            .as_deref()
+            .map(super::grammar::project_identity_label)
+            .or_else(|| ws.project_label.clone())
+            .unwrap_or_else(|| ws.workspace.clone());
+        format!("{project} · {member}")
     }
 }
 
@@ -1092,14 +1123,15 @@ pub(crate) fn agent_panel_body_rect(area: Rect, has_scrollbar: bool) -> Rect {
 
 fn agent_panel_visible_count(area: Rect, row_gap: u16) -> usize {
     let body = agent_panel_body_rect(area, false);
-    if body.width == 0 || body.height < 2 {
+    if body.width == 0 || body.height < 1 {
         return 0;
     }
 
+    // Single-row entries (#62): one row per agent, plus the inter-row gap.
     let mut used_rows = 0u16;
     let mut visible = 0usize;
-    while used_rows.saturating_add(2) <= body.height {
-        used_rows = used_rows.saturating_add(2);
+    while used_rows.saturating_add(1) <= body.height {
+        used_rows = used_rows.saturating_add(1);
         visible += 1;
         if used_rows < body.height {
             used_rows = used_rows.saturating_add(row_gap);
@@ -1286,7 +1318,7 @@ pub(super) fn render_sidebar_collapsed(app: &AppState, frame: &mut Frame, area: 
             break;
         }
         let (agg_state, agg_seen) = ws.aggregate_state(&app.terminals);
-        let (icon, icon_style) = state_dot(agg_state, agg_seen, p);
+        let (icon, icon_style) = agent_icon(agg_state, agg_seen, app.spinner_tick, p);
         let is_selected = visible_idx == app.selected && is_navigating;
         let is_active = Some(visible_idx) == app.active;
         let row_style = if is_selected {
@@ -2156,6 +2188,20 @@ fn render_workspace_list(
     // currency fill as the active row (and the current-server row) — one
     // "where am I" idiom from server to session to workspace.
     let active_section_primary = app.active_section_primary();
+    // Section indices for switch_space discoverability (#62): the Nth project
+    // section (unindented head row) shows its 1-based index, exactly like the
+    // collapsed sidebar numbers workspaces — but only when `switch_space` is
+    // bound, so the unbound default stays uncluttered. ws_idx -> 1-based index.
+    let section_indices: std::collections::HashMap<usize, usize> =
+        if app.keybinds.switch_space.is_empty() {
+            std::collections::HashMap::new()
+        } else {
+            app.space_section_heads()
+                .into_iter()
+                .enumerate()
+                .map(|(pos, ws_idx)| (ws_idx, pos + 1))
+                .collect()
+        };
 
     for card in cards {
         let i = card.ws_idx;
@@ -2194,26 +2240,39 @@ fn render_workspace_list(
             Style::default().fg(p.subtext0)
         };
 
-        let (icon, icon_style) = state_dot(agg_state, agg_seen, p);
-        let label = ws.display_name_from(&app.terminals, terminal_runtimes);
+        // Agent-style icon REPLACES the circle on member rows (#62): ✓ done /
+        // spinner working / escalation blocked / muted idle, driven by the
+        // member's own join head.
+        let (icon, icon_style) = agent_icon(agg_state, agg_seen, app.spinner_tick, p);
+        // Uniform member grammar: `<server>:<target>` (the branch IS the label
+        // for git checkouts, the workspace name for misc) — local and remote
+        // read the same. The space identity lives in the group header row.
+        let label = super::grammar::local_member_label(app, ws, terminal_runtimes);
         let mut line1 = Vec::new();
         let mut show_workspace_icon = true;
         let mut collapsed_group_key: Option<String> = None;
         let mut group_key: Option<String> = None;
+        // Section index prefix (#62) on the section-head row, when bound.
+        if let Some(index) = section_indices.get(&i).filter(|_| !card.indented) {
+            let idx_style = if highlighted {
+                Style::default().fg(p.overlay1)
+            } else {
+                Style::default().fg(p.overlay0)
+            };
+            line1.push(Span::styled(format!("{index} "), idx_style));
+        }
         if card.indented {
             line1.push(Span::styled("   ", Style::default()));
         } else if let Some((key, collapsed)) = workspace_parent_group_state(app, i) {
-            let icon = if collapsed { "▸" } else { "▾" };
-            let (state_icon, state_style) = if collapsed {
-                let (state, seen) = space_aggregate_state(app, &key);
-                state_dot(state, seen, p)
-            } else {
-                (icon, Style::default().fg(p.accent))
-            };
-            line1.push(Span::styled(icon, Style::default().fg(p.accent)));
+            let triangle = if collapsed { "▸" } else { "▾" };
+            line1.push(Span::styled(triangle, Style::default().fg(p.accent)));
             if collapsed {
+                // The collapsed group header shows the GROUP join head as the
+                // agent-style icon (not a circle) over the project identity.
+                let (state, seen) = space_aggregate_state(app, &key);
+                let (group_icon, group_style) = agent_icon(state, seen, app.spinner_tick, p);
                 line1.push(Span::styled(" ", Style::default()));
-                line1.push(Span::styled(state_icon, state_style));
+                line1.push(Span::styled(group_icon, group_style));
                 show_workspace_icon = false;
                 collapsed_group_key = Some(key.clone());
             }
@@ -2226,15 +2285,29 @@ fn render_workspace_list(
             line1.push(Span::styled(icon, icon_style));
             line1.push(Span::styled(" ", Style::default()));
         }
-        if card.indented {
-            let display_label = grouped_child_display_label(
-                &label,
-                ws.branch().as_deref(),
-                ws.custom_name.is_some(),
-            );
-            line1.push(Span::styled(display_label, name_style));
-        } else {
-            line1.push(Span::styled(label, name_style));
+        line1.push(Span::styled(label, name_style));
+        // ahead/behind appends inline (the branch line is gone).
+        if let Some((ahead, behind)) = ws.git_ahead_behind() {
+            if ahead > 0 {
+                line1.push(Span::styled(" ", Style::default()));
+                line1.push(Span::styled(
+                    format!("↑{ahead}"),
+                    Style::default().fg(p.green),
+                ));
+            }
+            if behind > 0 {
+                line1.push(Span::styled(" ", Style::default()));
+                line1.push(Span::styled(
+                    format!("↓{behind}"),
+                    Style::default().fg(p.red),
+                ));
+            }
+        }
+        // PR glyph appends after ahead/behind, sharing the pane-header set.
+        if let Some(pr) = ws.pr_state() {
+            let (text, color) = super::grammar::pr_glyph(pr, p);
+            line1.push(Span::styled(" ", Style::default()));
+            line1.push(Span::styled(text, Style::default().fg(color)));
         }
         // The row's state language as packed rects (#42): the group join on
         // space header rows — even when expanded, the primary row always
@@ -2264,93 +2337,10 @@ fn render_workspace_list(
                 ));
             }
         }
-        // Single-line rows carry the PR glyph inline (their branch IS the
-        // label); two-line rows render it on the branch line below.
-        if row_height == 1 {
-            if let Some(pr) = ws.pr_state() {
-                let (glyph, color) = pr_state_glyph(pr.state, p);
-                line1.push(Span::styled(
-                    format!(" #{} {glyph}", pr.number),
-                    Style::default().fg(color),
-                ));
-            }
-        }
-
         frame.render_widget(
-            Paragraph::new(Line::from(line1)),
+            Paragraph::new(clamp_line(Line::from(line1), card.rect.width)),
             Rect::new(card.rect.x, row_y, card.rect.width, 1),
         );
-
-        if row_height > 1 && row_y + 1 < list_bottom {
-            if let Some(branch) = ws.branch() {
-                // Ahead/behind arrows render only when non-zero: silence
-                // means in sync with upstream (#42, deliberate — a synced
-                // chip on every row would be noise at sidebar density).
-                let upstream_label = ws.git_ahead_behind().and_then(|(ahead, behind)| {
-                    let mut parts = Vec::new();
-                    if ahead > 0 {
-                        parts.push((format!("↑{}", ahead), p.green));
-                    }
-                    if behind > 0 {
-                        parts.push((format!("↓{}", behind), p.red));
-                    }
-                    (!parts.is_empty()).then_some(parts)
-                });
-                // Compact PR state after the ahead/behind arrows (#42): the
-                // same `#N ⊙/◐/✓/✗` language as the pane-header HUD.
-                let pr_label = ws.pr_state().map(|pr| {
-                    let (glyph, color) = pr_state_glyph(pr.state, p);
-                    (format!("#{} {glyph}", pr.number), color)
-                });
-                let reserved = upstream_label
-                    .as_ref()
-                    .map(|parts| {
-                        parts.iter().map(|(label, _)| label.len()).sum::<usize>() + parts.len()
-                    })
-                    .unwrap_or(0)
-                    + pr_label
-                        .as_ref()
-                        .map(|(label, _)| label.chars().count() + 1)
-                        .unwrap_or(0);
-                // The branch glyph (`` — the same one the pane-header HUD
-                // uses) anchors the line as git metadata of the row above,
-                // not a phantom sibling workspace; +2 cells in the budget.
-                let max_branch_len = (card.rect.width as usize).saturating_sub(7 + reserved);
-                let branch_display = if branch.len() > max_branch_len {
-                    format!("{}…", &branch[..max_branch_len.saturating_sub(1)])
-                } else {
-                    branch
-                };
-                let branch_color = if selected || is_active {
-                    p.mauve
-                } else {
-                    p.overlay0
-                };
-                let branch_indent = if card.indented { "     " } else { "   " };
-                let mut spans = vec![
-                    Span::styled(branch_indent, Style::default()),
-                    Span::styled("\u{e0a0} ", Style::default().fg(branch_color)),
-                    Span::styled(branch_display, Style::default().fg(branch_color)),
-                ];
-                if let Some(parts) = upstream_label {
-                    spans.push(Span::styled(" ", Style::default()));
-                    for (idx, (label, color)) in parts.into_iter().enumerate() {
-                        if idx > 0 {
-                            spans.push(Span::styled(" ", Style::default()));
-                        }
-                        spans.push(Span::styled(label, Style::default().fg(color)));
-                    }
-                }
-                if let Some((label, color)) = pr_label {
-                    spans.push(Span::styled(" ", Style::default()));
-                    spans.push(Span::styled(label, Style::default().fg(color)));
-                }
-                frame.render_widget(
-                    Paragraph::new(Line::from(spans)),
-                    Rect::new(card.rect.x, row_y + 1, card.rect.width, 1),
-                );
-            }
-        }
     }
 
     for card in &app.view.remote_card_areas {
@@ -2364,12 +2354,16 @@ fn render_workspace_list(
             continue;
         }
         let stale = peer.is_stale() || peer.error.is_some();
-        let (icon, icon_style) = remote_status_dot(remote_ws.status, p);
+        let (icon, icon_style) = remote_agent_icon(remote_ws.status, app.spinner_tick, p);
         let label = remote_entry_label(app, card.peer, card.ws_idx, card.indented);
         let max_label =
             (card.rect.width as usize).saturating_sub(if card.indented { 5 } else { 3 });
-        let label = if label.len() > max_label {
-            format!("{}…", &label[..max_label.saturating_sub(1)])
+        // Truncate on CHAR boundaries, not bytes: remote-only project leader
+        // labels carry a `·` separator (and the origin rows from #66 are long),
+        // so a byte slice could land mid-`·` and panic the whole render.
+        let label = if label.chars().count() > max_label {
+            let kept: String = label.chars().take(max_label.saturating_sub(1)).collect();
+            format!("{kept}…")
         } else {
             label
         };
@@ -2501,92 +2495,61 @@ fn render_agent_detail(
     let mut row_y = body.y;
     let body_bottom = body.y + body.height;
     for detail in details.iter().skip(app.agent_panel_scroll) {
-        if row_y.saturating_add(1) >= body_bottom {
+        if row_y >= body_bottom {
             break;
         }
 
-        // Check if this agent entry corresponds to the active session
-        let is_active = app.is_active_pane(detail.ws_idx, detail.tab_idx, detail.pane_id);
+        // Single-row grammar (#62): `<icon> <agent> <server> <proj> <target>`.
+        // The status symbol carries the state — no status text, no activity /
+        // custom-status / header-field chips (those live in the pane header,
+        // navigator, and member rows). Remote agent rows render identically.
+        // The active-pane highlight only applies to LOCAL rows; remote rows are
+        // never the focused local pane.
+        let is_active = detail.remote.is_none()
+            && app.is_active_pane(detail.ws_idx, detail.tab_idx, detail.pane_id);
 
         let (icon, icon_style) = agent_icon(detail.state, detail.seen, app.spinner_tick, p);
-        let label_color = state_label_color(detail.state, detail.seen, p);
-        let label = detail
-            .state_labels
-            .get(agent_panel_status_key(detail.state, detail.seen))
-            .map(String::as_str)
-            .unwrap_or_else(|| state_label(detail.state, detail.seen));
 
         let row_style = if is_active {
             Style::default().bg(p.surface_dim)
         } else {
             Style::default()
         };
-
-        let name_style = if is_active {
+        let agent_style = if is_active {
             Style::default().fg(p.text).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(p.subtext0).add_modifier(Modifier::BOLD)
         };
-        // Status colors render at full strength regardless of selection —
-        // blocked/working/done are attention signals, not decoration. Only a
-        // settled idle (seen, nothing to report) stays toned down; the row
-        // highlight bar already marks the selected entry.
-        let settled_idle =
-            matches!(detail.state, AgentState::Idle | AgentState::Unknown) && detail.seen;
-        let status_style = if settled_idle && !is_active {
-            Style::default().fg(label_color).add_modifier(Modifier::DIM)
-        } else {
-            Style::default().fg(label_color)
-        };
-        let agent_style = Style::default().fg(p.overlay0).add_modifier(Modifier::DIM);
+        let location_style = Style::default().fg(p.overlay0).add_modifier(Modifier::DIM);
 
-        let primary_label =
-            format_agent_panel_primary_label(detail, body.width.saturating_sub(3) as usize);
-        let name_line = Line::from(vec![
+        // Leading "  <icon> " consumes 4 columns (space, icon, space). The
+        // agent code then leads the location, which gets the remaining budget.
+        let agent_code = detail
+            .agent_label
+            .as_deref()
+            .map(|a| app.agent_alias(a).to_string())
+            .unwrap_or_default();
+        let prefix_cols = 4 + agent_code.chars().count() + usize::from(!agent_code.is_empty());
+        let location_budget = (body.width as usize).saturating_sub(prefix_cols);
+        let location = super::grammar::agent_location_label(
+            &detail.server,
+            detail.project.as_deref(),
+            &detail.target,
+            location_budget,
+        );
+
+        let mut spans = vec![
             Span::styled(" ", Style::default()),
             Span::styled(icon, icon_style),
             Span::styled(" ", Style::default()),
-            Span::styled(primary_label, name_style),
-        ]);
+        ];
+        if !agent_code.is_empty() {
+            spans.push(Span::styled(agent_code, agent_style));
+            spans.push(Span::styled(" ", Style::default()));
+        }
+        spans.push(Span::styled(location, location_style));
         frame.render_widget(
-            Paragraph::new(name_line).style(row_style),
-            Rect::new(body.x, row_y, body.width, 1),
-        );
-        row_y += 1;
-
-        // '<agent> · <activity-or-status>': the short agent code leads so the
-        // (potentially long) live activity text gets the remaining width.
-        let mut status_spans = vec![Span::styled("   ", Style::default())];
-        if let Some(agent_label) = &detail.agent_label {
-            status_spans.push(Span::styled(
-                app.agent_alias(agent_label).to_string(),
-                agent_style,
-            ));
-            status_spans.push(Span::styled(" · ", agent_style));
-        }
-        match &detail.live_activity {
-            Some(activity) => {
-                status_spans.push(Span::styled(format!("{activity}…"), status_style));
-            }
-            None => status_spans.push(Span::styled(label, status_style)),
-        }
-        if let Some(custom_status) = &detail.custom_status {
-            status_spans.push(Span::styled(" · ", agent_style));
-            status_spans.push(Span::styled(custom_status.clone(), agent_style));
-        }
-        // Promoted header fields, compact: muted key, readable value. The
-        // row is clipped at the panel edge; values get the agent-panel
-        // budget (header > agent panel > nav list).
-        for (key, value) in &detail.header_fields {
-            status_spans.push(Span::styled(" · ", agent_style));
-            status_spans.push(Span::styled(format!("{key} "), agent_style));
-            status_spans.push(Span::styled(
-                crate::terminal::middle_truncate_chars(value, AGENT_PANEL_HEADER_FIELD_VALUE_COLS),
-                Style::default().fg(p.subtext0),
-            ));
-        }
-        frame.render_widget(
-            Paragraph::new(Line::from(status_spans)).style(row_style),
+            Paragraph::new(Line::from(spans)).style(row_style),
             Rect::new(body.x, row_y, body.width, 1),
         );
         row_y += 1;
@@ -2649,6 +2612,7 @@ fn render_sidebar_toggle(
 
 #[cfg(test)]
 mod tests {
+    use super::super::status::state_dot;
     use super::*;
     use crate::{detect::Agent, workspace::Workspace};
     use ratatui::{backend::TestBackend, Terminal};
@@ -3328,11 +3292,12 @@ mod tests {
                 },
             ]
         );
-        // The leader row carries the project label.
+        // The leader row carries the project identity (#27 owner/repo from the
+        // project key) then the uniform `<server>:<target>` member grammar.
         let config_peer = crate::app::state::RemotePeerRef::Config { peer_idx: 0 };
         assert_eq!(
             remote_entry_label(&app, config_peer, 0, false),
-            "dotfiles · sage:dotfiles"
+            "gerchowl/dotfiles · sage:dotfiles"
         );
         assert_eq!(
             remote_entry_label(&app, config_peer, 1, true),
@@ -3886,6 +3851,40 @@ mod tests {
         terminal.backend().buffer().clone()
     }
 
+    /// A remote-only project leader row labels as `owner/repo · host:branch`,
+    /// which carries the multibyte `·` separator. In a narrow sidebar that
+    /// label truncates — the truncation MUST land on a char boundary, never
+    /// mid-`·`, or the whole render panics and a spoke that carries an origin
+    /// summary (#66) emits no frames at all. Regression for that panic.
+    #[test]
+    fn narrow_remote_only_leader_label_truncates_on_char_boundary() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![workspace_with_project_key(
+            "shared",
+            "github.com/peer-fed-test/shared",
+        )];
+        let mut origin = peer_with_workspaces(
+            "mba22",
+            vec![remote_summary(
+                "alpha",
+                Some("github.com/peer-fed-test/alpha"),
+                Some("alpha"),
+                Some("main"),
+            )],
+        );
+        origin.host = Some("mba22".into());
+        origin.ssh_target = crate::protocol::HOME_SWITCH_TARGET.into();
+        let mut snapshot = snapshot_with_peers("mba22", vec![]);
+        snapshot.origin_summary = Some(origin);
+        app.fleet_snapshot = Some(snapshot);
+        app.mode = Mode::Navigate;
+        // A width tight enough to truncate the `· mba22:main` tail right at the
+        // separator must not panic.
+        for width in 20..30 {
+            let _ = render_sidebar_to_buffer(&mut app, Rect::new(0, 0, width, 45));
+        }
+    }
+
     fn row_glyph_positions(
         buffer: &ratatui::buffer::Buffer,
         rect: Rect,
@@ -4347,13 +4346,14 @@ mod tests {
     #[test]
     fn workspace_rows_render_cached_pr_state_glyphs() {
         let mut app = space_group_app();
-        // Two-line parent row: branch line carries `#12 ⊙` after the branch.
+        // #62 single-row grammar: every member is ONE line and the PR glyph
+        // rides the label line inline (via `grammar::pr_glyph`), no separate
+        // branch line. Both parent and member rows are height 1.
         app.workspaces[0].cached_git_branch = Some("feat-x".into());
         app.workspaces[0].pr_state = Some(crate::worktree::PrStateInfo {
             state: crate::worktree::PrState::Open,
             number: 12,
         });
-        // One-line member row: the glyph rides the label line.
         app.workspaces[1].cached_git_branch = Some("worktree/feat-y".into());
         app.workspaces[1].pr_state = Some(crate::worktree::PrStateInfo {
             state: crate::worktree::PrState::Draft,
@@ -4365,17 +4365,11 @@ mod tests {
         let p = &app.palette;
 
         let parent = app.view.workspace_card_areas[0];
-        assert_eq!(parent.rect.height, 2);
-        let branch_line = buffer_row_text(&buffer, parent.rect, parent.rect.y + 1);
-        assert!(
-            branch_line.contains("\u{e0a0} feat-x #12 \u{2299}"),
-            "branch line leads with the git glyph: {branch_line:?}"
-        );
-        let glyph = row_glyph_positions(&buffer, parent.rect, parent.rect.y + 1, "\u{2299}");
-        assert_eq!(
-            buffer[(glyph[0], parent.rect.y + 1)].style().fg,
-            Some(p.accent)
-        );
+        assert_eq!(parent.rect.height, 1);
+        let parent_row = buffer_row_text(&buffer, parent.rect, parent.rect.y);
+        assert!(parent_row.contains("#12 \u{2299}"), "{parent_row:?}");
+        let glyph = row_glyph_positions(&buffer, parent.rect, parent.rect.y, "\u{2299}");
+        assert_eq!(buffer[(glyph[0], parent.rect.y)].style().fg, Some(p.accent));
 
         let child = app.view.workspace_card_areas[1];
         assert_eq!(child.rect.height, 1);
@@ -4577,28 +4571,6 @@ mod tests {
     }
 
     #[test]
-    fn all_workspaces_primary_label_truncates_workspace_and_tab() {
-        let entry = AgentPanelEntry {
-            ws_idx: 0,
-            tab_idx: 0,
-            pane_id: crate::layout::PaneId::from_raw(1),
-            primary_label: "agent-browser".into(),
-            primary_tab_label: Some("test-escalation".into()),
-            agent_label: Some("claude".into()),
-            state: AgentState::Idle,
-            seen: true,
-            custom_status: None,
-            header_fields: Vec::new(),
-            live_activity: None,
-            state_labels: std::collections::HashMap::new(),
-        };
-
-        let label = format_agent_panel_primary_label(&entry, 18);
-
-        assert_eq!(label, "agent-bro… · test…");
-    }
-
-    #[test]
     fn expanded_sidebar_sections_handle_tiny_heights() {
         // The bottom two rows stay reserved for the pinned menu band; the
         // sections split the three rows above it.
@@ -4643,22 +4615,6 @@ mod tests {
         let divider = sidebar_section_divider_rect(Rect::new(0, 0, 20, 5), 0.5, 0);
 
         assert_eq!(divider, Rect::default());
-    }
-
-    #[test]
-    fn grouped_child_label_keeps_custom_workspace_name() {
-        assert_eq!(
-            grouped_child_display_label("renamed issue", Some("worktree/issue-137"), true),
-            "renamed issue"
-        );
-    }
-
-    #[test]
-    fn grouped_child_label_uses_short_branch_for_auto_named_workspace() {
-        assert_eq!(
-            grouped_child_display_label("herdr-issue", Some("worktree/issue-137"), false),
-            "issue-137"
-        );
     }
 
     fn workspace_with_worktree_space(
@@ -4758,31 +4714,6 @@ mod tests {
     }
 
     #[test]
-    fn linked_only_worktree_members_do_not_form_parentless_group() {
-        let mut app = AppState::test_new();
-        app.workspaces = vec![
-            workspace_with_worktree_space("issue", Some("repo-key"), "/repo/herdr-issue"),
-            workspace_with_worktree_space("review", Some("repo-key"), "/repo/herdr-review"),
-        ];
-
-        let entries = workspace_list_entries(&app);
-
-        assert_eq!(
-            entries,
-            vec![
-                WorkspaceListEntry::Workspace {
-                    ws_idx: 0,
-                    indented: false
-                },
-                WorkspaceListEntry::Workspace {
-                    ws_idx: 1,
-                    indented: false
-                },
-            ]
-        );
-    }
-
-    #[test]
     fn compact_space_group_scroll_offset_can_start_inside_group() {
         let mut app = AppState::test_new();
         app.workspaces = vec![
@@ -4861,6 +4792,34 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn workspace_list_entries_group_survives_main_closed_members_only() {
+        // #62: main checkout gone (or never restored) — the space still groups
+        // on its members, with the first member promoted to the section head.
+        let mut app = AppState::test_new();
+        app.workspaces = vec![
+            workspace_with_worktree_space("issue", Some("repo-key"), "/repo/herdr-issue"),
+            workspace_with_worktree_space("fix", Some("repo-key"), "/repo/herdr-fix"),
+        ];
+
+        assert_eq!(
+            workspace_list_entries(&app),
+            vec![
+                WorkspaceListEntry::Workspace {
+                    ws_idx: 0,
+                    indented: false,
+                },
+                WorkspaceListEntry::Workspace {
+                    ws_idx: 1,
+                    indented: true,
+                },
+            ]
+        );
+        // The head row carries the group triangle even though it's a worktree.
+        assert!(workspace_parent_group_state(&app, 0).is_some());
+        assert!(workspace_parent_group_state(&app, 1).is_none());
     }
 
     #[test]
