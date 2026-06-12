@@ -2343,14 +2343,18 @@ fn render_workspace_list(
         // A section LEADER (`group_key` is set: the selectable main checkout that
         // heads a multi-member project section) renders the PROJECT IDENTITY, not
         // `<server>:<branch>` (#78) — two repos that both head as `mba22:main` are
-        // otherwise indistinguishable. Members keep the uniform `<server>:<target>`
-        // grammar (the branch IS the label for git checkouts, the workspace name
-        // for misc); local and remote read the same. One place (`grammar`) owns
-        // both label forms.
+        // otherwise indistinguishable. A SOLO local row — an unindented project
+        // section with no sibling members — carries the combined
+        // `project · <server>:<branch>` form (#92), mirroring solo remotes (#81)
+        // so its identity stays visible. Indented members keep the uniform
+        // `<server>:<target>` member grammar; local and remote read the same.
+        // One place (`grammar`) owns every label form.
         let label = if group_key.is_some() {
             super::grammar::leader_label(app, ws, terminal_runtimes)
-        } else {
+        } else if card.indented {
             super::grammar::local_member_label(app, ws, terminal_runtimes)
+        } else {
+            super::grammar::solo_local_label(app, ws, terminal_runtimes)
         };
         line1.push(Span::styled(label, name_style));
         // ahead/behind appends inline (the branch line is gone).
@@ -4362,6 +4366,67 @@ mod tests {
         assert!(
             member_row.contains(&format!("{}:", crate::ui::grammar::local_server_name())),
             "member keeps server:branch: {member_row:?}"
+        );
+    }
+
+    /// #92: a SOLO local row (one local member, no remote folds, no group)
+    /// must carry the project identity — `<owner/repo> · <server>:<branch>` —
+    /// mirroring solo remotes (#81). The bare member grammar would erase the
+    /// project name from the only place that could carry it.
+    #[test]
+    fn solo_local_row_renders_project_identity_then_server_branch() {
+        let mut app = crate::app::state::AppState::test_new();
+        let mut ws = workspace_with_project_key("herdr", "github.com/gerchowl/herdr");
+        // Clear the test-only custom name so `local_member_target` falls through
+        // to the branch — the issue's example uses a branch tail.
+        ws.custom_name = None;
+        ws.cached_git_branch = Some("keyboard-shorcuts".into());
+        app.workspaces = vec![ws];
+        app.ensure_test_terminals();
+        app.active = Some(0);
+        app.mode = crate::app::Mode::Terminal;
+
+        let area = Rect::new(0, 0, 60, 40);
+        let buffer = render_sidebar_to_buffer(&mut app, area);
+        let card = app.view.workspace_card_areas[0];
+        assert!(
+            !card.indented,
+            "the solo row is its project's section head, never indented"
+        );
+        let row = buffer_row_text(&buffer, card.rect, card.rect.y);
+        let server = crate::ui::grammar::local_server_name();
+        let expected_tail = format!("gerchowl/herdr \u{00b7} {server}:keyboard-shorcuts");
+        assert!(
+            row.contains(&expected_tail),
+            "solo local carries identity + member locator: {row:?}"
+        );
+    }
+
+    /// #92: when the project key has NOT resolved, the solo row falls back to
+    /// the workspace DISPLAY LABEL alone — never bare `<server>:<branch>` (an
+    /// identity-less row must not look like a member of an absent group).
+    #[test]
+    fn solo_local_row_unresolved_identity_uses_display_label_only() {
+        let mut app = crate::app::state::AppState::test_new();
+        // `Workspace::test_new` carries a custom_name but no `cached_git_space`,
+        // so `project_key()` is None — the unresolved-identity solo case.
+        app.workspaces = vec![Workspace::test_new("scratch")];
+        app.ensure_test_terminals();
+        app.active = Some(0);
+        app.mode = crate::app::Mode::Terminal;
+
+        let area = Rect::new(0, 0, 40, 40);
+        let buffer = render_sidebar_to_buffer(&mut app, area);
+        let card = app.view.workspace_card_areas[0];
+        let row = buffer_row_text(&buffer, card.rect, card.rect.y);
+        assert!(row.contains("scratch"), "display label rendered: {row:?}");
+        assert!(
+            !row.contains(&format!("{}:", crate::ui::grammar::local_server_name())),
+            "unresolved solo never falls through to server:branch: {row:?}"
+        );
+        assert!(
+            !row.contains('\u{00b7}'),
+            "unresolved solo has no project to anchor the separator: {row:?}"
         );
     }
 
