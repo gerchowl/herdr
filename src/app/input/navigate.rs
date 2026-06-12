@@ -1374,8 +1374,10 @@ mod tests {
             KeyEvent::new(KeyCode::Char('2'), KeyModifiers::empty()),
         );
 
-        assert_eq!(state.active, Some(2));
-        assert_eq!(state.selected, 2);
+        // Fleet-stable order (#85): "normal" sorts before "repo-key" --
+        // visual slot 2 is the group head (ws 0).
+        assert_eq!(state.active, Some(0));
+        assert_eq!(state.selected, 0);
     }
 
     #[test]
@@ -1395,8 +1397,9 @@ mod tests {
             ActionContext::Prefix,
         );
 
-        assert_eq!(state.active, Some(2));
-        assert_eq!(state.selected, 2);
+        // #85: "normal" sorts before "repo-key" -- visual slot 2 = group head.
+        assert_eq!(state.active, Some(0));
+        assert_eq!(state.selected, 0);
     }
 
     #[test]

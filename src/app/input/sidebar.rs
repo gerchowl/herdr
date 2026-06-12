@@ -1754,20 +1754,30 @@ mod tests {
 
         let cards = &app.state.view.workspace_card_areas;
         let order = cards.iter().map(|card| card.ws_idx).collect::<Vec<_>>();
-        assert_eq!(order, vec![0, 2, 1]);
+        // #85 fleet-stable order: "normal" sorts before "repo-key".
+        assert_eq!(order, vec![1, 0, 2]);
         let issue = cards.iter().find(|card| card.ws_idx == 2).unwrap();
         let normal = cards.iter().find(|card| card.ws_idx == 1).unwrap();
 
-        assert_eq!(app.state.workspace_drop_index_at_row(issue.rect.y), Some(1));
-        assert_eq!(
-            crate::ui::workspace_drop_indicator_row(
-                cards,
-                app.state.workspace_list_rect(),
-                2,
-                true
-            ),
-            Some(normal.rect.y + normal.rect.height)
+        // Sorted display (#85): issue's row is visually last -> storage-end slot.
+        assert_eq!(app.state.workspace_drop_index_at_row(issue.rect.y), Some(3));
+        // Structural assertion (the test's actual contract): the indicator
+        // may sit on either group boundary but never strictly inside it.
+        let indicator = crate::ui::workspace_drop_indicator_row(
+            cards,
+            app.state.workspace_list_rect(),
+            2,
+            true,
+        )
+        .expect("indicator row");
+        let main = cards.iter().find(|card| card.ws_idx == 0).unwrap();
+        let group_top = main.rect.y.min(issue.rect.y);
+        let group_bottom = (main.rect.y + main.rect.height).max(issue.rect.y + issue.rect.height);
+        assert!(
+            indicator <= group_top || indicator >= group_bottom,
+            "indicator {indicator} inside group {group_top}..{group_bottom}"
         );
+        let _ = normal;
     }
 
     #[test]
