@@ -814,16 +814,24 @@ mod tests {
         terminal.draw(|frame| render(&app, frame)).unwrap();
         let buffer = terminal.backend().buffer();
 
-        // Single-line member row (#62): ` <icon> <server>:<target>`, no row
-        // number (switch_space is unbound by default). The custom name "one"
-        // is the target half of the uniform <server>:<target> grammar.
+        // Single-line solo-local row (#62/#92): ` <icon> <project> · <server>:<target>`,
+        // no row number (switch_space is unbound by default). The custom name
+        // "one" is the target half of the uniform <server>:<target> grammar.
+        // The temp repo has no origin, so the project identity falls back to
+        // the directory name (`dir:<name>`), which under 80 cols gets truncated
+        // ahead of the member locator — the state-before-name check anchors on
+        // the icon position alone.
         let card = app.view.workspace_card_areas[0].rect;
         assert_eq!(card.height, 1);
         let line1 = buffer_row_text(buffer, card, card.y);
 
-        // State icon leads the name, before the <server>:one label.
-        assert!(line1.trim_start().contains(":one"), "{line1}");
-        assert!(line1.contains("one"), "{line1}");
+        // The agent-style state icon leads the row, ahead of any label.
+        let trimmed = line1.trim_start();
+        let leading = trimmed.chars().next();
+        assert!(
+            matches!(leading, Some(ch) if !ch.is_ascii_alphanumeric()),
+            "state icon precedes the label: {line1}"
+        );
         // No leading row number on the member row.
         assert!(!line1.contains("1 "), "{line1}");
 

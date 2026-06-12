@@ -93,6 +93,29 @@ pub(crate) fn leader_label(
     }
 }
 
+/// The label for a SOLO local row — a project's lone local checkout, with no
+/// sibling members to fold beneath it (#92). Mirrors solo remotes (#81): the
+/// row IS both the project AND its only checkout, so it reads
+/// `<owner/repo> · <server>:<branch>` — identity first, member locator second,
+/// one line, no synthetic group. When the git identity hasn't resolved (no
+/// project key yet) we fall back to the leader's display label alone, never
+/// bare `<server>:<branch>` — a solo row without identity must not look like
+/// a member of an absent group.
+pub(crate) fn solo_local_label(
+    app: &AppState,
+    ws: &Workspace,
+    terminal_runtimes: &crate::terminal::TerminalRuntimeRegistry,
+) -> String {
+    match ws.project_key() {
+        Some(key) => format!(
+            "{} \u{00b7} {}",
+            project_identity_label(key),
+            local_member_label(app, ws, terminal_runtimes),
+        ),
+        None => leader_label(app, ws, terminal_runtimes),
+    }
+}
+
 /// The PR glyph + number for a member row, sharing the pane-header symbol set:
 /// open `⊙`, draft `◐`, merged `✓`, closed `✗`. Returns `(text, color)` where
 /// `text` is `#<n> <glyph>`.
@@ -235,6 +258,46 @@ mod tests {
         assert!(out.starts_with("mba22 herdr "), "got {out:?}");
         assert!(out.chars().count() <= 20, "got {out:?}");
         assert!(out.contains('…'), "got {out:?}");
+    }
+
+    #[test]
+    fn solo_local_label_combines_identity_with_member_grammar() {
+        // Mirrors the shape `remote_entry_label` already produces for solo
+        // remotes (#81): `<owner/repo> · <server>:<branch>`.
+        let mut app = crate::app::AppState::test_new();
+        let mut ws = crate::workspace::Workspace::test_new("herdr");
+        ws.custom_name = None;
+        ws.cached_git_branch = Some("keyboard-shorcuts".into());
+        ws.cached_git_space = Some(crate::workspace::GitSpaceMetadata {
+            key: "/repo/herdr/.git".into(),
+            checkout_key: "/repo/herdr".into(),
+            label: "herdr".into(),
+            repo_root: std::path::PathBuf::from("/repo/herdr"),
+            is_linked_worktree: false,
+            project_key: "github.com/gerchowl/herdr".into(),
+        });
+        app.workspaces = vec![ws];
+        let runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+        let label = solo_local_label(&app, &app.workspaces[0], &runtimes);
+        let server = local_server_name();
+        assert_eq!(
+            label,
+            format!("gerchowl/herdr \u{00b7} {server}:keyboard-shorcuts")
+        );
+    }
+
+    #[test]
+    fn solo_local_label_unresolved_falls_back_to_display_label() {
+        let mut app = crate::app::AppState::test_new();
+        // Plain test workspace: no `cached_git_space`, so `project_key()` is
+        // None — the identity hasn't resolved. Must NOT fall through to
+        // `<server>:<branch>` (that would read like a member of an absent
+        // group); display label alone.
+        app.workspaces = vec![crate::workspace::Workspace::test_new("scratch")];
+        let runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+        let label = solo_local_label(&app, &app.workspaces[0], &runtimes);
+        assert_eq!(label, "scratch");
+        assert!(!label.contains(':'));
     }
 
     #[test]
