@@ -653,18 +653,15 @@ fn switch_snapshot_renders_home_row_on_spoke_and_home_switches_back() {
     assert!(error.is_none(), "spoke handshake rejected: {error:?}");
 
     // The spoke renders the carried fleet in one frame: the pinned home
-    // row plus the carried (render-only) ghost row.
-    let rows = wait_for_frame_matching(&mut stream_b, &["←", "ghost"], Duration::from_secs(30))
-        .expect("home row and snapshot peer should render on the spoke");
+    // row plus the carried (render-only) ghost row. Post-#84 the home row
+    // carries no arrow or suffix -- its pinned slot-0 position is the label,
+    // so the FIRST band row naming the origin is home.
+    let rows = wait_for_frame_matching(&mut stream_b, &["ghost"], Duration::from_secs(30))
+        .expect("snapshot peer should render on the spoke");
     let home_row = rows
         .iter()
-        .position(|row| row.contains('←'))
-        .expect("home row present");
-    assert!(
-        rows[home_row].contains(" home"),
-        "home row should be marked: {}",
-        rows[home_row]
-    );
+        .position(|row| row.starts_with("mba22"))
+        .expect("home (origin) row present in slot 0");
 
     // --- #66: the hub's OWN workspace (alpha) folds into the spoke's spaces
     // list as a remote-only project row. Clicking it lands HOME (the spoke

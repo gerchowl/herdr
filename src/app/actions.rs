@@ -864,6 +864,47 @@ impl AppState {
             .collect()
     }
 
+    /// Machine-INDEPENDENT sort identity per workspace (#85): the resolved
+    /// project key where available (shared across the fleet -- origin URLs),
+    /// else the local family key. Sections sort by this so the sidebar order
+    /// is identical on every server, instead of each server's storage order.
+    pub(crate) fn project_section_sort_ids(&self) -> Vec<Option<String>> {
+        let families: Vec<Option<&str>> = self
+            .workspaces
+            .iter()
+            .map(|ws| ws.repo_group_key())
+            .collect();
+        let mut project_of_family = std::collections::HashMap::<&str, &str>::new();
+        for ws in &self.workspaces {
+            let Some(space) = ws.git_space() else {
+                continue;
+            };
+            if space.project_key.starts_with("dir:") {
+                continue;
+            }
+            project_of_family
+                .entry(space.key.as_str())
+                .or_insert(space.project_key.as_str());
+            if let Some(membership) = ws.worktree_space() {
+                project_of_family
+                    .entry(membership.key.as_str())
+                    .or_insert(space.project_key.as_str());
+            }
+        }
+        families
+            .iter()
+            .map(|family| {
+                family.map(|family| {
+                    project_of_family
+                        .get(family)
+                        .copied()
+                        .unwrap_or(family)
+                        .to_ascii_lowercase()
+                })
+            })
+            .collect()
+    }
+
     /// The section key of one workspace's project group, if it has one.
     pub(crate) fn project_section_key(&self, ws_idx: usize) -> Option<String> {
         self.project_section_keys().into_iter().nth(ws_idx)?

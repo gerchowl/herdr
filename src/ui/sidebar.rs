@@ -581,10 +581,27 @@ pub(crate) fn workspace_list_entries(app: &AppState) -> Vec<WorkspaceListEntry> 
     };
     let active_group = visible_group_idx.and_then(|idx| section_keys.get(idx).cloned().flatten());
 
+    // Fleet-stable section order (#85): sections sort by their
+    // machine-independent identity (project key, alphabetical), so the list
+    // reads the same on every server. Members keep storage order within a
+    // section (stable sort by index); identity-less rows sort by name so
+    // pending probes hold a deterministic spot; misc still trails.
+    let sort_ids = app.project_section_sort_ids();
+    let mut order: Vec<usize> = (0..app.workspaces.len()).collect();
+    order.sort_by_cached_key(|&ws_idx| {
+        (
+            sort_ids[ws_idx]
+                .clone()
+                .unwrap_or_else(|| app.workspaces[ws_idx].display_name().to_ascii_lowercase()),
+            ws_idx,
+        )
+    });
+
     let mut emitted_groups = std::collections::HashSet::<&str>::new();
     let mut entries = Vec::new();
     let mut misc = Vec::new();
-    for (ws_idx, ws) in app.workspaces.iter().enumerate() {
+    for ws_idx in order {
+        let ws = &app.workspaces[ws_idx];
         let Some(key) = section_keys[ws_idx].as_deref() else {
             if ws.git_identity_pending() {
                 // Pending probe: hold position among the git sections.
@@ -1462,8 +1479,19 @@ pub(crate) fn workspace_drop_indicator_row(
         return Some(row);
     }
 
-    if let Some(card) = cards.iter().find(|card| card.ws_idx == insert_idx) {
-        return card.rect.y.checked_sub(1).filter(|y| *y < list_bottom);
+    if let Some(pos) = cards.iter().position(|card| card.ws_idx == insert_idx) {
+        // An indented target sits inside its group block (#85: visual order
+        // no longer tracks storage order) -- clamp to the slot above the
+        // group's leader so the indicator never lands inside a group.
+        let mut anchor = pos;
+        while anchor > 0 && cards[anchor].indented {
+            anchor -= 1;
+        }
+        return cards[anchor]
+            .rect
+            .y
+            .checked_sub(1)
+            .filter(|y| *y < list_bottom);
     }
 
     None
@@ -5017,7 +5045,7 @@ mod tests {
 
         assert!(headers.is_empty());
         assert_eq!(cards.len(), 1);
-        assert_eq!(cards[0].ws_idx, 2);
+        assert_eq!(cards[0].ws_idx, 0);
     }
 
     #[test]
@@ -5084,16 +5112,16 @@ mod tests {
             workspace_list_entries(&app),
             vec![
                 WorkspaceListEntry::Workspace {
+                    ws_idx: 1,
+                    indented: false,
+                },
+                WorkspaceListEntry::Workspace {
                     ws_idx: 0,
                     indented: false,
                 },
                 WorkspaceListEntry::Workspace {
                     ws_idx: 2,
                     indented: true,
-                },
-                WorkspaceListEntry::Workspace {
-                    ws_idx: 1,
-                    indented: false,
                 },
             ]
         );
@@ -5404,11 +5432,11 @@ mod tests {
             workspace_list_entries(&app),
             vec![
                 WorkspaceListEntry::Workspace {
-                    ws_idx: 1,
+                    ws_idx: 2,
                     indented: false,
                 },
                 WorkspaceListEntry::Workspace {
-                    ws_idx: 2,
+                    ws_idx: 1,
                     indented: false,
                 },
                 WorkspaceListEntry::Workspace {
@@ -5515,11 +5543,11 @@ mod tests {
             workspace_list_entries(&app),
             vec![
                 WorkspaceListEntry::Workspace {
-                    ws_idx: 0,
+                    ws_idx: 1,
                     indented: false,
                 },
                 WorkspaceListEntry::Workspace {
-                    ws_idx: 1,
+                    ws_idx: 0,
                     indented: false,
                 },
             ]
