@@ -340,6 +340,80 @@ fn pause_subscription_stops_frames_and_resume_redraws() {
     cleanup_spawned_herdr(spawned, base);
 }
 
+/// ClientMessage::Resize is positional variant 3. Re-asserting geometry to a
+/// just-activated slot is exactly this message.
+fn send_resize(stream: &mut UnixStream, cols: u16, rows: u16) -> std::io::Result<()> {
+    let mut payload = encode_varint_u32(3); // variant 3 = Resize
+    payload.extend_from_slice(&encode_varint_u16(cols));
+    payload.extend_from_slice(&encode_varint_u16(rows));
+    payload.extend_from_slice(&encode_varint_u32(0)); // cell_width_px
+    payload.extend_from_slice(&encode_varint_u32(0)); // cell_height_px
+    stream.write_all(&frame_message(&payload))?;
+    stream.flush()
+}
+
+#[test]
+fn resume_reasserts_geometry_so_panes_render_at_new_width() {
+    // #77 layer 1: a server switch resumes a WARM slot whose server only learned
+    // this client's size at dial time. On switch the client re-asserts its true
+    // geometry with a Resize; the server must then lay every pane out at the new
+    // width. This models that sequence end-to-end: dial-time width A, pause
+    // (warm), the terminal grows to width B, then resume + Resize(B), and the
+    // very next rendered frame must come back at width B — not the stale A.
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+
+    let spawned = spawn_server(&config_home, &runtime_dir, &api_socket, &client_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_file(&client_socket, Duration::from_secs(10));
+
+    // Dial-time width A = 80 (the size the warm slot's server first learned).
+    let mut stream = UnixStream::connect(&client_socket).expect("should connect to client socket");
+    let (version, error) =
+        client_handshake(&mut stream, 18, 80, 24).expect("handshake should succeed");
+    assert_eq!(version, 18);
+    assert!(error.is_none(), "handshake error: {error:?}");
+
+    let baseline = read_next_frame_payload(&mut stream, Duration::from_secs(10))
+        .and_then(|p| decode_frame_payload(&p).map_err(|e| e.to_string()))
+        .expect("active client should receive a frame at width A");
+    assert_eq!(
+        baseline.width, 80,
+        "baseline frame should render at width A"
+    );
+
+    // Become a warm slot: frames pause. The terminal then grows to B = 120 while
+    // paused — the stale-geometry window the bug lived in (the warm server never
+    // saw this resize because it only reached the then-active leg).
+    send_set_frame_subscription(&mut stream, false).expect("pause");
+    support::drain_messages(&mut stream);
+
+    // Switch back: resume, then re-assert geometry to width B. After this the
+    // server must repaint EVERY pane at B; we assert via the frame width, which
+    // is the whole-layout geometry the panes are sized against.
+    send_set_frame_subscription(&mut stream, true).expect("resume");
+    send_resize(&mut stream, 120, 40).expect("re-assert geometry on switch");
+
+    let reasserted = wait_until(Duration::from_secs(5), Duration::from_millis(50), || {
+        match read_next_frame_payload(&mut stream, Duration::from_millis(400)) {
+            Ok(p) => decode_frame_payload(&p)
+                .map(|f| f.width == 120)
+                .unwrap_or(false),
+            Err(_) => false,
+        }
+    });
+    assert!(
+        reasserted,
+        "after resume + geometry re-assert the server must render panes at width B (120)"
+    );
+
+    cleanup_spawned_herdr(spawned, base);
+}
+
 #[test]
 fn client_sees_headless_startup_config_diagnostic() {
     let _lock = test_lock();
