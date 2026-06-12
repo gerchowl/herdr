@@ -13,6 +13,7 @@
 //! - Displays sound/toast notifications forwarded from server
 
 mod input;
+pub(crate) mod slots;
 
 use std::collections::HashSet;
 use std::io::{self, Write as _};
@@ -709,10 +710,19 @@ enum ClientLoopEvent {
     StdinInput(Vec<u8>),
     /// Terminal resize detected.
     Resize(u16, u16, u32, u32),
-    /// Server message received.
-    ServerMessage(ServerMessage),
-    /// Server reader thread exited (connection lost).
-    ServerDisconnected,
+    /// Server message received. Carries the slot key of the reader that read
+    /// it (#65) so the loop can drop messages from a non-active slot and only
+    /// paint/act on the active one.
+    ServerMessage(String, ServerMessage),
+    /// Server reader thread exited (connection lost). Carries the slot key (#65)
+    /// so a warm slot's death demotes that slot silently while only the active
+    /// slot's death tears the session down.
+    ServerDisconnected(String),
+    /// A background warm-all dial succeeded: this slot now holds a paused
+    /// connection (#65). Carries the slot key and the writable stream half.
+    SlotWarmed(String, UnixStream),
+    /// A background warm-all dial failed: keep the slot cold with backoff.
+    SlotDialFailed(String),
     /// Timer tick.
     Timer,
 }
@@ -1320,24 +1330,31 @@ async fn run_client_loop(
         resize_poll_loop(resize_tx, cols, rows, kitty_graphics_enabled, &resize_quit);
     });
 
-    // Spawn the server reader thread (blocking reads from the socket).
+    let max_frame_size = if kitty_graphics_enabled {
+        MAX_GRAPHICS_FRAME_SIZE
+    } else {
+        MAX_FRAME_SIZE
+    };
+
+    // Spawn the active-slot reader thread (blocking reads from the socket).
     // Clone the stream's file descriptor so we can read from a blocking stream.
-    let server_read_quit = should_quit.clone();
-    let server_read_tx = event_tx.clone();
-    let read_stream = stream.try_clone().map_err(ClientError::ConnectionFailed)?;
-    std::thread::spawn(move || {
-        let max_frame_size = if kitty_graphics_enabled {
-            MAX_GRAPHICS_FRAME_SIZE
-        } else {
-            MAX_FRAME_SIZE
-        };
-        server_reader_thread(
-            read_stream,
-            server_read_tx,
-            &server_read_quit,
-            max_frame_size,
-        );
-    });
+    // The reader carries its OWN quit flag (in addition to `should_quit`) so a
+    // connection-slots flip can retire just this reader and bind a new one to
+    // the slot that became active, without tearing the whole loop down (#65).
+    let mut active_reader_quit = Arc::new(AtomicBool::new(false));
+    // The active slot's key. Reader threads tag every event with their slot
+    // key so the loop can tell a frame/disconnect from the active slot apart
+    // from one from a warm (background) slot (#65). When slots are disabled
+    // this is just the home sentinel and every event matches.
+    let mut active_slot_key = active_slot_key();
+    spawn_slot_reader(
+        active_slot_key.clone(),
+        stream.try_clone().map_err(ClientError::ConnectionFailed)?,
+        event_tx.clone(),
+        should_quit.clone(),
+        active_reader_quit.clone(),
+        max_frame_size,
+    );
 
     // Use the original stream for writing (blocking is fine since we write
     // from the async loop).
@@ -1345,6 +1362,13 @@ async fn run_client_loop(
     write_stream
         .set_nonblocking(false)
         .map_err(ClientError::ConnectionFailed)?;
+
+    // Connection slots (#65): when enabled, build the slot manager over the
+    // active connection and background-dial the warm-all fleet. The active
+    // slot's write stream is `write_stream`; a warm switch flips it in process
+    // without releasing the terminal. When disabled, `slot_manager` is None and
+    // the legacy exit-and-relaunch leg path drives every switch.
+    let mut slot_manager = build_slot_manager(&write_stream, max_frame_size);
 
     // Bytes consumed from stdin during the pre-handshake theme capture:
     // forward them as the session's first input so no keystroke is lost. The
@@ -1355,6 +1379,14 @@ async fn run_client_loop(
             return Err(ClientError::ConnectionLost(e));
         }
     }
+
+    // Connection-slots warm-all dialing bookkeeping (#65): keys of slots a
+    // background dial is currently in flight for, so the periodic dialer never
+    // double-dials. The dialer fires on the timer tick.
+    let mut slot_dials_in_flight: HashSet<String> = HashSet::new();
+    let mut last_slot_dial_sweep = Instant::now()
+        .checked_sub(Duration::from_secs(60))
+        .unwrap_or_else(Instant::now);
 
     // Main event loop.
     let mut stdin_closed = false;
@@ -1464,92 +1496,262 @@ async fn run_client_loop(
                     return Err(ClientError::ConnectionLost(e));
                 }
             }
-            ClientLoopEvent::ServerMessage(msg) => match msg {
-                ServerMessage::Frame(frame_data) => {
-                    let encoded = state.blit_encoder.encode(&frame_data, false);
-                    let mut stdout = io::stdout();
-                    let graphics = if state.kitty_graphics_enabled {
-                        frame_data.graphics.as_slice()
-                    } else {
-                        &[]
-                    };
-                    let _ =
-                        write_encoded_frame_with_graphics(&mut stdout, &encoded.bytes, graphics);
-                    let _ = stdout.flush();
-                    state.blit_encoder.commit(frame_data, encoded);
-                }
-                ServerMessage::Terminal(frame) => {
-                    if state.kitty_graphics_enabled && contains_kitty_graphics_bytes(&frame.bytes) {
-                        record_received_kitty_graphics(&frame.bytes);
+            ClientLoopEvent::ServerMessage(slot_key, msg) => {
+                // Apply-time slot check (#65): a frame or message from a slot
+                // that is no longer the active one (a queued frame from the old
+                // reader after a flip, or a warm slot that never paused in time)
+                // must not paint over or act on the active session. Drop it. The
+                // sole exceptions are lifecycle signals from a NON-active slot,
+                // which demote that slot silently instead of being dropped.
+                let is_shutdown = matches!(msg, ServerMessage::ServerShutdown { .. });
+                match slots::route_slot_event(&slot_key, &active_slot_key, is_shutdown) {
+                    slots::SlotRouting::Apply => {}
+                    slots::SlotRouting::DemoteDead => {
+                        // A warm slot's server is going away: demote it to cold
+                        // silently (the #65 ghost). The active session is
+                        // untouched; a later switch re-dials it.
+                        if let Some(manager) = slot_manager.as_mut() {
+                            manager.handle_dead(&slots::SlotTarget::from_key(&slot_key));
+                        }
+                        debug!(slot = %slot_key, "warm slot server shut down; demoted silently");
+                        continue;
                     }
-                    let mut stdout = io::stdout();
-                    let _ = stdout.write_all(&frame.bytes);
-                    let _ = stdout.flush();
+                    slots::SlotRouting::Drop => {
+                        // Stale frame or other non-active-slot traffic: drop.
+                        debug!(slot = %slot_key, "dropping message from non-active slot");
+                        continue;
+                    }
                 }
-                ServerMessage::Graphics { bytes } => {
-                    if state.kitty_graphics_enabled {
-                        record_received_kitty_graphics(&bytes);
+                match msg {
+                    ServerMessage::Frame(frame_data) => {
+                        let encoded = state.blit_encoder.encode(&frame_data, false);
                         let mut stdout = io::stdout();
-                        let _ = stdout.write_all(&bytes);
+                        let graphics = if state.kitty_graphics_enabled {
+                            frame_data.graphics.as_slice()
+                        } else {
+                            &[]
+                        };
+                        let _ = write_encoded_frame_with_graphics(
+                            &mut stdout,
+                            &encoded.bytes,
+                            graphics,
+                        );
+                        let _ = stdout.flush();
+                        state.blit_encoder.commit(frame_data, encoded);
+                    }
+                    ServerMessage::Terminal(frame) => {
+                        if state.kitty_graphics_enabled
+                            && contains_kitty_graphics_bytes(&frame.bytes)
+                        {
+                            record_received_kitty_graphics(&frame.bytes);
+                        }
+                        let mut stdout = io::stdout();
+                        let _ = stdout.write_all(&frame.bytes);
                         let _ = stdout.flush();
                     }
-                }
-                ServerMessage::ServerShutdown { reason } => {
-                    return Err(ClientError::ServerShutdown { reason });
-                }
-                ServerMessage::SwitchServer {
-                    ssh_target,
-                    fleet,
-                    focus_workspace,
-                } => {
-                    // Record the target for the launcher's attach loop, then
-                    // exit exactly like a detach. The outermost herdr process
-                    // reads the file and starts the next leg.
-                    if record_switch_target(&ssh_target, fleet.as_ref(), focus_workspace.as_deref())
-                    {
-                        // Hold the alternate screen across the handoff so the
-                        // host shell never flashes between legs (#63).
-                        SWITCH_HANDOFF_PENDING.store(true, Ordering::Release);
-                        return Err(ClientError::ServerShutdown {
-                            reason: Some("switching".to_string()),
-                        });
+                    ServerMessage::Graphics { bytes } => {
+                        if state.kitty_graphics_enabled {
+                            record_received_kitty_graphics(&bytes);
+                            let mut stdout = io::stdout();
+                            let _ = stdout.write_all(&bytes);
+                            let _ = stdout.flush();
+                        }
                     }
-                    // No launcher to chain into (e.g. bare `herdr client`):
-                    // stay attached and let the user switch manually.
-                    eprintln!("herdr: server requested switch to {ssh_target}, but no launcher is present (HERDR_SWITCH_FILE unset)");
-                }
-                ServerMessage::Notify { kind, message } => {
-                    handle_notify(kind, &message, &state.sound_config);
-                }
-                ServerMessage::Clipboard { data } => {
-                    forward_clipboard(&data);
-                    let _ = io::stdout().flush();
-                }
-                ServerMessage::ReloadSoundConfig => {
-                    reload_local_client_config(
-                        &mut state.sound_config,
-                        &mut state.redraw_on_focus_gained,
-                    );
-                }
-                ServerMessage::MouseCapture { enabled } => {
-                    let desired = enabled;
-                    if desired != state.mouse_capture_active {
-                        set_mouse_capture(desired).map_err(ClientError::ConnectionFailed)?;
-                        state.mouse_capture_active = desired;
+                    ServerMessage::ServerShutdown { reason } => {
+                        return Err(ClientError::ServerShutdown { reason });
+                    }
+                    ServerMessage::SwitchServer {
+                        ssh_target,
+                        fleet,
+                        focus_workspace,
+                    } => {
+                        // Connection slots (#65): if the target is a WARM slot, flip
+                        // to it in process — pause the old slot, resume the new one
+                        // with a full redraw, rebind input — without ever releasing
+                        // the terminal or exiting. The launcher's switch file is not
+                        // written, so no relaunch leg spawns.
+                        if let Some(manager) = slot_manager.as_mut() {
+                            let target = slots::SlotTarget::from_key(&ssh_target);
+                            match manager.flip_to(&target) {
+                                Ok(Some(new_stream)) => {
+                                    // Retire the old active reader and bind a new one
+                                    // to the slot that just became active.
+                                    //
+                                    // The old reader stays blocked in read_message
+                                    // and only checks its per-slot quit flag at loop
+                                    // top — but the old slot is now PAUSED, so no new
+                                    // frames arrive to unblock it, and it ghosts
+                                    // harmlessly. We deliberately do NOT shutdown the
+                                    // old fd's read half: that fd is a clone sharing
+                                    // the underlying socket with the warm slot we
+                                    // keep for a switch-BACK flip, and shutting it
+                                    // down would kill that paused transport. Stale
+                                    // frames already in flight are handled at apply
+                                    // time: the new active_slot_key makes the loop
+                                    // drop any Frame tagged with the old slot's key,
+                                    // so nothing from the old reader paints over the
+                                    // new slot's redraw (#65, blocker 2).
+                                    active_reader_quit.store(true, Ordering::Release);
+                                    let new_quit = Arc::new(AtomicBool::new(false));
+                                    if let Ok(read_clone) = new_stream.try_clone() {
+                                        let new_key = target.key().to_string();
+                                        spawn_slot_reader(
+                                            new_key.clone(),
+                                            read_clone,
+                                            event_tx.clone(),
+                                            should_quit.clone(),
+                                            new_quit.clone(),
+                                            max_frame_size,
+                                        );
+                                        active_reader_quit = new_quit;
+                                        // Flip the active-slot tag BEFORE any further
+                                        // events are applied, so queued frames from
+                                        // the old slot are dropped from here on.
+                                        active_slot_key = new_key;
+                                        write_stream = new_stream;
+                                        let _ = write_stream.set_nonblocking(false);
+                                        // Resume already asked the server for a full
+                                        // redraw; nudge the host surface so the
+                                        // repaint lands cleanly over the old frame.
+                                        state.request_full_redraw();
+                                        continue;
+                                    }
+                                }
+                                Ok(None) => {
+                                    // Cold/unknown/already-active: fall through to
+                                    // the legacy relaunch-leg path below.
+                                }
+                                Err(err) => {
+                                    warn!(err = %err, target = %ssh_target, "slot flip failed; demoting and falling back to dial");
+                                    manager.handle_dead(&target);
+                                }
+                            }
+                        }
+                        // Record the target for the launcher's attach loop, then
+                        // exit exactly like a detach. The outermost herdr process
+                        // reads the file and starts the next leg.
+                        if record_switch_target(
+                            &ssh_target,
+                            fleet.as_ref(),
+                            focus_workspace.as_deref(),
+                        ) {
+                            // Hold the alternate screen across the handoff so the
+                            // host shell never flashes between legs (#63).
+                            SWITCH_HANDOFF_PENDING.store(true, Ordering::Release);
+                            return Err(ClientError::ServerShutdown {
+                                reason: Some("switching".to_string()),
+                            });
+                        }
+                        // No launcher to chain into (e.g. bare `herdr client`):
+                        // stay attached and let the user switch manually.
+                        eprintln!("herdr: server requested switch to {ssh_target}, but no launcher is present (HERDR_SWITCH_FILE unset)");
+                    }
+                    ServerMessage::Notify { kind, message } => {
+                        handle_notify(kind, &message, &state.sound_config);
+                    }
+                    ServerMessage::Clipboard { data } => {
+                        forward_clipboard(&data);
+                        let _ = io::stdout().flush();
+                    }
+                    ServerMessage::ReloadSoundConfig => {
+                        reload_local_client_config(
+                            &mut state.sound_config,
+                            &mut state.redraw_on_focus_gained,
+                        );
+                    }
+                    ServerMessage::MouseCapture { enabled } => {
+                        let desired = enabled;
+                        if desired != state.mouse_capture_active {
+                            set_mouse_capture(desired).map_err(ClientError::ConnectionFailed)?;
+                            state.mouse_capture_active = desired;
+                        }
+                    }
+                    ServerMessage::Welcome { .. } => {
+                        debug!("received unexpected Welcome in main loop");
                     }
                 }
-                ServerMessage::Welcome { .. } => {
-                    debug!("received unexpected Welcome in main loop");
+            }
+            ClientLoopEvent::ServerDisconnected(slot_key) => {
+                // Only the ACTIVE slot's death tears the session down with
+                // today's ConnectionLost semantics (#65). A warm slot dying is
+                // a silent demote — the ghost the design intends; the active
+                // session keeps painting.
+                match slots::route_slot_event(&slot_key, &active_slot_key, true) {
+                    slots::SlotRouting::Apply => {
+                        return Err(ClientError::ConnectionLost(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "server closed connection",
+                        )));
+                    }
+                    // A reader disconnect is always a lifecycle death, so a
+                    // non-active slot routes here (never to Drop).
+                    slots::SlotRouting::DemoteDead | slots::SlotRouting::Drop => {
+                        if let Some(manager) = slot_manager.as_mut() {
+                            manager.handle_dead(&slots::SlotTarget::from_key(&slot_key));
+                        }
+                        debug!(slot = %slot_key, "warm slot disconnected; demoted silently");
+                        continue;
+                    }
                 }
-            },
-            ClientLoopEvent::ServerDisconnected => {
-                return Err(ClientError::ConnectionLost(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "server closed connection",
-                )));
+            }
+            ClientLoopEvent::SlotWarmed(key, stream) => {
+                slot_dials_in_flight.remove(&key);
+                if let Some(manager) = slot_manager.as_mut() {
+                    let target = slots::SlotTarget::from_key(&key);
+                    let conn = slots::SlotConnection {
+                        target,
+                        write_stream: stream,
+                    };
+                    if let Err(err) = manager.add_warm(conn) {
+                        debug!(target = %key, err = %err, "failed to pause newly warmed slot");
+                    } else {
+                        debug!(target = %key, "slot warmed and paused");
+                    }
+                }
+            }
+            ClientLoopEvent::SlotDialFailed(key) => {
+                slot_dials_in_flight.remove(&key);
+                if let Some(manager) = slot_manager.as_mut() {
+                    manager
+                        .registry
+                        .mark_dial_failed(&slots::SlotTarget::from_key(&key), Instant::now());
+                }
             }
             ClientLoopEvent::Timer => {
-                // Check if we should quit.
+                // Warm-all dial sweep (#65): periodically dial the registry's
+                // pending cold slots so a later switch to any fleet server is an
+                // instant flip. Throttled; in-flight slots are skipped.
+                if let Some(manager) = slot_manager.as_mut() {
+                    let now = Instant::now();
+                    if now.duration_since(last_slot_dial_sweep) >= Duration::from_secs(2) {
+                        last_slot_dial_sweep = now;
+                        let geometry = (state.reported_size.0, state.reported_size.1, 0, 0);
+                        for effect in manager.registry.pending_dials(now) {
+                            if let slots::SlotEffect::Dial(target) = effect {
+                                // Only attempt targets with a REAL reachable
+                                // socket (#65, blocker 3): home and the active
+                                // leg's bridge. An additional peer has no bridge
+                                // in stage 1 (#75) — leave it cold-by-design so a
+                                // switch falls back to the relaunch leg, rather
+                                // than dialing a path that never exists.
+                                let Some(socket_path) = slot_socket_path(&target) else {
+                                    continue;
+                                };
+                                let key = target.key().to_string();
+                                if !slot_dials_in_flight.insert(key) {
+                                    continue;
+                                }
+                                spawn_warm_dial(
+                                    target.clone(),
+                                    socket_path,
+                                    geometry,
+                                    negotiated_encoding,
+                                    event_tx.clone(),
+                                );
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -1566,12 +1768,187 @@ async fn run_client_loop(
 // Server reader thread
 // ---------------------------------------------------------------------------
 
+/// Spawn the reader thread for one slot's stream. The reader stops when either
+/// the loop-wide `should_quit` or this slot's `reader_quit` flips — a
+/// connection-slots flip retires the old active reader via `reader_quit` while
+/// the loop keeps running (#65).
+fn spawn_slot_reader(
+    slot_key: String,
+    stream: UnixStream,
+    event_tx: tokio::sync::mpsc::Sender<ClientLoopEvent>,
+    should_quit: Arc<AtomicBool>,
+    reader_quit: Arc<AtomicBool>,
+    max_frame_size: usize,
+) {
+    std::thread::spawn(move || {
+        let combined = CombinedQuit {
+            global: should_quit,
+            slot: reader_quit,
+        };
+        server_reader_thread(slot_key, stream, event_tx, &combined, max_frame_size);
+    });
+}
+
+/// A reader quits when EITHER its loop-wide flag or its per-slot flag is set.
+struct CombinedQuit {
+    global: Arc<AtomicBool>,
+    slot: Arc<AtomicBool>,
+}
+
+impl CombinedQuit {
+    fn load(&self, order: Ordering) -> bool {
+        self.global.load(order) || self.slot.load(order)
+    }
+}
+
+/// The active slot's target for this client leg: the ssh target carried by a
+/// remote leg, or home for a local attach. The whole loop keys off this so the
+/// initial reader, the slot manager, and the active-slot tagging agree (#65).
+fn active_slot_target() -> slots::SlotTarget {
+    std::env::var(crate::remote::ACTIVE_SSH_TARGET_ENV_VAR)
+        .ok()
+        .filter(|t| !t.is_empty())
+        .map(slots::SlotTarget::Ssh)
+        .unwrap_or(slots::SlotTarget::Home)
+}
+
+/// The active slot's key string (the home sentinel or the ssh target).
+fn active_slot_key() -> String {
+    active_slot_target().key().to_string()
+}
+
+/// Build the connection-slots manager when `[slots] enabled`, owning the active
+/// connection (a clone of the active write stream) and the warm-all target
+/// list derived from config peers plus the carried fleet snapshot. Returns None
+/// when slots are disabled — the legacy leg path then drives switches.
+fn build_slot_manager(
+    active_write_stream: &UnixStream,
+    _max_frame_size: usize,
+) -> Option<slots::SlotManager> {
+    let loaded = crate::config::Config::load();
+    let slots_config = loaded.config.slots.clone();
+    if !slots_config.enabled {
+        return None;
+    }
+
+    // The active slot is whatever leg launched this client: home for a local
+    // attach, the ssh target for a remote leg (carried in REATTACH/remote env).
+    let active_target = active_slot_target();
+
+    // Warm-all targets: locally-configured peers (a hub knows its fleet) plus
+    // the carried snapshot's peers and origin (a spoke learns its fleet from
+    // the down-gossip, #73). Home is always included.
+    let config_peers: Vec<String> = loaded
+        .config
+        .peers
+        .iter()
+        .map(|p| p.ssh_target().to_string())
+        .collect();
+    let mut carried: Vec<String> = Vec::new();
+    if let Some(fleet) = carried_fleet_snapshot() {
+        carried.extend(fleet.peers.iter().map(|p| p.ssh_target.clone()));
+        if let Some(origin) = fleet.origin_summary.as_ref() {
+            carried.push(origin.ssh_target.clone());
+        }
+    }
+    let targets = slots::warm_all_targets(&config_peers, &carried, slots_config.max);
+
+    let active_conn = slots::SlotConnection {
+        target: active_target,
+        write_stream: active_write_stream.try_clone().ok()?,
+    };
+    Some(slots::SlotManager::new(
+        active_conn,
+        targets,
+        slots_config.max,
+    ))
+}
+
+/// Background-dial a warm slot: connect its socket and complete the handshake
+/// so the server holds a session, then report the writable stream back to the
+/// loop (which pauses it). Runs on a detached thread — a slow or failing dial
+/// must never stall the active paint path (#65). Stage 1 warms slots whose
+/// transport is reachable as a local socket: home (the local client socket) and
+/// any peer whose ssh-stdio bridge socket is already live; a cold peer with no
+/// bridge stays cold and a switch to it falls back to the relaunch leg.
+fn spawn_warm_dial(
+    target: slots::SlotTarget,
+    socket_path: std::path::PathBuf,
+    geometry: (u16, u16, u32, u32),
+    requested_encoding: RenderEncoding,
+    event_tx: tokio::sync::mpsc::Sender<ClientLoopEvent>,
+) {
+    std::thread::spawn(move || {
+        let key = target.key().to_string();
+        let (cols, rows, cell_width_px, cell_height_px) = geometry;
+        let dialed = (|| -> Result<UnixStream, ClientError> {
+            let mut stream =
+                UnixStream::connect(&socket_path).map_err(ClientError::ConnectionFailed)?;
+            // A warm slot is a full app client, like the active one. It carries
+            // no host theme (the active slot owns the host terminal) and no
+            // notice; the handshake just establishes a paused session.
+            do_handshake(
+                &mut stream,
+                cols,
+                rows,
+                cell_width_px,
+                cell_height_px,
+                requested_encoding,
+                false,
+                None,
+            )?;
+            Ok(stream)
+        })();
+        let event = match dialed {
+            Ok(stream) => ClientLoopEvent::SlotWarmed(key, stream),
+            Err(err) => {
+                debug!(target = %key, err = %err, "warm-all dial failed; slot stays cold");
+                ClientLoopEvent::SlotDialFailed(key)
+            }
+        };
+        let _ = event_tx.blocking_send(event);
+    });
+}
+
+/// Socket path for a slot target with a REAL, already-reachable transport, or
+/// `None` when the target has no live socket yet (#65, blocker 3).
+///
+/// - Home: the local client socket — always reachable.
+/// - The ACTIVE ssh leg: its ssh-stdio bridge socket, created by the LAUNCHER
+///   (`run_remote`) and handed down explicitly via `HERDR_ACTIVE_BRIDGE_SOCKET`.
+///   The client is a separate child, so it CANNOT recompute that path from
+///   `local_forward_socket_path` (which keys on `std::process::id()` — the
+///   launcher's pid, never the client's). Recomputing it was the bug: every ssh
+///   warm-dial missed and the slot stayed cold.
+/// - Any OTHER ssh peer: there is no bridge for it in stage 1, so it has no
+///   reachable socket. It returns `None` and stays cold-by-design; a switch to
+///   it falls through to the exit-and-relaunch leg that bootstraps the bridge.
+///   Warming additional peers over their own bridges is stage-2 scope (#75).
+fn slot_socket_path(target: &slots::SlotTarget) -> Option<std::path::PathBuf> {
+    match target {
+        slots::SlotTarget::Home => Some(crate::server::socket_paths::client_socket_path()),
+        slots::SlotTarget::Ssh(t) => {
+            // Only the active leg's bridge socket is live; match it by the ssh
+            // target the launcher tagged this client with.
+            let active = std::env::var(crate::remote::ACTIVE_SSH_TARGET_ENV_VAR).ok();
+            if active.as_deref() == Some(t.as_str()) {
+                std::env::var_os(crate::remote::ACTIVE_BRIDGE_SOCKET_ENV_VAR)
+                    .map(std::path::PathBuf::from)
+                    .filter(|p| !p.as_os_str().is_empty())
+            } else {
+                None
+            }
+        }
+    }
+}
+
 /// Blocking thread that reads ServerMessages from the server and sends them
 /// to the main event loop.
 fn server_reader_thread(
+    slot_key: String,
     mut stream: UnixStream,
     event_tx: tokio::sync::mpsc::Sender<ClientLoopEvent>,
-    should_quit: &Arc<AtomicBool>,
+    should_quit: &CombinedQuit,
     max_frame_size: usize,
 ) {
     // Ensure the read stream is in blocking mode to avoid WouldBlock errors
@@ -1579,7 +1956,7 @@ fn server_reader_thread(
     // blocking after handshake, but we enforce it here as a safety measure.
     if stream.set_nonblocking(false).is_err() {
         // If we can't set blocking mode, the stream is likely broken.
-        let _ = event_tx.blocking_send(ClientLoopEvent::ServerDisconnected);
+        let _ = event_tx.blocking_send(ClientLoopEvent::ServerDisconnected(slot_key));
         return;
     }
 
@@ -1591,7 +1968,7 @@ fn server_reader_thread(
         match protocol::read_message(&mut stream, max_frame_size) {
             Ok(msg) => {
                 if event_tx
-                    .blocking_send(ClientLoopEvent::ServerMessage(msg))
+                    .blocking_send(ClientLoopEvent::ServerMessage(slot_key.clone(), msg))
                     .is_err()
                 {
                     break; // Main loop gone.
@@ -1599,7 +1976,7 @@ fn server_reader_thread(
             }
             Err(protocol::FramingError::UnexpectedEof) => {
                 // Server closed connection.
-                let _ = event_tx.blocking_send(ClientLoopEvent::ServerDisconnected);
+                let _ = event_tx.blocking_send(ClientLoopEvent::ServerDisconnected(slot_key));
                 break;
             }
             Err(protocol::FramingError::Io(err)) if err.kind() == io::ErrorKind::WouldBlock => {
@@ -1610,7 +1987,7 @@ fn server_reader_thread(
             }
             Err(err) => {
                 warn!(err = %err, "server read error");
-                let _ = event_tx.blocking_send(ClientLoopEvent::ServerDisconnected);
+                let _ = event_tx.blocking_send(ClientLoopEvent::ServerDisconnected(slot_key));
                 break;
             }
         }

@@ -280,6 +280,18 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # herdr from adding its own.
 # manage_ssh_config = true
 
+[slots]
+# Connection slots (#65): a multi-connection client that holds one framed
+# connection per fleet server and FLIPS between them in process on a switch —
+# the terminal is never released, so warm switches are instant with no blip and
+# no relaunch. At start the client background-dials every configured peer (plus
+# the carried fleet snapshot on a spoke); home is always warm. Down servers
+# ghost as today and are gently re-dialed. When disabled (default), the client
+# keeps the exit-and-relaunch leg model.
+# enabled = false
+# Generous sanity cap on concurrently warmed slots (incl. home + active).
+# max = 8
+
 [experimental]
 # Allow launching herdr from inside a herdr-managed pane.
 # allow_nested = false

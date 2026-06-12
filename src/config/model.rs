@@ -271,6 +271,7 @@ pub struct Config {
     pub advanced: AdvancedConfig,
     pub experimental: ExperimentalConfig,
     pub remote: RemoteConfig,
+    pub slots: SlotsConfig,
     pub peers: Vec<PeerConfig>,
 }
 
@@ -601,6 +602,32 @@ impl Default for RemoteConfig {
     fn default() -> Self {
         Self {
             manage_ssh_config: true,
+        }
+    }
+}
+
+/// Connection slots (#65): the multi-connection client warms one framed
+/// connection per fleet server in the background and flips between them in
+/// process on a switch, instead of exiting and relaunching an attach leg.
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(default)]
+pub struct SlotsConfig {
+    /// Master switch for the slots client. Default false: the client keeps the
+    /// exit-and-relaunch leg model until the fork owner opts in (lockstep
+    /// deploy, then dogfood). When true, the active server's fleet (config
+    /// peers plus the carried snapshot, home always warm) defines the slots.
+    pub enabled: bool,
+    /// Generous sanity cap on the number of concurrently warmed slots,
+    /// including home and the active slot. Far above a personal fleet; only a
+    /// large-fleet guard.
+    pub max: usize,
+}
+
+impl Default for SlotsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max: 8,
         }
     }
 }

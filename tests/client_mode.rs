@@ -15,8 +15,9 @@ use serde::Deserialize;
 use support::{
     cleanup_test_base, client_handshake, encode_live_handoff_refusal, encode_varint_u16,
     encode_varint_u32, frame_message, read_server_message, register_runtime_dir,
-    register_spawned_herdr_pid, unregister_spawned_herdr_pid, wait_for_file,
-    wait_for_message_variant, wait_for_socket, wait_until,
+    register_spawned_herdr_pid, send_input, send_set_frame_subscription,
+    unregister_spawned_herdr_pid, wait_for_file, wait_for_message_variant, wait_for_socket,
+    wait_until,
 };
 
 fn unique_test_dir() -> PathBuf {
@@ -274,8 +275,8 @@ fn client_connects_and_receives_frame() {
     // Connect and handshake.
     let mut stream = UnixStream::connect(&client_socket).expect("should connect to client socket");
     let (version, error) =
-        client_handshake(&mut stream, 16, 80, 24).expect("handshake should succeed");
-    assert_eq!(version, 16, "server should report protocol version 16");
+        client_handshake(&mut stream, 18, 80, 24).expect("handshake should succeed");
+    assert_eq!(version, 18, "server should report protocol version 18");
     assert!(
         error.is_none(),
         "handshake should not have error: {:?}",
@@ -284,6 +285,57 @@ fn client_connects_and_receives_frame() {
 
     read_next_frame_payload(&mut stream, Duration::from_secs(10))
         .expect("should receive a frame from server");
+
+    cleanup_spawned_herdr(spawned, base);
+}
+
+#[test]
+fn pause_subscription_stops_frames_and_resume_redraws() {
+    // Connection slots (#65): a warm slot pauses frames with
+    // SetFrameSubscription { enabled: false }; the server stops streaming to it.
+    // Resuming (enabled: true) triggers a full redraw so the slot repaints.
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+
+    let spawned = spawn_server(&config_home, &runtime_dir, &api_socket, &client_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_file(&client_socket, Duration::from_secs(10));
+
+    let mut stream = UnixStream::connect(&client_socket).expect("should connect to client socket");
+    let (version, error) =
+        client_handshake(&mut stream, 18, 80, 24).expect("handshake should succeed");
+    assert_eq!(version, 18);
+    assert!(error.is_none(), "handshake error: {error:?}");
+
+    // Baseline: the active subscription streams frames.
+    read_next_frame_payload(&mut stream, Duration::from_secs(10))
+        .expect("active client should receive a frame");
+
+    // Pause: become a warm slot. Drain any frames already queued, then assert
+    // that fresh input produces NO frame within a window — the server stopped
+    // streaming to this paused client.
+    send_set_frame_subscription(&mut stream, false).expect("pause");
+    support::drain_messages(&mut stream);
+    // Input that on an active client forces a post-input frame.
+    for _ in 0..5 {
+        send_input(&mut stream, b"j").expect("send input");
+        thread::sleep(Duration::from_millis(40));
+    }
+    let got_frame_while_paused =
+        read_next_frame_payload(&mut stream, Duration::from_millis(800)).is_ok();
+    assert!(
+        !got_frame_while_paused,
+        "a paused slot must not receive frames"
+    );
+
+    // Resume: the server sends a full redraw, so a frame arrives again.
+    send_set_frame_subscription(&mut stream, true).expect("resume");
+    read_next_frame_payload(&mut stream, Duration::from_secs(10))
+        .expect("resumed slot should receive a full-redraw frame");
 
     cleanup_spawned_herdr(spawned, base);
 }
@@ -342,8 +394,8 @@ fn client_sees_headless_startup_config_diagnostic() {
 
     let mut stream = UnixStream::connect(&client_socket).expect("should connect to client socket");
     let (version, error) =
-        client_handshake(&mut stream, 16, 80, 24).expect("handshake should succeed");
-    assert_eq!(version, 16);
+        client_handshake(&mut stream, 18, 80, 24).expect("handshake should succeed");
+    assert_eq!(version, 18);
     assert!(error.is_none(), "{:?}", error);
 
     stream
@@ -391,8 +443,8 @@ fn client_input_forwarded_to_pane() {
     // Connect and handshake.
     let mut stream = UnixStream::connect(&client_socket).expect("should connect to client socket");
     let (version, error) =
-        client_handshake(&mut stream, 16, 80, 24).expect("handshake should succeed");
-    assert_eq!(version, 16);
+        client_handshake(&mut stream, 18, 80, 24).expect("handshake should succeed");
+    assert_eq!(version, 18);
     assert!(error.is_none(), "{:?}", error);
 
     // Send an Input message containing "echo hello\n".
@@ -445,8 +497,8 @@ fn client_resize_sends_message() {
     // Connect and handshake.
     let mut stream = UnixStream::connect(&client_socket).expect("should connect to client socket");
     let (version, error) =
-        client_handshake(&mut stream, 16, 80, 24).expect("handshake should succeed");
-    assert_eq!(version, 16);
+        client_handshake(&mut stream, 18, 80, 24).expect("handshake should succeed");
+    assert_eq!(version, 18);
     assert!(error.is_none(), "{:?}", error);
 
     // Drain the initial frame(s).
@@ -504,8 +556,8 @@ fn server_shutdown_sends_message_to_client() {
     // Connect and handshake.
     let mut stream = UnixStream::connect(&client_socket).expect("should connect to client socket");
     let (version, error) =
-        client_handshake(&mut stream, 16, 80, 24).expect("handshake should succeed");
-    assert_eq!(version, 16);
+        client_handshake(&mut stream, 18, 80, 24).expect("handshake should succeed");
+    assert_eq!(version, 18);
     assert!(error.is_none(), "{:?}", error);
 
     // Send SIGINT so the server takes the graceful shutdown path and
@@ -743,8 +795,8 @@ fn client_receives_frame_after_pane_output() {
     // Connect and handshake.
     let mut stream = UnixStream::connect(&client_socket).expect("should connect to client socket");
     let (version, error) =
-        client_handshake(&mut stream, 16, 80, 24).expect("handshake should succeed");
-    assert_eq!(version, 16);
+        client_handshake(&mut stream, 18, 80, 24).expect("handshake should succeed");
+    assert_eq!(version, 18);
     assert!(error.is_none(), "{:?}", error);
 
     read_next_frame_payload(&mut stream, Duration::from_secs(10))
@@ -790,8 +842,8 @@ fn navigate_mode_keybind_dispatch_in_server() {
     // Connect and handshake.
     let mut stream = UnixStream::connect(&client_socket).expect("should connect to client socket");
     let (version, error) =
-        client_handshake(&mut stream, 16, 80, 24).expect("handshake should succeed");
-    assert_eq!(version, 16);
+        client_handshake(&mut stream, 18, 80, 24).expect("handshake should succeed");
+    assert_eq!(version, 18);
     assert!(error.is_none(), "{:?}", error);
 
     // Drain initial frames.
@@ -908,8 +960,8 @@ fn graceful_shutdown_sends_server_shutdown_to_client() {
     // Connect and handshake.
     let mut stream = UnixStream::connect(&client_socket).expect("should connect to client socket");
     let (version, error) =
-        client_handshake(&mut stream, 16, 80, 24).expect("handshake should succeed");
-    assert_eq!(version, 16);
+        client_handshake(&mut stream, 18, 80, 24).expect("handshake should succeed");
+    assert_eq!(version, 18);
     assert!(error.is_none(), "{:?}", error);
 
     // Drain initial frame(s).
@@ -1007,8 +1059,8 @@ fn client_receives_notify_on_agent_state_change() {
     // Connect as a client and perform handshake.
     let mut stream = UnixStream::connect(&client_socket).expect("should connect");
     let (version, error) =
-        client_handshake(&mut stream, 16, 80, 24).expect("handshake should succeed");
-    assert_eq!(version, 16);
+        client_handshake(&mut stream, 18, 80, 24).expect("handshake should succeed");
+    assert_eq!(version, 18);
     assert!(error.is_none(), "{:?}", error);
 
     // Drain initial frame(s).
