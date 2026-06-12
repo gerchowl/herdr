@@ -53,6 +53,10 @@ struct ClientState {
     mouse_capture_active: bool,
     /// The terminal size we reported to the server in our last Hello/Resize.
     reported_size: (u16, u16),
+    /// The cell pixel size (width, height) we last reported alongside
+    /// `reported_size`. Carried so an in-process server switch can re-assert the
+    /// full geometry — cols/rows AND cell px — to the newly-active server (#77).
+    reported_cell_size: (u32, u32),
     /// Client-local sound playback config, refreshed on server request.
     sound_config: crate::config::SoundConfig,
     /// Whether this client may write Kitty graphics bytes to its host terminal.
@@ -1302,10 +1306,13 @@ async fn run_client_loop(
     initial_input: Option<Vec<u8>>,
     stdin_rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
 ) -> Result<(), ClientError> {
+    let (_, _, initial_cell_width, initial_cell_height) =
+        current_terminal_geometry(kitty_graphics_enabled);
     let mut state = ClientState {
         blit_encoder: render_ansi::BlitEncoder::new(),
         mouse_capture_active,
         reported_size: (cols, rows),
+        reported_cell_size: (initial_cell_width, initial_cell_height),
         sound_config,
         kitty_graphics_enabled,
         attach_escape,
@@ -1486,6 +1493,7 @@ async fn run_client_loop(
             }
             ClientLoopEvent::Resize(new_cols, new_rows, cell_width_px, cell_height_px) => {
                 state.reported_size = (new_cols, new_rows);
+                state.reported_cell_size = (cell_width_px, cell_height_px);
                 let msg = ClientMessage::Resize {
                     cols: new_cols,
                     rows: new_rows,
@@ -1610,6 +1618,27 @@ async fn run_client_loop(
                                         active_slot_key = new_key;
                                         write_stream = new_stream;
                                         let _ = write_stream.set_nonblocking(false);
+                                        // Re-assert our true geometry to the slot we
+                                        // just made active (#77). A warm slot only
+                                        // learned this client's size at dial time and
+                                        // never saw subsequent Resize events (those
+                                        // only went to the then-active write stream),
+                                        // so without this its panes keep the stale
+                                        // dial-time width and fresh output wraps
+                                        // narrow. The server's Resize handler reflows
+                                        // every pane's PTY+VT to the new geometry.
+                                        let (cur_cols, cur_rows) = state.reported_size;
+                                        let (cur_cw, cur_ch) = state.reported_cell_size;
+                                        let resize = ClientMessage::Resize {
+                                            cols: cur_cols,
+                                            rows: cur_rows,
+                                            cell_width_px: cur_cw,
+                                            cell_height_px: cur_ch,
+                                        };
+                                        if let Err(e) = write_to_server(&mut write_stream, &resize)
+                                        {
+                                            return Err(ClientError::ConnectionLost(e));
+                                        }
                                         // Resume already asked the server for a full
                                         // redraw; nudge the host surface so the
                                         // repaint lands cleanly over the old frame.
