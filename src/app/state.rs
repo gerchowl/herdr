@@ -1537,6 +1537,8 @@ pub struct AppState {
     pub agent_aliases: std::collections::HashMap<String, String>,
     /// Auto-adopt external linked worktrees into managed groups.
     pub adopt_external_worktrees: bool,
+    /// One-shot pivot prompt injected into a branched Claude fork (#106).
+    pub branch_pivot_message: String,
     /// Configured federated peer servers ([[peers]]), config-owned.
     pub peers: Vec<crate::config::PeerConfig>,
     /// Latest polled summary per configured peer (sidebar remote rows).
@@ -2013,6 +2015,7 @@ impl AppState {
             action_notice: None,
             agent_aliases: std::collections::HashMap::new(),
             adopt_external_worktrees: true,
+            branch_pivot_message: String::new(),
             peers: Vec::new(),
             peer_summaries: Vec::new(),
             fleet_snapshot: None,

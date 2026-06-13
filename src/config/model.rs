@@ -443,6 +443,13 @@ pub struct WorktreesConfig {
     /// they group under their open parent repo workspace and get the managed
     /// worktree actions. Default: true.
     pub adopt_external: bool,
+    /// One-shot prompt injected as the forked agent's first turn when you
+    /// branch_session a Claude pane (#106) -- so the fork knows it was
+    /// branched and should pivot rather than duplicate the parent. The
+    /// `<branch>` placeholder is replaced with the new branch name. Empty
+    /// string disables injection. Claude only (the only agent whose resume
+    /// takes a positional first prompt).
+    pub branch_pivot_message: String,
 }
 
 /// A federated peer Herdr server. Declared as `[[peers]]` entries. Peers are
@@ -740,11 +747,17 @@ impl Default for KeysConfig {
     }
 }
 
+/// Default branch pivot prompt (#106). `<branch>` is substituted at fork time.
+fn default_branch_pivot_message() -> &'static str {
+    "You have been branched from a parent agent session into a new worktree (<branch>). The parent continues the original direction. You should PIVOT: pick up a different thread, an alternative approach, or the next sub-task -- do not duplicate the parent's work. Re-orient before continuing."
+}
+
 impl Default for WorktreesConfig {
     fn default() -> Self {
         Self {
             directory: "~/.herdr/worktrees".into(),
             adopt_external: true,
+            branch_pivot_message: default_branch_pivot_message().to_string(),
         }
     }
 }

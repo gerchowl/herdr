@@ -159,6 +159,23 @@ pub fn branch_plan(
     Some(plan)
 }
 
+/// Append a one-shot pivot prompt as the forked agent's first turn (#106).
+/// Only applies to a CLAUDE fork (argv starts with `claude` and carries
+/// `--fork-session`); Claude takes a positional prompt as the opening user
+/// turn in interactive mode. A no-op for an empty message or any other agent
+/// (codex/copilot resume take no positional prompt). The argv is built once
+/// per branch and never persisted, so later resumes re-inject nothing.
+pub fn append_pivot_message(plan: &mut AgentResumePlan, message: &str) {
+    if message.is_empty() {
+        return;
+    }
+    let is_claude_fork = plan.argv.first().map(String::as_str) == Some("claude")
+        && plan.argv.iter().any(|a| a == "--fork-session");
+    if is_claude_fork {
+        plan.argv.push(message.to_string());
+    }
+}
+
 pub fn dedupe_key(source: &str, agent: &str, session_ref: &AgentSessionRef) -> String {
     format!(
         "{source}\u{0}{agent}\u{0}{:?}\u{0}{}",
@@ -378,6 +395,25 @@ mod tests {
             plan.argv,
             vec!["claude", "--resume", "claude-session", "--fork-session"]
         );
+    }
+
+    #[test]
+    fn append_pivot_message_pushes_only_for_claude_forks() {
+        let session = AgentSessionRef::id("sid").unwrap();
+        let mut claude = branch_plan("herdr:claude", "claude", &session).unwrap();
+        append_pivot_message(&mut claude, "PIVOT now");
+        assert_eq!(claude.argv.last().unwrap(), "PIVOT now");
+
+        // Empty message: no-op.
+        let mut claude2 = branch_plan("herdr:claude", "claude", &session).unwrap();
+        append_pivot_message(&mut claude2, "");
+        assert_eq!(claude2.argv.last().unwrap(), "--fork-session");
+
+        // Non-claude (codex): no positional prompt appended even if asked.
+        let mut codex = branch_plan("herdr:codex", "codex", &session).unwrap();
+        let before = codex.argv.clone();
+        append_pivot_message(&mut codex, "PIVOT now");
+        assert_eq!(codex.argv, before);
     }
 
     #[test]

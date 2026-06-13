@@ -748,6 +748,7 @@ impl App {
             Ok(()) => {
                 tracing::info!(checkout_path = %create.checkout_path.display(), "git worktree add completed");
                 let path = create.checkout_path.clone();
+                let branch_name = create.branch.clone();
                 let branch_plan = create.branch_plan.clone();
                 let source_workspace_id = create.source_workspace_id.clone();
                 let source_checkout_path = create.source_checkout_path.clone();
@@ -758,7 +759,15 @@ impl App {
                 self.state.worktree_create = None;
                 self.state.name_input.clear();
                 self.state.name_input_replace_on_type = false;
-                let created = if let Some(plan) = branch_plan {
+                let created = if let Some(mut plan) = branch_plan {
+                    // #106: inject the one-shot pivot prompt as the fork's
+                    // first turn, with <branch> resolved to the new branch
+                    // name. No-op for an empty config or a non-claude fork.
+                    let pivot = self
+                        .state
+                        .branch_pivot_message
+                        .replace("<branch>", branch_name.trim());
+                    crate::agent_resume::append_pivot_message(&mut plan, &pivot);
                     let (rows, cols) = self.state.estimate_pane_size();
                     self.spawn_agent_workspace(path.clone(), rows, cols, &plan.argv, true)
                         .map(|(ws_idx, _, _)| ws_idx)

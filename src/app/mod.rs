@@ -471,6 +471,7 @@ impl App {
             action_notice: None,
             agent_aliases: config.ui.agent_aliases.clone(),
             adopt_external_worktrees: config.worktrees.adopt_external,
+            branch_pivot_message: config.worktrees.branch_pivot_message.clone(),
             peers: config.peers.clone(),
             peer_summaries: config
                 .peers
@@ -1275,6 +1276,7 @@ impl App {
                 self.state.status_line = config.ui.status_line;
                 self.state.agent_aliases = config.ui.agent_aliases.clone();
                 self.state.adopt_external_worktrees = config.worktrees.adopt_external;
+                self.state.branch_pivot_message = config.worktrees.branch_pivot_message.clone();
                 if self.state.peers != config.peers {
                     // Keep polled data for peers that survive the reload.
                     self.state.peer_summaries = config
