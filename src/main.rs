@@ -500,6 +500,14 @@ fn decide_next_leg(
                 keybindings,
                 live_handoff: false,
                 fleet: switch.fleet,
+                // The leg loop may still hold the previous leg's alt-screen
+                // for the seamless swap (#69/#72). A federation switch must
+                // never prompt for install/upgrade here — the held alt-screen
+                // would swallow the prompt and the stdin read would block /
+                // corrupt the terminal (#115). Fail-with-notice instead so
+                // the user lands back at the previous leg with a top-right
+                // failure notice (#67).
+                context: remote::LaunchContext::FederationSwitch,
             });
             LegStep::Switch {
                 previous: (current.clone(), switch_failure_label(&next)),
@@ -975,6 +983,7 @@ mod tests {
             keybindings: remote::RemoteKeybindings::Local,
             live_handoff: false,
             fleet: None,
+            context: remote::LaunchContext::Cli,
         });
         assert_eq!(switch_failure_label(&leg), "lars@sage");
     }
@@ -997,6 +1006,7 @@ mod tests {
             keybindings: remote::RemoteKeybindings::Local,
             live_handoff: false,
             fleet: None,
+            context: remote::LaunchContext::FederationSwitch,
         })
     }
 
@@ -1013,9 +1023,39 @@ mod tests {
                 // Falls back to where we came from, labeled by the target.
                 assert_eq!(previous.0, AttachLeg::Local);
                 assert_eq!(previous.1, "lars@sage");
+                // The switch leg MUST be non-interactive: the previous leg
+                // may still hold the alt-screen for the seamless swap, so a
+                // remote install/upgrade prompt here would corrupt the
+                // terminal (#115). Verify the constructed leg's context.
+                match &next {
+                    AttachLeg::Remote(launch) => assert_eq!(
+                        launch.context,
+                        remote::LaunchContext::FederationSwitch,
+                        "switch leg must run with non-interactive context"
+                    ),
+                    _ => panic!("switch leg must be Remote"),
+                }
             }
             _ => panic!("expected Switch"),
         }
+    }
+
+    #[test]
+    fn cli_remote_leg_uses_interactive_context() {
+        // The explicit `herdr --remote <target>` path retains its install
+        // / upgrade prompt -- the user typed the command at a shell, has a
+        // real TTY, and no alt-screen is held. Verify the CLI parser
+        // produces an interactive RemoteLaunch.
+        let args = vec![
+            "herdr".to_string(),
+            "--remote".to_string(),
+            "lars@sage".to_string(),
+        ];
+        let (_cleaned, remote) =
+            remote::extract_remote_args(&args).expect("--remote parses cleanly");
+        let remote = remote.expect("--remote produces a RemoteLaunch");
+        assert_eq!(remote.context, remote::LaunchContext::Cli);
+        assert!(remote.context.allows_install_prompt());
     }
 
     #[test]
