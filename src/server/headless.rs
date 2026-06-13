@@ -647,6 +647,39 @@ impl HeadlessServer {
         self.resize_shared_runtime_to_effective_size_with_pending_agent_resumes(true);
     }
 
+    /// In-session active-focus snapshot used to detect workspace/tab/pane
+    /// switches around an input or API dispatch (#114). When the snapshot
+    /// changes, the just-activated pane(s) must have geometry re-asserted to
+    /// the current foreground area — the in-session sibling of #82's
+    /// slot-flip re-assert. We also include the active workspace's active
+    /// tab index, so a tab switch within the same workspace counts too.
+    fn active_focus_snapshot(&self) -> Option<(crate::app::state::PaneFocusTarget, usize)> {
+        let target = self.app.state.current_pane_focus_target()?;
+        let active_tab = self
+            .app
+            .state
+            .active
+            .and_then(|idx| self.app.state.workspaces.get(idx))
+            .map(|ws| ws.active_tab_index())
+            .unwrap_or(0);
+        Some((target, active_tab))
+    }
+
+    /// Re-assert the foreground geometry to the just-activated pane(s) when
+    /// `before` differs from the current focus snapshot. The newly-foreground
+    /// pane (single- or multi-pane workspace) may have kept stale geometry
+    /// from when it was a background tab — a split-drag self-heals multi-pane
+    /// by firing a Resize, but single-pane has no such trigger (#114).
+    fn reassert_geometry_if_active_focus_changed(
+        &mut self,
+        before: Option<(crate::app::state::PaneFocusTarget, usize)>,
+    ) {
+        let after = self.active_focus_snapshot();
+        if before != after {
+            self.resize_shared_runtime_to_effective_size();
+        }
+    }
+
     fn resize_shared_runtime_to_effective_size_before_input(&mut self) {
         self.resize_shared_runtime_to_effective_size_with_pending_agent_resumes(false);
     }
@@ -2013,6 +2046,13 @@ impl HeadlessServer {
                     self.resize_shared_runtime_to_effective_size_before_input();
                 }
                 let theme_changed = self.update_client_host_theme_from_events(client_id, &events);
+                // Snapshot the active focus (workspace + active tab + focused
+                // pane) BEFORE dispatching the events so we can detect an
+                // in-session workspace/tab/pane switch and re-assert geometry
+                // to the newly-foreground pane (#114). A multi-pane layout
+                // self-heals via the split-drag Resize a user does to widen
+                // a split, but a single-pane switch has no such trigger.
+                let focus_before = self.active_focus_snapshot();
                 self.app
                     .route_client_events(events, self.foreground_client_id == Some(client_id));
                 if self.app.take_config_reloaded_from_disk() {
@@ -2020,6 +2060,7 @@ impl HeadlessServer {
                 } else {
                     self.sync_foreground_client_state();
                 }
+                self.reassert_geometry_if_active_focus_changed(focus_before);
 
                 // Check if the detach keybind was triggered during input processing.
                 if self.app.state.detach_requested {
@@ -2266,6 +2307,11 @@ impl HeadlessServer {
         };
 
         self.sync_foreground_client_state();
+        // Snapshot the active focus before the API dispatch so an in-session
+        // workspace/tab/pane switch driven by an API request re-asserts the
+        // foreground geometry to the just-activated pane(s) (#114) — the
+        // sibling of #82's slot-flip re-assert on the local-switch path.
+        let focus_before = self.active_focus_snapshot();
         let response = if matches!(
             &msg.request.method,
             api::schema::Method::ServerReloadConfig(_)
@@ -2297,6 +2343,7 @@ impl HeadlessServer {
             response
         };
         let _ = msg.respond_to.send(response);
+        self.reassert_geometry_if_active_focus_changed(focus_before);
 
         // Forward new toast state only when a client-local delivery mode is selected.
         // Herdr delivery renders the toast in-frame and must not ask clients to
@@ -5654,6 +5701,332 @@ next_tab = ""
                 .unwrap()
                 .current_size(),
             expected
+        );
+    }
+
+    #[tokio::test]
+    async fn in_session_workspace_switch_reasserts_pane_geometry_single_pane() {
+        // #114: switching to a single-pane background workspace must
+        // re-assert geometry to the foreground area immediately on the
+        // switch chokepoint — not wait for the next external Resize event.
+        // A multi-pane workspace self-heals via the user's split-drag
+        // Resize, but single-pane has no such trigger.
+        let mut server = test_headless_server();
+
+        let mut ws_a = crate::workspace::Workspace::test_new("a");
+        let pane_a = ws_a.tabs[0].root_pane;
+        ws_a.tabs[0].runtimes.insert(
+            pane_a,
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b""),
+        );
+
+        let mut ws_b = crate::workspace::Workspace::test_new("b");
+        let pane_b = ws_b.tabs[0].root_pane;
+        ws_b.tabs[0].runtimes.insert(
+            pane_b,
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b""),
+        );
+
+        server.app.state.workspaces = vec![ws_a, ws_b];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+
+        server.clients.insert(
+            1,
+            ClientConnection::new(
+                (120, 40),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                1,
+                RenderEncoding::SemanticFrame,
+                None,
+            ),
+        );
+        server.foreground_client_id = Some(1);
+        server.sync_foreground_client_state();
+        server.resize_shared_runtime_to_effective_size();
+
+        let terminal_area = server.app.state.view.terminal_area;
+        let expected_inner = (
+            terminal_area.height.saturating_sub(2),
+            terminal_area.width.saturating_sub(2),
+        );
+
+        // Simulate the stale-geometry window: workspace B's pane has been
+        // shrunk by something out-of-band (mirrors the production path
+        // where a background pane carries a smaller dial-time width than
+        // the current foreground area).
+        server
+            .app
+            .state
+            .runtime_for_pane(&server.app.terminal_runtimes, pane_b)
+            .expect("workspace B runtime")
+            .resize(5, 30, 0, 0);
+        assert_eq!(
+            server
+                .app
+                .state
+                .runtime_for_pane(&server.app.terminal_runtimes, pane_b)
+                .unwrap()
+                .current_size(),
+            (5, 30),
+            "pre-switch sanity: ws B carries stale narrow geometry"
+        );
+
+        // Drive the switch through the same chokepoint the user reaches via
+        // the in-session switch keybind / focus action.
+        let focus_before = server.active_focus_snapshot();
+        server.app.state.switch_workspace(1);
+        server.reassert_geometry_if_active_focus_changed(focus_before);
+
+        // The just-activated single pane must now be re-asserted to the
+        // current foreground terminal area — not the stale narrow size.
+        assert_eq!(
+            server
+                .app
+                .state
+                .runtime_for_pane(&server.app.terminal_runtimes, pane_b)
+                .unwrap()
+                .current_size(),
+            expected_inner,
+            "post-switch: ws B's single pane must be re-asserted to foreground area"
+        );
+        // Workspace A's background pane stays sized to the foreground area
+        // too — the helper resizes every workspace's panes, not just the
+        // just-activated one (the same shape as #82's flip-time re-assert).
+        assert_eq!(
+            server
+                .app
+                .state
+                .runtime_for_pane(&server.app.terminal_runtimes, pane_a)
+                .unwrap()
+                .current_size(),
+            expected_inner,
+            "post-switch: ws A's background pane stays sized to foreground area"
+        );
+    }
+
+    #[tokio::test]
+    async fn in_session_workspace_switch_does_not_reassert_when_focus_unchanged() {
+        // The re-assert is gated on the active-focus snapshot changing —
+        // a no-op input (no switch) must NOT call back into the layout
+        // pipeline, so the render path is not paid for every keypress.
+        let mut server = test_headless_server();
+
+        let mut ws = crate::workspace::Workspace::test_new("only");
+        let pane = ws.tabs[0].root_pane;
+        ws.tabs[0].runtimes.insert(
+            pane,
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b""),
+        );
+
+        server.app.state.workspaces = vec![ws];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+
+        server.clients.insert(
+            1,
+            ClientConnection::new(
+                (120, 40),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                1,
+                RenderEncoding::SemanticFrame,
+                None,
+            ),
+        );
+        server.foreground_client_id = Some(1);
+        server.sync_foreground_client_state();
+        server.resize_shared_runtime_to_effective_size();
+
+        // Drop the pane to a deliberately wrong size. If the helper
+        // wrongly re-asserts when focus didn't change, this would snap
+        // back to the foreground size; if it correctly no-ops, it stays.
+        server
+            .app
+            .state
+            .runtime_for_pane(&server.app.terminal_runtimes, pane)
+            .expect("runtime")
+            .resize(5, 30, 0, 0);
+
+        let focus_before = server.active_focus_snapshot();
+        // No focus change between the snapshots.
+        server.reassert_geometry_if_active_focus_changed(focus_before);
+
+        assert_eq!(
+            server
+                .app
+                .state
+                .runtime_for_pane(&server.app.terminal_runtimes, pane)
+                .unwrap()
+                .current_size(),
+            (5, 30),
+            "no focus change must not trigger a redundant re-assert"
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_focus_via_api_reasserts_single_pane_geometry_end_to_end() {
+        // End-to-end: a workspace.focus API request (the path the in-session
+        // switch keybind and external CLI both reach the server through)
+        // triggers the re-assert. The just-activated single-pane workspace
+        // must land at the foreground area without waiting for the next
+        // render or external Resize event (#114).
+        let mut server = test_headless_server();
+
+        let mut ws_a = crate::workspace::Workspace::test_new("a");
+        let pane_a = ws_a.tabs[0].root_pane;
+        ws_a.tabs[0].runtimes.insert(
+            pane_a,
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b""),
+        );
+
+        let mut ws_b = crate::workspace::Workspace::test_new("b");
+        let pane_b = ws_b.tabs[0].root_pane;
+        ws_b.tabs[0].runtimes.insert(
+            pane_b,
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b""),
+        );
+        let ws_b_public_id = ws_b.id.clone();
+
+        server.app.state.workspaces = vec![ws_a, ws_b];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+
+        server.clients.insert(
+            1,
+            ClientConnection::new(
+                (120, 40),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                1,
+                RenderEncoding::SemanticFrame,
+                None,
+            ),
+        );
+        server.foreground_client_id = Some(1);
+        server.sync_foreground_client_state();
+        server.resize_shared_runtime_to_effective_size();
+
+        let terminal_area = server.app.state.view.terminal_area;
+        let expected_inner = (
+            terminal_area.height.saturating_sub(2),
+            terminal_area.width.saturating_sub(2),
+        );
+
+        server
+            .app
+            .state
+            .runtime_for_pane(&server.app.terminal_runtimes, pane_b)
+            .expect("workspace B runtime")
+            .resize(5, 30, 0, 0);
+
+        let (respond_to, response_rx) = std::sync::mpsc::channel();
+        assert!(
+            server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+                request: api::schema::Request {
+                    id: "focus_b".into(),
+                    method: api::schema::Method::WorkspaceFocus(api::schema::WorkspaceTarget {
+                        workspace_id: ws_b_public_id,
+                    },),
+                },
+                respond_to,
+                peer_pid: None,
+            })
+        );
+        let _ = response_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("response");
+
+        assert_eq!(
+            server.app.state.active,
+            Some(1),
+            "workspace.focus must switch the active workspace"
+        );
+        assert_eq!(
+            server
+                .app
+                .state
+                .runtime_for_pane(&server.app.terminal_runtimes, pane_b)
+                .unwrap()
+                .current_size(),
+            expected_inner,
+            "post API focus-switch: ws B's single pane must be re-asserted"
+        );
+    }
+
+    #[tokio::test]
+    async fn in_session_tab_switch_reasserts_pane_geometry() {
+        // A tab switch WITHIN the same workspace is also an active-focus
+        // change (#114): the newly-active tab's pane must be re-asserted.
+        let mut server = test_headless_server();
+
+        let mut ws = crate::workspace::Workspace::test_new("ws");
+        let second_tab = ws.test_add_tab(Some("two"));
+        let pane_one = ws.tabs[0].root_pane;
+        let pane_two = ws.tabs[second_tab].root_pane;
+        ws.tabs[0].runtimes.insert(
+            pane_one,
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b""),
+        );
+        ws.tabs[second_tab].runtimes.insert(
+            pane_two,
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b""),
+        );
+
+        server.app.state.workspaces = vec![ws];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+
+        server.clients.insert(
+            1,
+            ClientConnection::new(
+                (120, 40),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                1,
+                RenderEncoding::SemanticFrame,
+                None,
+            ),
+        );
+        server.foreground_client_id = Some(1);
+        server.sync_foreground_client_state();
+        server.resize_shared_runtime_to_effective_size();
+
+        let terminal_area = server.app.state.view.terminal_area;
+        let expected_inner = (
+            terminal_area.height.saturating_sub(2),
+            terminal_area.width.saturating_sub(2),
+        );
+
+        server
+            .app
+            .state
+            .runtime_for_pane(&server.app.terminal_runtimes, pane_two)
+            .expect("runtime")
+            .resize(5, 30, 0, 0);
+
+        let focus_before = server.active_focus_snapshot();
+        server.app.state.switch_workspace_tab(0, second_tab);
+        server.reassert_geometry_if_active_focus_changed(focus_before);
+
+        assert_eq!(
+            server
+                .app
+                .state
+                .runtime_for_pane(&server.app.terminal_runtimes, pane_two)
+                .unwrap()
+                .current_size(),
+            expected_inner,
+            "post tab-switch: the just-activated tab's pane must be re-asserted"
         );
     }
 
