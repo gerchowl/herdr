@@ -71,6 +71,37 @@ impl RemoteKeybindings {
     }
 }
 
+/// Where this remote leg came from. Decides whether the bootstrap path may
+/// PROMPT the user (`--remote` from a shell) or must surface mismatches as
+/// errors that ride the switch-failure notice rail (#67).
+///
+/// An explicit `herdr --remote <target>` call has a real interactive TTY and
+/// the user is making a one-shot decision to launch a remote leg — install /
+/// upgrade prompts are appropriate. A federation SWITCH leg is queued by the
+/// leg loop while a previous leg may still hold the alternate screen + raw
+/// mode for the seamless swap (#69/#72): a stdin read here would scribble on
+/// the held alt-screen and block until the user typed something, corrupting
+/// the terminal tab (the live bug on #115).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LaunchContext {
+    /// The user typed `herdr --remote <target>` at a shell. Prompt freely.
+    Cli,
+    /// The leg loop is chaining into this remote leg after a SwitchServer
+    /// from a previous leg. Any install / upgrade prompt must be replaced
+    /// with an error so the switch fails-with-notice instead of corrupting
+    /// the terminal.
+    FederationSwitch,
+}
+
+impl LaunchContext {
+    /// Whether this context may PROMPT the user during remote-binary
+    /// install / upgrade. `false` for the federation-switch leg, which must
+    /// never read stdin while a previous leg holds the alt-screen.
+    pub(crate) fn allows_install_prompt(self) -> bool {
+        matches!(self, Self::Cli)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RemoteLaunch {
     pub(crate) target: String,
@@ -80,6 +111,11 @@ pub(crate) struct RemoteLaunch {
     /// (`None` for CLI-launched legs; a fresh origin-only snapshot is
     /// stamped at launch so the remote end always knows the way home).
     pub(crate) fleet: Option<crate::protocol::FleetSnapshot>,
+    /// Whether the remote-binary bootstrap may prompt for install / upgrade
+    /// approval. The explicit-CLI path keeps the prompts; a federation
+    /// switch leg must fail-with-notice instead so it does not corrupt the
+    /// held terminal (#115).
+    pub(crate) context: LaunchContext,
 }
 
 pub(crate) fn extract_remote_args(
@@ -156,6 +192,9 @@ pub(crate) fn extract_remote_args(
         keybindings,
         live_handoff,
         fleet: None,
+        // CLI `--remote <target>` from a real shell: install / upgrade
+        // prompts are fine here.
+        context: LaunchContext::Cli,
     });
     if remote.is_none() && keybindings_seen {
         return Err("--remote-keybindings requires --remote".to_string());
@@ -194,13 +233,15 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
         remote.keybindings,
         remote.live_handoff,
     );
-    let prepared_remote = prepare_remote_herdr(&remote.target, remote.live_handoff)?;
+    let prepared_remote =
+        prepare_remote_herdr(&remote.target, remote.live_handoff, remote.context)?;
     ensure_remote_server_ready(
         &remote.target,
         &prepared_remote.remote_herdr,
         prepared_remote.installed_or_replaced,
         prepared_remote.stop_after_install_approved,
         remote.live_handoff,
+        remote.context,
     )?;
 
     let manage_ssh_config = crate::config::Config::load()
@@ -507,6 +548,7 @@ impl InstallSource {
 fn prepare_remote_herdr(
     target: &str,
     live_handoff_enabled: bool,
+    context: LaunchContext,
 ) -> io::Result<PreparedRemoteHerdr> {
     let platform = detect_remote_platform(target)?;
     let remote_herdr = RemoteHerdr::for_platform(platform);
@@ -543,12 +585,14 @@ fn prepare_remote_herdr(
             target,
             status_probe_herdr,
             live_handoff_enabled,
+            context,
         )?;
     }
     confirm_remote_install(
         target,
         &remote_herdr,
         &install_source_description(&remote_herdr.platform, override_binary.as_deref()),
+        context,
     )?;
     let source = resolve_install_source(&remote_herdr.platform, override_binary)?;
     let install_result = install_remote_herdr(target, &remote_herdr, &source.path);
@@ -754,6 +798,7 @@ fn ensure_remote_server_ready(
     remote_binary_changed: bool,
     stop_after_install_approved: bool,
     live_handoff_enabled: bool,
+    context: LaunchContext,
 ) -> io::Result<()> {
     let status = remote_server_status(target, remote_herdr)?;
     let RemoteServerStatus::Running {
@@ -786,7 +831,7 @@ fn ensure_remote_server_ready(
         return Ok(());
     }
 
-    if confirm_remote_server_stop(target, version.as_deref(), protocol, reason)? {
+    if confirm_remote_server_stop(target, version.as_deref(), protocol, reason, context)? {
         stop_remote_server(target, remote_herdr)?;
     }
     Ok(())
@@ -813,11 +858,17 @@ fn confirm_remote_install_with_running_server(
     target: &str,
     remote_herdr: &RemoteHerdr,
     live_handoff_enabled: bool,
+    context: LaunchContext,
 ) -> io::Result<bool> {
+    // A federation switch leg must never prompt while the previous leg may
+    // hold the alternate screen + raw mode (#115 / #69-72). Treat it like a
+    // non-interactive launcher: surface mismatches as errors so the switch
+    // fails-with-notice (#67) instead of corrupting the terminal.
+    let may_prompt = context.allows_install_prompt() && io::stdin().is_terminal();
     let status = match remote_server_status(target, remote_herdr) {
         Ok(status) => status,
         Err(err) => {
-            if !io::stdin().is_terminal() {
+            if !may_prompt {
                 return Err(io::Error::other(format!(
                     "could not inspect the running remote herdr server on {target} before installing: {err}; run from an interactive terminal to approve updating the remote binary"
                 )));
@@ -848,7 +899,7 @@ fn confirm_remote_install_with_running_server(
     else {
         return Ok(false);
     };
-    if !io::stdin().is_terminal() {
+    if !may_prompt {
         if live_handoff_enabled && live_handoff {
             return Ok(false);
         }
@@ -954,7 +1005,19 @@ fn confirm_remote_server_stop(
     version: Option<&str>,
     _protocol: Option<u32>,
     reason: RemoteServerRestartReason,
+    context: LaunchContext,
 ) -> io::Result<bool> {
+    // A federation switch leg must never prompt OR scribble on the held
+    // alt-screen (#115). Any restart reason on a switch leg is a hard error
+    // that rides the failure-notice rail (#67) — the switch should
+    // fail-with-notice ("anvil-dev: herdr version mismatch"), not silently
+    // keep running an incompatible remote server.
+    if !context.allows_install_prompt() {
+        return Err(io::Error::other(format!(
+            "remote herdr server on {target} is running v{}; refusing to prompt for a stop during a federation switch — relaunching previous leg",
+            version_label(version)
+        )));
+    }
     if !io::stdin().is_terminal() {
         if reason == RemoteServerRestartReason::ProtocolMismatch {
             return Err(io::Error::other(format!(
@@ -1241,8 +1304,13 @@ fn confirm_remote_install(
     target: &str,
     remote_herdr: &RemoteHerdr,
     source_description: &str,
+    context: LaunchContext,
 ) -> io::Result<()> {
-    if !io::stdin().is_terminal() {
+    // A federation switch leg must never prompt (#115). Surface the missing
+    // remote binary as an error so the switch falls back to the previous
+    // server with a top-right notice (#67) instead of corrupting the held
+    // terminal with a stdin read while the alt-screen is held.
+    if !context.allows_install_prompt() || !io::stdin().is_terminal() {
         return Err(io::Error::other(format!(
             "matching remote herdr {} is not installed at {}; run from an interactive terminal to approve installation",
             current_version(),
@@ -2606,5 +2674,85 @@ mod tests {
         InstallSource::temporary(path, dir.clone()).cleanup();
 
         assert!(!dir.exists());
+    }
+
+    // --- LaunchContext / install-prompt gating (#115) ----------------------
+
+    #[test]
+    fn launch_context_cli_allows_install_prompt() {
+        // The explicit `herdr --remote <target>` path keeps its prompts:
+        // the user typed the command at a real shell and is making a
+        // one-shot install/upgrade decision.
+        assert!(LaunchContext::Cli.allows_install_prompt());
+    }
+
+    #[test]
+    fn launch_context_federation_switch_forbids_install_prompt() {
+        // A side-pane / sidebar switch must never prompt -- the previous
+        // leg may still hold the alt-screen for the seamless swap, and a
+        // stdin read here corrupts the terminal (#115).
+        assert!(!LaunchContext::FederationSwitch.allows_install_prompt());
+    }
+
+    #[test]
+    fn confirm_remote_install_returns_error_under_federation_switch() {
+        // The non-interactive install branch is what the switch leg lands
+        // on: it MUST return an io::Error so the leg loop sees a failure
+        // and rides the #67 fall-back-with-notice rail, rather than
+        // blocking on stdin.
+        let platform = RemotePlatform::from_uname("Linux", "x86_64")
+            .expect("Linux x86_64 must be a known remote platform");
+        let remote_herdr = RemoteHerdr::for_platform(platform);
+        let err = confirm_remote_install(
+            "alice@anvil-dev",
+            &remote_herdr,
+            "the 0.6.8 stable asset for linux-x86_64",
+            LaunchContext::FederationSwitch,
+        )
+        .expect_err("federation switch must not prompt for install");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not installed"),
+            "expected install-missing error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn confirm_remote_server_stop_returns_error_under_federation_switch_for_version_mismatch() {
+        // Even a "soft" reason (VersionMismatch) becomes a hard error on a
+        // federation switch -- a switch landing on an incompatible remote
+        // server must fail-with-notice (#67), not silently keep running.
+        let err = confirm_remote_server_stop(
+            "alice@anvil-dev",
+            Some("0.6.8"),
+            Some(CURRENT_PROTOCOL),
+            RemoteServerRestartReason::VersionMismatch,
+            LaunchContext::FederationSwitch,
+        )
+        .expect_err("federation switch must surface mismatch as error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("federation switch"),
+            "expected federation-switch error wording, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn confirm_remote_server_stop_returns_error_under_federation_switch_for_protocol_mismatch() {
+        let err = confirm_remote_server_stop(
+            "alice@anvil-dev",
+            Some("0.6.8"),
+            Some(CURRENT_PROTOCOL.wrapping_sub(1)),
+            RemoteServerRestartReason::ProtocolMismatch,
+            LaunchContext::FederationSwitch,
+        )
+        .expect_err("federation switch must error on protocol mismatch");
+        // The federation-switch branch fires before the !is_terminal one,
+        // so the error wording is the switch-specific message.
+        let msg = err.to_string();
+        assert!(
+            msg.contains("federation switch"),
+            "expected federation-switch error wording, got: {msg}"
+        );
     }
 }
