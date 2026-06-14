@@ -78,6 +78,14 @@ pub enum AppEvent {
         pane_id: PaneId,
         recap: String,
     },
+    /// A reply entry reported for an agent pane (the agent's last assistant
+    /// message, captured by the same Stop hook that fires `HookRecapReported`).
+    /// Renders distinct from prompts and recaps in the prompt-history float so
+    /// the user can scan the conversation, not just their own side of it.
+    HookReplyReported {
+        pane_id: PaneId,
+        reply: String,
+    },
     /// A session promoted (or refreshed) a header field for its own pane.
     PaneHeaderFieldSet {
         pane_id: PaneId,

@@ -92,6 +92,8 @@ pub enum Method {
     PaneReportPrompt(PaneReportPromptParams),
     #[serde(rename = "pane.report_recap")]
     PaneReportRecap(PaneReportRecapParams),
+    #[serde(rename = "pane.report_reply")]
+    PaneReportReply(PaneReportReplyParams),
     #[serde(rename = "pane.report_metadata")]
     PaneReportMetadata(PaneReportMetadataParams),
     #[serde(rename = "pane.set_header_field")]
@@ -383,6 +385,18 @@ pub struct PaneReportRecapParams {
     pub agent: String,
     /// Free-text recap from a session lifecycle hook (e.g. Claude Stop).
     pub recap: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneReportReplyParams {
+    pub pane_id: String,
+    pub source: String,
+    pub agent: String,
+    /// Free-text assistant reply from a session lifecycle hook (e.g. the
+    /// last assistant message scraped from Claude's transcript on Stop).
+    pub reply: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seq: Option<u64>,
 }

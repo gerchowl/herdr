@@ -648,11 +648,22 @@ fn build_prompt_history_lines(
     width: u16,
 ) -> Vec<Line<'static>> {
     let now = std::time::Instant::now();
+    // Three glanceable tones: prompt = dim subtext (the user's input is
+    // history, not signal), reply = cool blue (the agent's prose), recap =
+    // warm mauve accent (the disciplined one-line summary, the signal).
     let prompt_style = Style::default()
         .fg(palette.subtext0)
         .bg(palette.surface_dim);
     let recap_style = Style::default().fg(palette.mauve).bg(palette.surface_dim);
+    let reply_style = Style::default().fg(palette.blue).bg(palette.surface_dim);
     let chrome_style = Style::default()
+        .fg(palette.overlay0)
+        .bg(palette.surface_dim);
+    // For body lines that look like leaked harness markup
+    // (`<task-notification>`, `<task-id>`, ...): keep the entry's tone but
+    // dim it so chrome reads as chrome. Defense-in-depth — the hook also
+    // filters task-notification blocks at the source.
+    let xml_chrome_style = Style::default()
         .fg(palette.overlay0)
         .bg(palette.surface_dim);
     let width = width as usize;
@@ -662,6 +673,7 @@ fn build_prompt_history_lines(
         let age = entry.relative_age(now);
         let (kind_label, body_style) = match entry.kind {
             crate::terminal::PromptHistoryKind::Prompt => ("prompt", prompt_style),
+            crate::terminal::PromptHistoryKind::Reply => ("reply", reply_style),
             crate::terminal::PromptHistoryKind::Recap => ("recap", recap_style),
         };
         let chrome_text = format!("{kind_label} \u{b7} {age}");
@@ -684,11 +696,89 @@ fn build_prompt_history_lines(
         // Empty bodies contribute only the chrome line (matches
         // `PromptHistoryEntry::rendered_line_count`).
         for body in body_lines {
-            let body = truncate_label(body, width.saturating_sub(2));
-            lines.push(Line::from(Span::styled(format!("  {body}"), body_style)));
+            let truncated = truncate_label(body, width.saturating_sub(2));
+            let trimmed = truncated.trim_start();
+            // Heuristic re-styling: a recap body line starting with the
+            // `※ recap:` sentinel gets the prefix bolded so the structural
+            // marker reads as chrome; the summary itself stays accent.
+            if matches!(entry.kind, crate::terminal::PromptHistoryKind::Recap)
+                && trimmed.starts_with('\u{203b}')
+            {
+                let lead = truncated.len() - trimmed.len();
+                let (indent, rest) = truncated.split_at(lead);
+                let prefix_end = recap_sentinel_prefix_len(rest);
+                let (prefix, summary) = rest.split_at(prefix_end);
+                let bold = recap_style.add_modifier(Modifier::BOLD);
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {indent}"), chrome_style),
+                    Span::styled(prefix.to_string(), bold),
+                    Span::styled(summary.to_string(), body_style),
+                ]));
+            } else if looks_like_xml_chrome(trimmed) {
+                lines.push(Line::from(Span::styled(
+                    format!("  {truncated}"),
+                    xml_chrome_style,
+                )));
+            } else {
+                lines.push(Line::from(Span::styled(
+                    format!("  {truncated}"),
+                    body_style,
+                )));
+            }
         }
     }
     lines
+}
+
+/// Length of the `※ recap:` (or `※ recap` without colon) prefix in `body`,
+/// covering trailing whitespace so the summary span starts on a non-space.
+/// Anything that does not begin with the sentinel returns 0.
+fn recap_sentinel_prefix_len(body: &str) -> usize {
+    let mut chars = body.char_indices();
+    let Some((_, first)) = chars.next() else {
+        return 0;
+    };
+    if first != '\u{203b}' {
+        return 0;
+    }
+    // Find the first ':' (the sentinel is `※ recap:`), then consume trailing
+    // whitespace so the summary span starts at the first non-space char. If
+    // there's no colon (loose form), prefix is just the sentinel char.
+    let after_marker = body[first.len_utf8()..]
+        .find(':')
+        .map(|idx| first.len_utf8() + idx + 1)
+        .unwrap_or(first.len_utf8());
+    after_marker
+        + body[after_marker..]
+            .find(|c: char| !c.is_whitespace())
+            .unwrap_or(body.len() - after_marker)
+}
+
+/// Whether a body line looks like leaked harness/system-reminder markup
+/// (XML-ish tags). Used only to DIM the line in the float, never to drop
+/// content — the shim filters at the hook source.
+fn looks_like_xml_chrome(line: &str) -> bool {
+    let line = line.trim();
+    if !line.starts_with('<') {
+        return false;
+    }
+    // `<task-notification>`, `<task-id>...</task-id>`, `<status>...`, etc.
+    // Match an opening tag whose name is lowercase letters/dashes — broad
+    // enough to catch the harness's reminders without flagging prose that
+    // happens to start with a `<`.
+    let after_lt = &line[1..];
+    let mut end = 0;
+    for (idx, ch) in after_lt.char_indices() {
+        if ch.is_ascii_lowercase() || ch == '-' || ch == '/' {
+            end = idx + ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if end == 0 {
+        return false;
+    }
+    after_lt[end..].starts_with('>') || after_lt[end..].starts_with(' ')
 }
 
 /// "owner/label" when the space key is a normalized origin URL
@@ -1031,6 +1121,47 @@ mod tests {
             .iter()
             .map(|(key, value)| (key.to_string(), value.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn xml_chrome_detects_system_reminder_tags_but_not_prose() {
+        // The harness's `<task-notification>` / `<system-reminder>` / etc.
+        // leak through if the shim filter is bypassed. The renderer dims
+        // them so they read as chrome, not content.
+        assert!(looks_like_xml_chrome("<task-notification>"));
+        assert!(looks_like_xml_chrome("<task-id>abc</task-id>"));
+        assert!(looks_like_xml_chrome("</task-notification>"));
+        assert!(looks_like_xml_chrome("<status>completed</status>"));
+        assert!(looks_like_xml_chrome("<summary>Background ...</summary>"));
+        // Prose with a stray angle bracket is not chrome.
+        assert!(!looks_like_xml_chrome("commit now - clean state"));
+        assert!(!looks_like_xml_chrome("<"));
+        assert!(!looks_like_xml_chrome("<3 the deploy"));
+        // Empty / whitespace-only lines do not look like tags.
+        assert!(!looks_like_xml_chrome(""));
+        assert!(!looks_like_xml_chrome("   "));
+    }
+
+    #[test]
+    fn recap_sentinel_prefix_isolates_marker_and_label() {
+        // `※ recap: Goal: ...` → prefix covers through the first colon and
+        // the space after it, so the bolded span ends right before "Goal:".
+        let body = "\u{203b} recap: Goal: ship the thing.";
+        let prefix_end = recap_sentinel_prefix_len(body);
+        let (prefix, summary) = body.split_at(prefix_end);
+        assert_eq!(prefix, "\u{203b} recap: ");
+        assert_eq!(summary, "Goal: ship the thing.");
+        // Sentinel without colon (loose form): prefix covers the marker
+        // plus the trailing whitespace so the summary span starts on a
+        // non-space char.
+        let loose = "\u{203b} done";
+        let prefix_end = recap_sentinel_prefix_len(loose);
+        let (prefix, summary) = loose.split_at(prefix_end);
+        assert_eq!(prefix, "\u{203b} ");
+        assert_eq!(summary, "done");
+        // Non-sentinel returns 0 (no prefix).
+        assert_eq!(recap_sentinel_prefix_len("plain prose"), 0);
+        assert_eq!(recap_sentinel_prefix_len(""), 0);
     }
 
     #[test]

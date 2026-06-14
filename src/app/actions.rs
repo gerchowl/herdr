@@ -2850,6 +2850,13 @@ impl AppState {
                 })
                 .into_iter()
                 .collect(),
+            AppEvent::HookReplyReported { pane_id, reply } => self
+                .update_terminal_state(pane_id, |terminal| {
+                    terminal.record_reply(reply.clone());
+                    None
+                })
+                .into_iter()
+                .collect(),
             AppEvent::PaneHeaderFieldSet {
                 pane_id,
                 key,
