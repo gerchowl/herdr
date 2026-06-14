@@ -94,7 +94,7 @@ pub(super) fn render_float_overlay(
         .border_style(border_style)
         .style(Style::default().bg(bg))
         .title(Line::from(Span::styled(
-            float_title(app, area.width),
+            float_title(app, rt, area.width),
             border_style,
         )));
     let inner = block.inner(area);
@@ -105,12 +105,33 @@ pub(super) fn render_float_overlay(
     rt.render(frame, inner, show_cursor);
 }
 
-/// Border title: the float's cwd when known, truncated to the overlay width.
-fn float_title(app: &AppState, overlay_width: u16) -> String {
-    let cwd = app
+/// Border title: the float PTY's live foreground cwd when known (the same
+/// `foreground_cwd`/`cwd` machinery `Tab::cwd_for_pane` uses for layout
+/// panes), falling back to the spawn cwd recorded in the terminal metadata.
+fn float_title(
+    app: &AppState,
+    rt: &crate::terminal::TerminalRuntime,
+    overlay_width: u16,
+) -> String {
+    let live_cwd = rt.foreground_cwd().or_else(|| rt.cwd());
+    let spawn_cwd = app
         .visible_float_for_active_workspace()
         .and_then(|float| app.terminals.get(&float.terminal_id))
-        .map(|terminal| terminal.cwd.display().to_string())
+        .map(|terminal| terminal.cwd.clone());
+    float_title_text(live_cwd, spawn_cwd, overlay_width)
+}
+
+/// Pure title formatting: prefer the live cwd over the spawn cwd, fall back
+/// to "float", and truncate (keeping the path tail) to the overlay width.
+fn float_title_text(
+    live_cwd: Option<std::path::PathBuf>,
+    spawn_cwd: Option<std::path::PathBuf>,
+    overlay_width: u16,
+) -> String {
+    let cwd = live_cwd
+        .filter(|cwd| !cwd.as_os_str().is_empty())
+        .or(spawn_cwd)
+        .map(|cwd| cwd.display().to_string())
         .filter(|cwd| !cwd.is_empty());
     let label = cwd.unwrap_or_else(|| "float".to_string());
     let max = usize::from(overlay_width.saturating_sub(4));
@@ -161,5 +182,34 @@ mod tests {
         let inner = float_overlay_inner_rect(area).unwrap();
         assert_eq!(inner.width, outer.width - 2);
         assert_eq!(inner.height, outer.height - 2);
+    }
+
+    #[test]
+    fn title_prefers_live_foreground_cwd_over_spawn_cwd() {
+        assert_eq!(
+            float_title_text(Some("/live/dir".into()), Some("/spawn/dir".into()), 40),
+            " /live/dir "
+        );
+    }
+
+    #[test]
+    fn title_falls_back_to_spawn_cwd_then_to_a_static_label() {
+        assert_eq!(
+            float_title_text(None, Some("/spawn/dir".into()), 40),
+            " /spawn/dir "
+        );
+        assert_eq!(float_title_text(None, None, 40), " float ");
+        // An empty live cwd never blanks the title or masks the spawn cwd.
+        assert_eq!(float_title_text(Some("".into()), None, 40), " float ");
+        assert_eq!(
+            float_title_text(Some("".into()), Some("/spawn/dir".into()), 40),
+            " /spawn/dir "
+        );
+    }
+
+    #[test]
+    fn title_truncation_keeps_the_path_tail() {
+        let title = float_title_text(Some("/very/long/path/to/somewhere".into()), None, 14);
+        assert_eq!(title, " …somewhere ");
     }
 }

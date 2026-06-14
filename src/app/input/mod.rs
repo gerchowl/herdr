@@ -105,12 +105,8 @@ impl App {
     /// The runtime that owns terminal-mode input for the active workspace:
     /// the visible float when one is up, otherwise the focused layout pane.
     pub(crate) fn terminal_input_runtime(&self) -> Option<&crate::terminal::TerminalRuntime> {
-        let ws_idx = self.state.active?;
-        if let Some(float) = self.state.visible_float_for_active_workspace() {
-            return self.terminal_runtimes.get(&float.terminal_id);
-        }
         self.state
-            .focused_runtime_in_workspace(&self.terminal_runtimes, ws_idx)
+            .terminal_input_runtime_from(&self.terminal_runtimes)
     }
 
     pub(crate) fn handle_onboarding_key(&mut self, key: KeyEvent) {
@@ -180,6 +176,17 @@ impl App {
 
     pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) {
         if self.handle_overlay_mouse(mouse) {
+            return;
+        }
+
+        // The visible float paints above the pane field: mouse events inside
+        // its overlay rect belong to the float's runtime and must never leak
+        // to the layout panes underneath (including the URL-click and
+        // double-click pre-hooks below). Events outside fall through.
+        if self
+            .state
+            .handle_float_mouse(&self.terminal_runtimes, mouse)
+        {
             return;
         }
 
@@ -482,6 +489,55 @@ fn app_for_mouse_test() -> App {
     app.state.view.sidebar_rect = ratatui::layout::Rect::new(0, 0, 26, 20);
     app.state.view.terminal_area = ratatui::layout::Rect::new(26, 0, 80, 20);
     app
+}
+
+/// App with a focused layout pane and a visible float, both backed by
+/// channel test runtimes so byte routing is observable.
+#[cfg(test)]
+fn app_with_visible_float() -> (
+    App,
+    tokio::sync::mpsc::Receiver<bytes::Bytes>,
+    tokio::sync::mpsc::Receiver<bytes::Bytes>,
+    crate::layout::PaneId,
+) {
+    let mut app = app_for_mouse_test();
+    let mut ws = crate::workspace::Workspace::test_new("test");
+    let pane_id = ws.tabs[0].root_pane;
+    let pane_infos = ws.tabs[0]
+        .layout
+        .panes(ratatui::layout::Rect::new(26, 2, 80, 18));
+    let info = pane_infos[0].clone();
+    let (pane_rt, pane_rx) = crate::terminal::TerminalRuntime::test_with_channel(
+        info.inner_rect.width,
+        info.inner_rect.height,
+    );
+    ws.tabs[0].runtimes.insert(pane_id, pane_rt);
+    let ws_id = ws.id.clone();
+
+    app.state.workspaces = vec![ws];
+    app.state.active = Some(0);
+    app.state.selected = 0;
+    app.state.mode = Mode::Terminal;
+    app.state.view.pane_infos = pane_infos;
+
+    let float_pane = crate::layout::PaneId::from_raw(777_777);
+    let float_terminal = crate::terminal::TerminalId::alloc();
+    let (float_rt, float_rx) = crate::terminal::TerminalRuntime::test_with_channel(60, 12);
+    app.terminal_runtimes
+        .insert(float_terminal.clone(), float_rt);
+    app.state.terminals.insert(
+        float_terminal.clone(),
+        crate::terminal::TerminalState::new(float_terminal.clone(), "/tmp".into()),
+    );
+    app.state.register_float(
+        ws_id,
+        crate::app::float::FloatPane {
+            pane_id: float_pane,
+            terminal_id: float_terminal,
+            visible: true,
+        },
+    );
+    (app, pane_rx, float_rx, float_pane)
 }
 
 #[cfg(test)]

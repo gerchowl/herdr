@@ -51,8 +51,9 @@ impl App {
     }
 
     /// Handle a Shift-modified scrollback key (PageUp/PageDown/Home/End) by
-    /// scrolling the focused pane's host scrollback. Returns true if the key
-    /// was a scrollback key and was consumed.
+    /// scrolling the host scrollback of the terminal-input owner (the
+    /// visible float when one is up, otherwise the focused layout pane).
+    /// Returns true if the key was a scrollback key and was consumed.
     fn handle_terminal_scrollback_key(&mut self, code: KeyCode) -> bool {
         match code {
             KeyCode::PageUp => self
@@ -95,6 +96,14 @@ impl App {
             }
             if self.state.is_prefix_key(key) {
                 self.state.mode = Mode::Prefix;
+                return None;
+            }
+            // Shift+PageUp/Down/Home/End page the float's HOST scrollback —
+            // the same deterministic keyboard escape hatch layout panes get
+            // (the scrollback helpers target the visible float themselves).
+            if key.modifiers.contains(KeyModifiers::SHIFT)
+                && self.handle_terminal_scrollback_key(key.code)
+            {
                 return None;
             }
             if is_modifier_only_key(&key_event.code) {
@@ -293,7 +302,8 @@ mod tests {
     use ratatui::layout::Rect;
 
     use super::super::{
-        app_for_mouse_test, mouse, numbered_lines_bytes, unique_temp_path, wait_for_file,
+        app_for_mouse_test, app_with_visible_float, mouse, numbered_lines_bytes, unique_temp_path,
+        wait_for_file,
     };
     use super::*;
     use crate::{config::Config, events::AppEvent, workspace::Workspace};
@@ -1338,52 +1348,6 @@ mod tests {
         assert_eq!(end_metrics.offset_from_bottom, 0);
     }
 
-    /// App with a focused layout pane and a visible float, both backed by
-    /// channel test runtimes so byte routing is observable.
-    fn app_with_visible_float() -> (
-        App,
-        tokio::sync::mpsc::Receiver<Bytes>,
-        tokio::sync::mpsc::Receiver<Bytes>,
-        crate::layout::PaneId,
-    ) {
-        let mut app = app_for_mouse_test();
-        let mut ws = Workspace::test_new("test");
-        let pane_id = ws.tabs[0].root_pane;
-        let pane_infos = ws.tabs[0].layout.panes(Rect::new(26, 2, 80, 18));
-        let info = pane_infos[0].clone();
-        let (pane_rt, pane_rx) = crate::terminal::TerminalRuntime::test_with_channel(
-            info.inner_rect.width,
-            info.inner_rect.height,
-        );
-        ws.tabs[0].runtimes.insert(pane_id, pane_rt);
-        let ws_id = ws.id.clone();
-
-        app.state.workspaces = vec![ws];
-        app.state.active = Some(0);
-        app.state.selected = 0;
-        app.state.mode = Mode::Terminal;
-        app.state.view.pane_infos = pane_infos;
-
-        let float_pane = crate::layout::PaneId::from_raw(777_777);
-        let float_terminal = crate::terminal::TerminalId::alloc();
-        let (float_rt, float_rx) = crate::terminal::TerminalRuntime::test_with_channel(60, 12);
-        app.terminal_runtimes
-            .insert(float_terminal.clone(), float_rt);
-        app.state.terminals.insert(
-            float_terminal.clone(),
-            crate::terminal::TerminalState::new(float_terminal.clone(), "/tmp".into()),
-        );
-        app.state.register_float(
-            ws_id,
-            crate::app::float::FloatPane {
-                pane_id: float_pane,
-                terminal_id: float_terminal,
-                visible: true,
-            },
-        );
-        (app, pane_rx, float_rx, float_pane)
-    }
-
     #[tokio::test]
     async fn visible_float_owns_terminal_keys_and_toggle_hides_then_reshows() {
         let (mut app, mut pane_rx, mut float_rx, _) = app_with_visible_float();
@@ -1487,5 +1451,75 @@ mod tests {
         );
         // The workspace pane tree is untouched.
         assert_eq!(app.state.workspaces[0].tabs[0].layout.pane_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn shift_scrollback_keys_target_the_float_host_scrollback_while_visible() {
+        let (mut app, _pane_rx, _float_rx, _) = app_with_visible_float();
+        let float_terminal = app
+            .state
+            .floats
+            .values()
+            .next()
+            .unwrap()
+            .terminal_id
+            .clone();
+        // Swap in a float runtime with scrollback history.
+        let (float_rt, mut float_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                60,
+                12,
+                16 * 1024,
+                &numbered_lines_bytes(64),
+                4,
+            );
+        app.terminal_runtimes
+            .insert(float_terminal.clone(), float_rt);
+        let float_offset = |app: &App| {
+            app.terminal_runtimes
+                .get(&float_terminal)
+                .and_then(crate::terminal::TerminalRuntime::scroll_metrics)
+                .expect("float scroll metrics")
+                .offset_from_bottom
+        };
+
+        // Shift+PageUp pages the float's HOST scrollback instead of being
+        // encoded into the float's PTY.
+        app.handle_terminal_key_headless(TerminalKey::new(KeyCode::PageUp, KeyModifiers::SHIFT));
+        assert!(float_offset(&app) > 0, "float host scrollback paged up");
+        assert!(
+            float_rx.try_recv().is_err(),
+            "scrollback keys send nothing to the float PTY"
+        );
+
+        // Shift+End jumps back to the live bottom.
+        app.handle_terminal_key_headless(TerminalKey::new(KeyCode::End, KeyModifiers::SHIFT));
+        assert_eq!(float_offset(&app), 0);
+
+        // With the float hidden, the same key pages the focused layout pane.
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let pane_rect = app.state.view.pane_infos[0].inner_rect;
+        app.state.workspaces[0].tabs[0].runtimes.insert(
+            pane_id,
+            crate::terminal::TerminalRuntime::test_with_scrollback_bytes(
+                pane_rect.width,
+                pane_rect.height,
+                16 * 1024,
+                &numbered_lines_bytes(64),
+            ),
+        );
+        assert!(app.state.toggle_active_float_visibility());
+        app.handle_terminal_key_headless(TerminalKey::new(KeyCode::PageUp, KeyModifiers::SHIFT));
+
+        let pane_metrics = app
+            .state
+            .runtime_for_pane_in_workspace(&app.terminal_runtimes, 0, pane_id)
+            .and_then(crate::terminal::TerminalRuntime::scroll_metrics)
+            .expect("pane scroll metrics");
+        assert!(
+            pane_metrics.offset_from_bottom > 0,
+            "hidden float yields scrollback keys back to the focused pane"
+        );
+        assert_eq!(float_offset(&app), 0, "the hidden float did not scroll");
     }
 }
