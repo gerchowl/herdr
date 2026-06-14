@@ -1588,6 +1588,91 @@ impl Drop for SshStdioBridge {
     }
 }
 
+/// Single-round-trip remote-herdr discovery for the cold-switch path.
+///
+/// The legacy chain ran `uname`, `command -v herdr`, and one or two
+/// `--version`/`status` probes as *separate* ssh invocations — 3-4 sequential
+/// SSH handshakes before the bridge could even start, which on a slow link is
+/// the bulk of a cold switch's latency. This collapses all of it into one
+/// `/bin/sh -s` script whose tab-delimited output we parse locally, so a cold
+/// switch costs exactly one probe SSH command. The selection order (PATH binary,
+/// then the default `$HOME/.local/bin/herdr`) matches the interactive
+/// `prepare_remote_herdr` path.
+fn probe_switch_remote_herdr(target: &str) -> io::Result<RemoteHerdr> {
+    // `KEY\tVALUE` lines keep parsing robust against missing sections (an absent
+    // candidate simply omits its lines) and empty values (an unresolved
+    // `command -v`). `printf` interprets the `\t`/`\n` escapes; the captured
+    // values are passed as `%s` args so `%` in JSON can't corrupt the format.
+    const PROBE_SCRIPT: &str = r#"printf 'OS\t%s\n' "$(uname -s)"
+printf 'ARCH\t%s\n' "$(uname -m)"
+P=$(command -v herdr 2>/dev/null || true)
+printf 'PATH\t%s\n' "$P"
+if [ -n "$P" ] && [ -x "$P" ]; then
+  printf 'PATHVER\t%s\n' "$("$P" --version 2>/dev/null | head -n1)"
+  printf 'PATHSTATUS\t%s\n' "$("$P" status client --json 2>/dev/null | head -n1)"
+fi
+D="$HOME/.local/bin/herdr"
+if [ -x "$D" ]; then
+  printf 'DEFVER\t%s\n' "$("$D" --version 2>/dev/null | head -n1)"
+  printf 'DEFSTATUS\t%s\n' "$("$D" status client --json 2>/dev/null | head -n1)"
+fi
+"#;
+
+    let output = ssh_sh_output(target, PROBE_SCRIPT)?;
+    if !output.status.success() {
+        return Err(command_failed("remote switch probe failed", &output));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let fields = parse_switch_probe(&stdout);
+    let field = |key: &str| fields.get(key).map(String::as_str).unwrap_or_default();
+
+    let platform = RemotePlatform::from_uname(field("OS"), field("ARCH")).ok_or_else(|| {
+        io::Error::other(format!(
+            "unsupported remote platform: {} {}",
+            field("OS").trim(),
+            field("ARCH").trim()
+        ))
+    })?;
+    let default_remote = RemoteHerdr::for_platform(platform);
+
+    if let Some(path) = fields.get("PATH").filter(|path| path.starts_with('/')) {
+        if switch_probe_matches(fields.get("PATHVER"), fields.get("PATHSTATUS")) {
+            return Ok(default_remote.with_shell_path(shell_quote(path)));
+        }
+    }
+    if switch_probe_matches(fields.get("DEFVER"), fields.get("DEFSTATUS")) {
+        return Ok(default_remote);
+    }
+
+    Err(io::Error::other(format!(
+        "no compatible herdr {} on {target}; install via `herdr --remote {target}` from an interactive terminal first",
+        current_version()
+    )))
+}
+
+fn parse_switch_probe(stdout: &str) -> std::collections::HashMap<String, String> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let (key, value) = line.split_once('\t')?;
+            Some((key.to_string(), value.to_string()))
+        })
+        .collect()
+}
+
+/// A probed binary is usable iff it reports the current `herdr <version>` AND a
+/// client status whose protocol matches ours — same gate as the legacy
+/// `remote_binary_matches`, just evaluated on already-captured output.
+fn switch_probe_matches(version: Option<&String>, status: Option<&String>) -> bool {
+    let (Some(version), Some(status)) = (version, status) else {
+        return false;
+    };
+    version.trim() == format!("herdr {}", current_version())
+        && parse_client_status_json(status)
+            .map(|status| status.protocol == CURRENT_PROTOCOL)
+            .unwrap_or(false)
+}
+
 /// Build a client-side ssh-stdio bridge to `target` for a cold switch dial,
 /// NON-INTERACTIVELY. Used by the slots cold-switch path (#93): the user is
 /// already mid-switch under raw mode, so install prompts are impossible —
@@ -1606,27 +1691,13 @@ pub(crate) fn start_switch_bridge_noninteractive(
         .unwrap_or_else(|| crate::session::DEFAULT_SESSION_NAME.to_string());
     let local_socket = local_forward_socket_path(target, &session_name);
 
-    // Non-interactive remote-herdr discovery: prefer the PATH binary; fall back
-    // to the default `~/.local/bin/herdr` install location. We deliberately do
-    // NOT call into the interactive install/upgrade path — a cold switch under
-    // raw mode cannot prompt the user, and a missing/incompatible remote binary
-    // must surface as a dial failure that the popup shows in plain text.
-    let platform = detect_remote_platform(target)?;
-    let default_remote = RemoteHerdr::for_platform(platform);
-    let path_remote = remote_binary_on_path_any(target, &default_remote)?;
-    let remote_herdr = if let Some(remote) = path_remote
-        .as_ref()
-        .filter(|candidate| remote_binary_matches(target, candidate).unwrap_or(false))
-    {
-        remote.clone()
-    } else if remote_binary_matches(target, &default_remote).unwrap_or(false) {
-        default_remote
-    } else {
-        return Err(io::Error::other(format!(
-            "no compatible herdr {} on {target}; install via `herdr --remote {target}` from an interactive terminal first",
-            current_version()
-        )));
-    };
+    // Non-interactive remote-herdr discovery in a SINGLE ssh round-trip: prefer
+    // the PATH binary; fall back to the default `~/.local/bin/herdr` install
+    // location. We deliberately do NOT call into the interactive install/upgrade
+    // path — a cold switch under raw mode cannot prompt the user, and a
+    // missing/incompatible remote binary must surface as a dial failure that the
+    // popup shows in plain text.
+    let remote_herdr = probe_switch_remote_herdr(target)?;
 
     let manage_ssh_config = crate::config::Config::load()
         .config
@@ -2305,6 +2376,47 @@ mod tests {
             "/usr/local/bin/herdr\n"
         ));
         assert!(!remote_shell_resolves_managed_install(""));
+    }
+
+    #[test]
+    fn parse_switch_probe_reads_tab_delimited_fields() {
+        let stdout = "OS\tDarwin\nARCH\tarm64\nPATH\t/Users/can/.local/bin/herdr\nPATHVER\therdr 0.6.0\nPATHSTATUS\t{\"protocol\":8}\n";
+        let fields = parse_switch_probe(stdout);
+        assert_eq!(fields.get("OS").map(String::as_str), Some("Darwin"));
+        assert_eq!(fields.get("ARCH").map(String::as_str), Some("arm64"));
+        assert_eq!(
+            fields.get("PATH").map(String::as_str),
+            Some("/Users/can/.local/bin/herdr")
+        );
+        assert_eq!(
+            fields.get("PATHVER").map(String::as_str),
+            Some("herdr 0.6.0")
+        );
+        // A missing section simply yields no entry — never a panic.
+        assert!(!fields.contains_key("DEFVER"));
+    }
+
+    #[test]
+    fn switch_probe_matches_requires_version_and_protocol() {
+        let good_version = format!("herdr {}", current_version());
+        let good_status = format!(r#"{{"protocol":{CURRENT_PROTOCOL}}}"#);
+        assert!(switch_probe_matches(
+            Some(&good_version),
+            Some(&good_status)
+        ));
+
+        // Wrong version, stale protocol, and missing fields all reject.
+        assert!(!switch_probe_matches(
+            Some(&"herdr 0.0.1".to_string()),
+            Some(&good_status)
+        ));
+        let stale_status = format!(r#"{{"protocol":{}}}"#, CURRENT_PROTOCOL + 1);
+        assert!(!switch_probe_matches(
+            Some(&good_version),
+            Some(&stale_status)
+        ));
+        assert!(!switch_probe_matches(None, Some(&good_status)));
+        assert!(!switch_probe_matches(Some(&good_version), None));
     }
 
     #[test]
