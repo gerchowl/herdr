@@ -103,6 +103,18 @@ pub(super) fn render_float_overlay(
 
     let show_cursor = app.mode == Mode::Terminal && !pane_is_scrolled_back(rt);
     rt.render(frame, inner, show_cursor);
+
+    // Host text selection over the float, painted with the same style layout
+    // panes use (keyed to the float's pane id, offset to the overlay rect).
+    super::panes::render_selection_highlight(
+        &app.selection,
+        frame,
+        float.pane_id,
+        inner,
+        rt.scroll_metrics(),
+        &app.palette,
+        app.host_terminal_theme,
+    );
 }
 
 /// Border title: the float PTY's live foreground cwd when known (the same

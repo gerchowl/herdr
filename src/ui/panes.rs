@@ -857,7 +857,7 @@ fn render_copy_mode_cursor(app: &AppState, frame: &mut Frame, info: &PaneInfo) {
     );
 }
 
-fn render_selection_highlight(
+pub(crate) fn render_selection_highlight(
     selection: &Option<crate::selection::Selection>,
     frame: &mut Frame,
     pane_id: crate::layout::PaneId,
