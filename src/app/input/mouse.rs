@@ -90,6 +90,12 @@ impl AppState {
     /// swallowed so they never reach the panes underneath. Events outside
     /// the overlay (and gestures anchored outside it) return false and
     /// follow the normal pane path.
+    ///
+    /// Text selection inside the float mirrors layout panes: a left-press the
+    /// float's program does not claim (mouse-reporting off, or Shift held)
+    /// anchors a host selection on the float's pane; dragging extends it and
+    /// release copies. A press the program *does* claim is forwarded as a
+    /// mouse event instead, exactly as in a tiled pane.
     pub(crate) fn handle_float_mouse(
         &mut self,
         terminal_runtimes: &TerminalRuntimeRegistry,
@@ -98,16 +104,60 @@ impl AppState {
         if self.mode != Mode::Terminal {
             return false;
         }
-        // A selection or drag gesture anchored outside the float keeps the
+        let Some(float) = self.visible_float_for_active_workspace() else {
+            return false;
+        };
+        let pane_id = float.pane_id;
+        let terminal_id = float.terminal_id.clone();
+
+        // A selection anchored ON the float owns every following drag/release,
+        // even once the cursor leaves the overlay — drag() clamps to the inner
+        // rect, so it tracks the edge and the release still copies.
+        let float_selecting = self
+            .selection
+            .as_ref()
+            .is_some_and(|sel| sel.pane_id == pane_id && sel.is_in_progress());
+        if float_selecting {
+            match mouse.kind {
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    if let Some(inner) =
+                        crate::ui::float_overlay_inner_rect(self.view.terminal_area)
+                    {
+                        let metrics = terminal_runtimes
+                            .get(&terminal_id)
+                            .and_then(|rt| rt.scroll_metrics());
+                        if let Some(sel) = self.selection.as_mut() {
+                            sel.drag(mouse.column, mouse.row, inner, metrics);
+                        }
+                    }
+                    return true;
+                }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    // Mirror the layout-pane mouse-up: a bare click clears, a
+                    // real drag copies (float-aware extraction in copy_selection).
+                    if let Some(sel) = self.selection.as_ref() {
+                        let was_click = sel.was_just_click();
+                        let was_already_copied = sel.is_done();
+                        self.selection_autoscroll = None;
+                        if was_click {
+                            self.selection = None;
+                        } else if !was_already_copied {
+                            self.copy_selection(terminal_runtimes);
+                        }
+                    }
+                    return true;
+                }
+                _ => {}
+            }
+        }
+
+        // A selection or resize gesture anchored OUTSIDE the float keeps the
         // normal path, so dragging across the overlay cannot hijack it.
         if (self.selection.is_some() || self.drag.is_some())
             && matches!(mouse.kind, MouseEventKind::Drag(_) | MouseEventKind::Up(_))
         {
             return false;
         }
-        let Some(float) = self.visible_float_for_active_workspace() else {
-            return false;
-        };
         let Some(outer) = crate::ui::float_overlay_rect(self.view.terminal_area) else {
             return false;
         };
@@ -120,13 +170,6 @@ impl AppState {
                 return true;
             }
             return false;
-        }
-        let pane_id = float.pane_id;
-        let terminal_id = float.terminal_id.clone();
-
-        if matches!(mouse.kind, MouseEventKind::Down(_)) {
-            self.selection = None;
-            self.selection_autoscroll = None;
         }
 
         let Some(rt) = terminal_runtimes.get(&terminal_id) else {
@@ -158,6 +201,22 @@ impl AppState {
                     MouseEventKind::ScrollUp => rt.scroll_up(self.mouse_scroll_lines),
                     MouseEventKind::ScrollDown => rt.scroll_down(self.mouse_scroll_lines),
                     _ => {}
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                // Same forward-or-select decision as a layout pane: forward the
+                // press when the float's program wants the mouse (and Shift is
+                // not forcing a host selection); otherwise anchor a host
+                // selection on the float's pane.
+                if forward_runtime_mouse_button(rt, pane_id, column, row, mouse) {
+                    self.selection = None;
+                    self.selection_autoscroll = None;
+                } else {
+                    let metrics = rt.scroll_metrics();
+                    self.selection = Some(crate::selection::Selection::anchor(
+                        pane_id, row, column, metrics,
+                    ));
+                    self.selection_autoscroll = None;
                 }
             }
             MouseEventKind::Down(_) | MouseEventKind::Up(_) | MouseEventKind::Drag(_) => {
@@ -3916,6 +3975,110 @@ mod tests {
         assert!(
             app.state.selection.is_none(),
             "border click must not anchor a pane selection"
+        );
+    }
+
+    #[tokio::test]
+    async fn drag_inside_float_without_mouse_reporting_selects_and_copies() {
+        let (mut app, mut pane_rx, mut float_rx, float_pane) = app_with_visible_float();
+        let float_tid = float_terminal_id(&app);
+        // The float's program is NOT reporting mouse, so a left-drag is a host
+        // text selection — the same forward-or-select decision a layout pane makes.
+        app.terminal_runtimes
+            .get(&float_tid)
+            .unwrap()
+            .test_process_pty_bytes(b"hello world");
+
+        let inner = crate::ui::float_overlay_inner_rect(app.state.view.terminal_area)
+            .expect("float inner rect");
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            inner.x,
+            inner.y,
+        ));
+        assert!(
+            app.state
+                .selection
+                .as_ref()
+                .is_some_and(|s| s.pane_id == float_pane),
+            "press anchors a selection on the float's pane"
+        );
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            inner.x + 4,
+            inner.y,
+        ));
+        assert!(
+            app.state.selection.as_ref().is_some_and(|s| s.is_visible()),
+            "drag makes the float selection visible"
+        );
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            inner.x + 4,
+            inner.y,
+        ));
+
+        let copied = app
+            .state
+            .request_clipboard_write
+            .take()
+            .expect("release copies the float selection");
+        let text = String::from_utf8(copied).expect("utf8 clipboard");
+        assert!(
+            text.starts_with("hell"),
+            "copied the dragged cells: {text:?}"
+        );
+        assert!(
+            "hello world".starts_with(&text),
+            "selection stays within the float line: {text:?}"
+        );
+        assert!(app.state.selection.is_none(), "copy clears the selection");
+        assert!(
+            float_rx.try_recv().is_err(),
+            "gesture not forwarded to float"
+        );
+        assert!(pane_rx.try_recv().is_err(), "pane underneath untouched");
+    }
+
+    #[tokio::test]
+    async fn plain_click_in_float_anchors_then_clears_without_copying() {
+        let (mut app, _pane_rx, _float_rx, float_pane) = app_with_visible_float();
+        let float_tid = float_terminal_id(&app);
+        app.terminal_runtimes
+            .get(&float_tid)
+            .unwrap()
+            .test_process_pty_bytes(b"hello world");
+        let inner = crate::ui::float_overlay_inner_rect(app.state.view.terminal_area)
+            .expect("float inner rect");
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            inner.x + 1,
+            inner.y,
+        ));
+        assert!(
+            app.state
+                .selection
+                .as_ref()
+                .is_some_and(|s| s.pane_id == float_pane),
+            "press anchors on the float pane"
+        );
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            inner.x + 1,
+            inner.y,
+        ));
+        assert!(
+            app.state.selection.is_none(),
+            "a bare click leaves no lingering selection"
+        );
+        assert!(
+            app.state.request_clipboard_write.is_none(),
+            "a bare click copies nothing"
         );
     }
 

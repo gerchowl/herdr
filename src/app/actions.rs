@@ -2363,9 +2363,20 @@ impl AppState {
             _ => return,
         };
 
-        let text = self
-            .runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, sel.pane_id)
-            .and_then(|rt| rt.extract_selection(&sel));
+        // A float selection lives outside the workspace pane tree, so resolve
+        // its runtime by the float's terminal id; otherwise it's a layout pane.
+        let float_terminal = self
+            .visible_float_for_active_workspace()
+            .filter(|float| float.pane_id == sel.pane_id)
+            .map(|float| float.terminal_id.clone());
+        let text = match float_terminal {
+            Some(terminal_id) => terminal_runtimes
+                .get(&terminal_id)
+                .and_then(|rt| rt.extract_selection(&sel)),
+            None => self
+                .runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, sel.pane_id)
+                .and_then(|rt| rt.extract_selection(&sel)),
+        };
         if let Some(text) = text {
             if !text.is_empty() {
                 self.request_clipboard_write = Some(text.into_bytes());
