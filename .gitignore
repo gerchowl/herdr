@@ -17,3 +17,6 @@ __pycache__/
 /.pi/cache
 /result
 /result-*
+
+# nix-direnv devshell cache (machine-local, points into /nix/store)
+/.direnv/
