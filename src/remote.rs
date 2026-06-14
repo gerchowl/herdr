@@ -1390,11 +1390,27 @@ mv "$tmp" "$dest"
     }
 }
 
+/// SSH options applied to every non-interactive control-plane invocation
+/// (discovery probes + the bridge tunnel). Without these a dead, firewalled,
+/// or unknown host blocks a server switch indefinitely on a TCP black-hole or
+/// an interactive password / host-key prompt — the "switch just hangs / breaks
+/// herdr" failure mode. `BatchMode` refuses to prompt, `ConnectTimeout` bounds
+/// the TCP connect, and `accept-new` trusts first-seen host keys without asking.
+const SSH_NONINTERACTIVE_OPTS: &[&str] = &[
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "ConnectTimeout=5",
+    "-o",
+    "StrictHostKeyChecking=accept-new",
+];
+
 fn ssh_sh_output(target: &str, script: &str) -> io::Result<Output> {
     // Feed POSIX bootstrap scripts to /bin/sh so the user's login shell only
     // has to parse a simple executable invocation.
     let mut child = Command::new("ssh")
         .arg("-T")
+        .args(SSH_NONINTERACTIVE_OPTS)
         .arg(target)
         .arg("/bin/sh -s")
         .stdin(Stdio::piped())
@@ -1418,6 +1434,7 @@ fn ssh_sh_output(target: &str, script: &str) -> io::Result<Output> {
 fn ssh_user_shell_output(target: &str, command: &str) -> io::Result<Output> {
     Command::new("ssh")
         .arg("-T")
+        .args(SSH_NONINTERACTIVE_OPTS)
         .arg(target)
         .arg(command)
         .output()
@@ -1712,6 +1729,7 @@ fn bridge_connection(
     }
     command
         .arg("-T")
+        .args(SSH_NONINTERACTIVE_OPTS)
         .arg(target)
         .arg(remote_bridge_command(remote_herdr, session_name));
     command
