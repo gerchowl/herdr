@@ -2286,6 +2286,15 @@ const ESC_GRACE_AFTER_SUCCESS: Duration = Duration::from_millis(150);
 /// How long the failure beat stays up before the popup clears.
 const POPUP_FAILURE_BEAT: Duration = Duration::from_secs(2);
 
+/// Overall wall-clock deadline for a single cold-switch dial (probe + bridge +
+/// handshake). #132 bounds each individual ssh with `ConnectTimeout`, but a peer
+/// that accepts the TCP connection and then stalls (auth, exec, or a bridge
+/// accept that never completes) could otherwise outlast the popup's retry window
+/// and leave the user stuck. When this elapses the dial worker surfaces a
+/// `SlotDialFailed` so the loop returns the user to the previous server; it sits
+/// just past `POPUP_RETRY_ENDING_AT` so the popup shows its final hint first.
+const SWITCH_DIAL_DEADLINE: Duration = Duration::from_secs(28);
+
 /// How long the cancel-confirmation beat stays up.
 /// Hold a lone Esc this long before treating it as a real Esc rather
 /// than the first byte of a split key sequence.
@@ -2598,42 +2607,20 @@ fn spawn_switch_dial(
     std::thread::spawn(move || {
         let key = target.key().to_string();
         let (cols, rows, cell_width_px, cell_height_px) = geometry;
-        let dialed: Result<(UnixStream, Option<crate::remote::SshStdioBridge>), ClientError> =
-            (|| {
-                // Path A: the slot already has a live transport (home, or the
-                // active leg's launcher-owned bridge). Just dial it.
-                if let Some(path) = slot_socket_path(&target) {
-                    let mut stream =
-                        UnixStream::connect(&path).map_err(ClientError::ConnectionFailed)?;
-                    do_handshake(
-                        &mut stream,
-                        cols,
-                        rows,
-                        cell_width_px,
-                        cell_height_px,
-                        requested_encoding,
-                        false,
-                        None,
-                        fleet.as_ref(),
-                    )?;
-                    return Ok((stream, None));
-                }
-                // Path B: cold ssh peer with no bridge — build one
-                // non-interactively, then dial the forwarded socket. The
-                // bridge is returned to the loop and stored on the slot.
-                match &target {
-                    slots::SlotTarget::Home => Err(ClientError::ConnectionFailed(
-                        io::Error::other("home slot has no socket path"),
-                    )),
-                    slots::SlotTarget::Ssh(t) => {
-                        let (bridge, sock) = crate::remote::start_switch_bridge_noninteractive(t)
-                            .map_err(ClientError::ConnectionFailed)?;
-                        // The bridge listener may need a moment to be ready
-                        // (it binds synchronously, but ssh dial latency hides
-                        // here on first connect). Retry briefly on connect
-                        // refused to avoid spurious failures.
-                        let mut stream = connect_with_brief_retry(&sock)
-                            .map_err(ClientError::ConnectionFailed)?;
+
+        // Run the blocking dial on an inner thread and race it against an overall
+        // deadline. A dial that outlives the deadline is abandoned: its result
+        // channel receiver is dropped, so a late success drops its stream +
+        // bridge (which clean up on drop) rather than racing a stale flip.
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let dialed: Result<(UnixStream, Option<crate::remote::SshStdioBridge>), ClientError> =
+                (|| {
+                    // Path A: the slot already has a live transport (home, or the
+                    // active leg's launcher-owned bridge). Just dial it.
+                    if let Some(path) = slot_socket_path(&target) {
+                        let mut stream =
+                            UnixStream::connect(&path).map_err(ClientError::ConnectionFailed)?;
                         do_handshake(
                             &mut stream,
                             cols,
@@ -2645,23 +2632,67 @@ fn spawn_switch_dial(
                             None,
                             fleet.as_ref(),
                         )?;
-                        Ok((stream, Some(bridge)))
+                        return Ok((stream, None));
                     }
-                }
-            })();
-        let event = match dialed {
-            Ok((stream, bridge)) => ClientLoopEvent::SlotWarmed {
+                    // Path B: cold ssh peer with no bridge — build one
+                    // non-interactively, then dial the forwarded socket. The
+                    // bridge is returned to the loop and stored on the slot.
+                    match &target {
+                        slots::SlotTarget::Home => Err(ClientError::ConnectionFailed(
+                            io::Error::other("home slot has no socket path"),
+                        )),
+                        slots::SlotTarget::Ssh(t) => {
+                            let (bridge, sock) =
+                                crate::remote::start_switch_bridge_noninteractive(t)
+                                    .map_err(ClientError::ConnectionFailed)?;
+                            // The bridge listener may need a moment to be ready
+                            // (it binds synchronously, but ssh dial latency hides
+                            // here on first connect). Retry briefly on connect
+                            // refused to avoid spurious failures.
+                            let mut stream = connect_with_brief_retry(&sock)
+                                .map_err(ClientError::ConnectionFailed)?;
+                            do_handshake(
+                                &mut stream,
+                                cols,
+                                rows,
+                                cell_width_px,
+                                cell_height_px,
+                                requested_encoding,
+                                false,
+                                None,
+                                fleet.as_ref(),
+                            )?;
+                            Ok((stream, Some(bridge)))
+                        }
+                    }
+                })();
+            let _ = result_tx.send(dialed);
+        });
+
+        let event = match result_rx.recv_timeout(SWITCH_DIAL_DEADLINE) {
+            Ok(Ok((stream, bridge))) => ClientLoopEvent::SlotWarmed {
                 gen,
                 key,
                 stream,
                 bridge,
             },
-            Err(err) => {
+            Ok(Err(err)) => {
                 debug!(target = %key, err = %err, "switch dial failed");
                 ClientLoopEvent::SlotDialFailed {
                     gen,
                     key,
                     err: err.to_string(),
+                }
+            }
+            Err(_) => {
+                debug!(target = %key, "switch dial timed out");
+                ClientLoopEvent::SlotDialFailed {
+                    gen,
+                    key,
+                    err: format!(
+                        "host did not respond within {}s",
+                        SWITCH_DIAL_DEADLINE.as_secs()
+                    ),
                 }
             }
         };
@@ -4151,6 +4182,14 @@ mod tests {
         let now = p.started_at + POPUP_RETRY_ENDING_AT;
         let lines = popup_lines(&p, now);
         assert!(lines[1].contains("retry window ending soon"));
+    }
+
+    #[test]
+    fn switch_dial_deadline_outlasts_popup_retry_hint() {
+        // The dial must not give up before the popup has shown its final
+        // "retry window ending soon" hint — otherwise the failure beat would
+        // replace a hint the user never saw.
+        assert!(SWITCH_DIAL_DEADLINE > POPUP_RETRY_ENDING_AT);
     }
 
     #[test]
