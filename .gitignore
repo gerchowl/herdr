@@ -20,3 +20,6 @@ __pycache__/
 
 # nix-direnv devshell cache (machine-local, points into /nix/store)
 /.direnv/
+
+# Claude Code's per-project local state (scheduled tasks, worktree metadata)
+/.claude/
