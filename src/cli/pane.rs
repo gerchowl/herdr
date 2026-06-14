@@ -1,8 +1,8 @@
 use crate::api::schema::{
     Method, PaneClearHeaderFieldParams, PaneListParams, PaneReadParams, PaneRenameParams,
-    PaneReportAgentParams, PaneReportMetadataParams, PaneReportRecapParams, PaneSendInputParams,
-    PaneSendKeysParams, PaneSendTextParams, PaneSetHeaderFieldParams, PaneSplitParams, PaneTarget,
-    ReadFormat, ReadSource, Request,
+    PaneReportAgentParams, PaneReportMetadataParams, PaneReportRecapParams, PaneReportReplyParams,
+    PaneSendInputParams, PaneSendKeysParams, PaneSendTextParams, PaneSetHeaderFieldParams,
+    PaneSplitParams, PaneTarget, ReadFormat, ReadSource, Request,
 };
 
 pub(super) fn run_pane_command(args: &[String]) -> std::io::Result<i32> {
@@ -23,6 +23,7 @@ pub(super) fn run_pane_command(args: &[String]) -> std::io::Result<i32> {
         "report-agent" => pane_report_agent(&args[1..]),
         "report-metadata" => pane_report_metadata(&args[1..]),
         "report-recap" => pane_report_recap(&args[1..]),
+        "report-reply" => pane_report_reply(&args[1..]),
         "set-field" => pane_set_field(&args[1..]),
         "clear-field" => pane_clear_field(&args[1..]),
         "run" => pane_run(&args[1..]),
@@ -610,6 +611,8 @@ const SET_FIELD_USAGE: &str =
 const CLEAR_FIELD_USAGE: &str = "usage: herdr pane clear-field <key> [--pane <pane_id>]";
 const REPORT_RECAP_USAGE: &str =
     "usage: herdr pane report-recap --source ID --agent LABEL --recap TEXT [--seq N] [--pane <pane_id>]";
+const REPORT_REPLY_USAGE: &str =
+    "usage: herdr pane report-reply --source ID --agent LABEL --reply TEXT [--seq N] [--pane <pane_id>]";
 
 /// `herdr pane report-recap`: append a recap entry to the calling pane's
 /// prompt-history scrollback (#96). The pane defaults to the calling pane,
@@ -700,6 +703,99 @@ fn pane_report_recap(args: &[String]) -> std::io::Result<i32> {
         source,
         agent,
         recap,
+        seq,
+    }))
+}
+
+/// `herdr pane report-reply`: append an assistant-reply entry to the calling
+/// pane's prompt-history scrollback. Wired from the same Stop hook that fires
+/// `report-recap` — see `assets/claude/herdr-agent-state.sh`.
+fn pane_report_reply(args: &[String]) -> std::io::Result<i32> {
+    let mut source = None;
+    let mut agent = None;
+    let mut reply = None;
+    let mut seq = None;
+    let mut pane_id = None;
+
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--source" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --source");
+                    return Ok(2);
+                };
+                source = Some(value.clone());
+                index += 2;
+            }
+            "--agent" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --agent");
+                    return Ok(2);
+                };
+                agent = Some(value.clone());
+                index += 2;
+            }
+            "--reply" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --reply");
+                    return Ok(2);
+                };
+                reply = Some(value.clone());
+                index += 2;
+            }
+            "--seq" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --seq");
+                    return Ok(2);
+                };
+                match super::parse_u64_flag("--seq", value) {
+                    Ok(value) => seq = Some(value),
+                    Err(err) => {
+                        eprintln!("{err}");
+                        return Ok(2);
+                    }
+                }
+                index += 2;
+            }
+            "--pane" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --pane");
+                    return Ok(2);
+                };
+                pane_id = Some(super::normalize_pane_id(value));
+                index += 2;
+            }
+            other => {
+                eprintln!("unknown option: {other}");
+                eprintln!("{REPORT_REPLY_USAGE}");
+                return Ok(2);
+            }
+        }
+    }
+
+    let Some(source) = source.and_then(|source| {
+        let source = source.trim().to_string();
+        (!source.is_empty()).then_some(source)
+    }) else {
+        eprintln!("missing required --source");
+        return Ok(2);
+    };
+    let Some(agent) = agent else {
+        eprintln!("missing required --agent");
+        return Ok(2);
+    };
+    let Some(reply) = reply else {
+        eprintln!("missing required --reply");
+        return Ok(2);
+    };
+    let pane_id = pane_id.unwrap_or_else(calling_pane_id);
+
+    super::send_ok_request(Method::PaneReportReply(PaneReportReplyParams {
+        pane_id,
+        source,
+        agent,
+        reply,
         seq,
     }))
 }
@@ -818,6 +914,10 @@ fn pane_help_text() -> String {
     );
     let _ = writeln!(
         out,
+        "  herdr pane report-reply --source ID --agent LABEL --reply TEXT [--seq N] [--pane <pane_id>]"
+    );
+    let _ = writeln!(
+        out,
         "  herdr pane set-field <key> <value> [--ttl <secs>] [--pane <pane_id>]"
     );
     let _ = writeln!(out, "  herdr pane clear-field <key> [--pane <pane_id>]");
@@ -846,11 +946,19 @@ fn pane_help_text() -> String {
     );
     let _ = writeln!(
         out,
-        "(visible in the expanded header panel). report_prompt is unchanged; both feed"
+        "(visible in the expanded header panel). report-reply appends the agent's last"
     );
     let _ = writeln!(
         out,
-        "the same per-pane history ring (cap ~1000 rendered lines, oldest dropped first)."
+        "assistant message via the same Stop hook; report_prompt is unchanged. All three"
+    );
+    let _ = writeln!(
+        out,
+        "feed the same per-pane history ring (cap ~1000 rendered lines, oldest dropped"
+    );
+    let _ = writeln!(
+        out,
+        "first), rendered in distinct palette tones so prompt/reply/recap are glanceable."
     );
     out
 }
@@ -868,14 +976,19 @@ mod tests {
         let help = pane_help_text();
         assert!(
             help.contains("herdr pane report-recap --source ID --agent LABEL --recap TEXT"),
-            "help should advertise the new report-recap subcommand"
+            "help should advertise the report-recap subcommand"
+        );
+        assert!(
+            help.contains("herdr pane report-reply --source ID --agent LABEL --reply TEXT"),
+            "help should advertise the report-reply subcommand"
         );
         assert!(
             help.contains("prompt-history scrollback"),
             "help should explain that report-recap feeds the scrollback"
         );
+        // Cap semantics may wrap across lines; check the load-bearing phrase.
         assert!(
-            help.contains("cap ~1000 rendered lines, oldest dropped first"),
+            help.contains("~1000 rendered lines"),
             "help should explain the cap semantics"
         );
     }

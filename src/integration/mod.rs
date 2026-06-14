@@ -19,7 +19,7 @@ const OMP_INTEGRATION_VERSION: u32 = 2;
 const PI_CODING_AGENT_DIR_ENV_VAR: &str = "PI_CODING_AGENT_DIR";
 const CLAUDE_HOOK_INSTALL_NAME: &str = "herdr-agent-state.sh";
 const CLAUDE_HOOK_ASSET: &str = include_str!("assets/claude/herdr-agent-state.sh");
-const CLAUDE_INTEGRATION_VERSION: u32 = 6;
+const CLAUDE_INTEGRATION_VERSION: u32 = 7;
 const CLAUDE_CONFIG_DIR_ENV_VAR: &str = "CLAUDE_CONFIG_DIR";
 const CODEX_HOOK_INSTALL_NAME: &str = "herdr-agent-state.sh";
 const CODEX_HOOK_ASSET: &str = include_str!("assets/codex/herdr-agent-state.sh");
@@ -911,6 +911,8 @@ pub(crate) fn install_claude() -> io::Result<ClaudeInstallPaths> {
         "PreToolUse",
         &format!("bash {quoted_hook_path} working"),
     )?;
+    // Older versions of the integration left a `Stop idle` command behind.
+    // Remove it before the v7 install adds the recap/reply Stop handler.
     remove_command_hook(hooks, "Stop", &format!("bash {quoted_hook_path} idle"))?;
     remove_command_hook(
         hooks,
@@ -928,6 +930,17 @@ pub(crate) fn install_claude() -> io::Result<ClaudeInstallPaths> {
         hooks,
         "UserPromptSubmit",
         format!("bash {quoted_hook_path} prompt"),
+        10,
+        None,
+    )?;
+    // Stop: scrape the transcript for the last assistant message, POST it
+    // as a reply, lift the `※ recap:` sentinel line as a recap. Missing
+    // sentinel returns decision:block so the agent gets one more turn to
+    // emit one — self-healing, never user-facing. See the shim asset.
+    ensure_command_hook(
+        hooks,
+        "Stop",
+        format!("bash {quoted_hook_path} stop"),
         10,
         None,
     )?;
@@ -2687,16 +2700,66 @@ mod tests {
                 .unwrap()
                 .ends_with(" prompt")
         );
+        // v7: Stop hook wired to scrape transcript for recap+reply.
+        assert_eq!(settings["hooks"]["Stop"].as_array().unwrap().len(), 1);
+        assert!(settings["hooks"]["Stop"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .ends_with(" stop"));
         assert!(settings["hooks"].get("PreToolUse").is_none());
         assert!(settings["hooks"].get("PermissionRequest").is_none());
         assert!(settings["hooks"].get("PostToolUse").is_none());
         assert!(settings["hooks"].get("PostToolUseFailure").is_none());
         assert!(settings["hooks"].get("SubagentStop").is_none());
-        assert!(settings["hooks"].get("Stop").is_none());
         assert!(settings["hooks"].get("SessionEnd").is_none());
 
         std::env::remove_var("HOME");
         let _ = fs::remove_dir_all(base);
+    }
+
+    /// Structural smoke test for the v7 Claude shim asset. Catches accidental
+    /// regressions (a refactor that drops the filter, the recap extraction,
+    /// or the decision:block nudge) without needing to spawn python3 at
+    /// test time. Pairs with the runtime path that the install test covers.
+    #[test]
+    fn claude_hook_asset_has_v7_shape() {
+        let asset = CLAUDE_HOOK_ASSET;
+        // Version pin so a future change makes the test catch the
+        // out-of-sync constant before the install test reports the wrong
+        // version.
+        assert!(
+            asset.contains("HERDR_INTEGRATION_VERSION=7"),
+            "asset version pin missing"
+        );
+        // Stop action wired through the case statement.
+        assert!(
+            asset.contains("session|prompt|stop"),
+            "stop action missing from case"
+        );
+        // Task-notification + sibling system-reminder filter (the noise the
+        // user surfaced in the float).
+        assert!(
+            asset.contains("<task-notification>"),
+            "task-notification filter prefix missing"
+        );
+        assert!(
+            asset.contains("<system-reminder>"),
+            "system-reminder filter prefix missing"
+        );
+        // Recap sentinel character (KATAKANA REFERENCE MARK U+203B).
+        assert!(
+            asset.contains("\u{203b}"),
+            "recap sentinel char missing from shim"
+        );
+        // Three POST sites: prompt, reply, recap.
+        assert!(asset.contains("pane.report_prompt"));
+        assert!(asset.contains("pane.report_reply"));
+        assert!(asset.contains("pane.report_recap"));
+        // Self-healing nudge emits decision:block on missing recap.
+        assert!(
+            asset.contains("\"decision\": \"block\"") || asset.contains("'decision': 'block'"),
+            "decision:block nudge missing"
+        );
     }
 
     #[test]
@@ -2751,12 +2814,17 @@ mod tests {
                 .unwrap()
                 .ends_with(" prompt")
         );
+        // v7: Stop hook wired to scrape transcript for recap+reply.
+        assert_eq!(settings["hooks"]["Stop"].as_array().unwrap().len(), 1);
+        assert!(settings["hooks"]["Stop"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .ends_with(" stop"));
         assert!(settings["hooks"].get("PreToolUse").is_none());
         assert!(settings["hooks"].get("PermissionRequest").is_none());
         assert!(settings["hooks"].get("PostToolUse").is_none());
         assert!(settings["hooks"].get("PostToolUseFailure").is_none());
         assert!(settings["hooks"].get("SubagentStop").is_none());
-        assert!(settings["hooks"].get("Stop").is_none());
         assert!(settings["hooks"].get("SessionEnd").is_none());
 
         std::env::remove_var("HOME");
@@ -2820,7 +2888,14 @@ mod tests {
                 .ends_with(" prompt")
         );
         assert!(settings["hooks"].get("PreToolUse").is_none());
-        assert!(settings["hooks"].get("Stop").is_none());
+        // v7: Stop is now installed (recap+reply scrape). It should not be
+        // absent here — only the LEGACY `Stop ... idle` command is removed.
+        // The presence assertion mirrors `install_claude_writes_hook_*`.
+        assert_eq!(settings["hooks"]["Stop"].as_array().unwrap().len(), 1);
+        assert!(settings["hooks"]["Stop"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .ends_with(" stop"));
 
         std::env::remove_var("HOME");
         let _ = fs::remove_dir_all(base);
@@ -2849,7 +2924,7 @@ mod tests {
 
         assert_eq!(claude.path, hook_path);
         assert_eq!(claude.installed_version, Some(1));
-        assert_eq!(claude.expected_version, 6);
+        assert_eq!(claude.expected_version, 7);
         assert_eq!(claude.state, IntegrationStatusKind::Outdated);
 
         std::env::remove_var("HOME");
@@ -2879,7 +2954,7 @@ mod tests {
 
         assert_eq!(claude.path, hook_path);
         assert_eq!(claude.installed_version, Some(2));
-        assert_eq!(claude.expected_version, 6);
+        assert_eq!(claude.expected_version, 7);
         assert_eq!(claude.state, IntegrationStatusKind::Outdated);
 
         std::env::remove_var("HOME");

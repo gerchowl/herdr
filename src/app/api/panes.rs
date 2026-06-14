@@ -248,6 +248,32 @@ impl App {
         encode_success(id, ResponseResult::Ok {})
     }
 
+    /// Append a reply entry to the pane's prompt-history scrollback. Replies
+    /// carry the agent's last assistant message (Stop-hook scraped, capped
+    /// on the wire). Stored verbatim after the same sanitize pass prompts
+    /// get; rendered in a distinct palette color so prompt/reply/recap read
+    /// as three glanceable tones in the float.
+    pub(super) fn handle_pane_report_reply(
+        &mut self,
+        id: String,
+        params: crate::api::schema::PaneReportReplyParams,
+    ) -> String {
+        let Some((_ws_idx, pane_id)) =
+            self.parse_pane_id_or_peer(&params.pane_id, self.current_api_peer_pid)
+        else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        if normalize_reported_agent_label(&params.agent).is_none() {
+            return invalid_agent(id);
+        }
+        let reply = sanitize_reported_prompt(&params.reply);
+        if reply.is_empty() {
+            return encode_success(id, ResponseResult::Ok {});
+        }
+        self.handle_internal_event(crate::events::AppEvent::HookReplyReported { pane_id, reply });
+        encode_success(id, ResponseResult::Ok {})
+    }
+
     pub(super) fn handle_pane_report_agent_session(
         &mut self,
         id: String,
@@ -978,6 +1004,113 @@ mod tests {
                 .and_then(|t| t.last_prompt.as_deref()),
             Some("fix the bug")
         );
+    }
+
+    #[test]
+    fn report_reply_round_trips_through_update_terminal_state() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        app.state.workspaces = vec![Workspace::test_new("main")];
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0]
+            .pane_state(pane_id)
+            .expect("pane state")
+            .attached_terminal_id
+            .clone();
+        app.state.terminals.insert(
+            terminal_id.clone(),
+            crate::terminal::TerminalState::new(terminal_id.clone(), "/tmp".into()),
+        );
+        let public_pane_id = app.public_pane_id(0, pane_id).unwrap();
+
+        // The full conversation shape: user prompt, agent reply, recap.
+        // All three land in history as distinct kinds; only the prompt
+        // updates `last_prompt`.
+        app.handle_pane_report_prompt(
+            "rid-p".into(),
+            crate::api::schema::PaneReportPromptParams {
+                pane_id: public_pane_id.clone(),
+                source: "herdr:claude".into(),
+                agent: "claude".into(),
+                prompt: "fix the bug".into(),
+                seq: None,
+            },
+        );
+        let reply_resp = app.handle_pane_report_reply(
+            "rid-r".into(),
+            crate::api::schema::PaneReportReplyParams {
+                pane_id: public_pane_id.clone(),
+                source: "herdr:claude".into(),
+                agent: "claude".into(),
+                reply: "I'll fix the parser at line 42.".into(),
+                seq: None,
+            },
+        );
+        assert!(reply_resp.contains("\"ok\""));
+        app.handle_pane_report_recap(
+            "rid-rc".into(),
+            crate::api::schema::PaneReportRecapParams {
+                pane_id: public_pane_id.clone(),
+                source: "herdr:claude".into(),
+                agent: "claude".into(),
+                recap: "\u{203b} recap: parser bug fixed. Next: ship PR.".into(),
+                seq: None,
+            },
+        );
+
+        let history = &app
+            .state
+            .terminals
+            .get(&terminal_id)
+            .unwrap()
+            .prompt_history;
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[0].kind, crate::terminal::PromptHistoryKind::Prompt);
+        assert_eq!(history[1].kind, crate::terminal::PromptHistoryKind::Reply);
+        assert_eq!(history[2].kind, crate::terminal::PromptHistoryKind::Recap);
+        assert_eq!(history[1].text, "I'll fix the parser at line 42.");
+        assert_eq!(
+            app.state
+                .terminals
+                .get(&terminal_id)
+                .and_then(|t| t.last_prompt.as_deref()),
+            Some("fix the bug"),
+            "reply and recap do not touch last_prompt"
+        );
+    }
+
+    #[test]
+    fn report_reply_rejects_unknown_pane_and_invalid_agent() {
+        let (mut app, _terminal_id, public_pane_id) = app_with_terminal();
+        let response = app.handle_pane_report_reply(
+            "rid".into(),
+            crate::api::schema::PaneReportReplyParams {
+                pane_id: "w_99-1".into(),
+                source: "herdr:claude".into(),
+                agent: "claude".into(),
+                reply: "nope".into(),
+                seq: None,
+            },
+        );
+        assert!(response.contains("pane_not_found"));
+
+        let response = app.handle_pane_report_reply(
+            "rid".into(),
+            crate::api::schema::PaneReportReplyParams {
+                pane_id: public_pane_id,
+                source: "herdr:claude".into(),
+                agent: "   ".into(),
+                reply: "nope".into(),
+                seq: None,
+            },
+        );
+        assert!(response.contains("invalid_agent"));
     }
 
     #[test]

@@ -922,6 +922,25 @@ impl TerminalState {
             },
         );
     }
+
+    /// Append an assistant reply to the history ring. Wired from the Stop
+    /// hook with the last assistant message (capped on the wire). Like
+    /// recaps, replies do NOT update `last_prompt` — the collapsed header
+    /// still shows the latest user prompt verbatim.
+    pub fn record_reply(&mut self, reply: String) {
+        self.record_reply_at(reply, Instant::now());
+    }
+
+    pub fn record_reply_at(&mut self, reply: String, now: Instant) {
+        append_prompt_history_with_cap(
+            &mut self.prompt_history,
+            PromptHistoryEntry {
+                kind: PromptHistoryKind::Reply,
+                text: reply,
+                recorded_at: now,
+            },
+        );
+    }
 }
 
 pub(crate) fn stabilize_agent_state(

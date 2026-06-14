@@ -765,6 +765,9 @@ impl App {
             Method::PaneReportRecap(params) => {
                 return self.handle_pane_report_recap(request.id, params);
             }
+            Method::PaneReportReply(params) => {
+                return self.handle_pane_report_reply(request.id, params);
+            }
             Method::PaneReportMetadata(params) => {
                 return self.handle_pane_report_metadata(request.id, params);
             }

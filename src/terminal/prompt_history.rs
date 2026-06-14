@@ -1,9 +1,11 @@
-//! Per-pane prompt + recap history.
+//! Per-pane prompt + recap + reply history.
 //!
 //! Today the pane header keeps only the LAST prompt; this module backs the
 //! upgrade (issue #96): every `pane.report_prompt` APPENDS a timestamped
-//! entry, and `pane.report_recap` appends a visually distinct recap entry
-//! from a session's Stop hook. The pane header keeps the collapsed (latest)
+//! entry, `pane.report_recap` appends a visually distinct recap entry from a
+//! session's Stop hook, and `pane.report_reply` appends the last assistant
+//! reply so the user can scan the agent's side of the conversation
+//! alongside their own prompts. The pane header keeps the collapsed (latest)
 //! prompt unchanged; the expanded view becomes a bounded scrollable panel.
 //!
 //! Ephemeral by design — never persisted into session snapshots.
@@ -15,11 +17,15 @@ use std::time::{Duration, Instant};
 /// generous for a long session, small enough to bound render cost.
 pub const MAX_PROMPT_HISTORY_LINES: usize = 1000;
 
-/// What kind of entry this is. Recaps render visually distinct from prompts.
+/// What kind of entry this is — each kind renders with its own palette color
+/// so the user can scan the float at a glance: `Prompt` (their input, dim
+/// subtext), `Reply` (the agent's prose response, cool blue), `Recap` (a
+/// disciplined `※ recap:` summary line at end-of-turn, warm mauve accent).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptHistoryKind {
     Prompt,
     Recap,
+    Reply,
 }
 
 /// One history entry. `text` is already sanitized when stored.
