@@ -2860,7 +2860,47 @@ mod tests {
     fn manifest_unsupported_target_errors() {
         let _lock = integration_env_lock();
         let err = integration_manifest(crate::api::schema::IntegrationTarget::Kimi).unwrap_err();
-        assert!(err.to_string().contains("not available"));
+        let message = err.to_string();
+        assert!(message.contains("not available"));
+        // the target label/command must be interpolated (catch a wrong arg).
+        assert!(message.contains("kimi"));
+    }
+
+    #[test]
+    fn manifest_matches_install_with_preexisting_user_hooks() {
+        let _lock = integration_env_lock();
+        let base = unique_base();
+        let claude_dir = base.join("custom-claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+        // A user-defined SessionStart hook unrelated to herdr must survive
+        // install AND must not bleed into the manifest (manifest = herdr's
+        // entries only). This exercises ensure_command_hook's "append to an
+        // existing array" branch, which the empty-settings test does not.
+        fs::write(
+            claude_dir.join("settings.json"),
+            r#"{"hooks":{"SessionStart":[{"matcher":"*","hooks":[{"type":"command","command":"echo user","timeout":5}]}]}}"#,
+        )
+        .unwrap();
+        std::env::set_var(CLAUDE_CONFIG_DIR_ENV_VAR, &claude_dir);
+
+        let installed = install_claude().unwrap();
+        let settings: Value =
+            serde_json::from_str(&fs::read_to_string(&installed.settings_path).unwrap()).unwrap();
+        let manifest = integration_manifest(crate::api::schema::IntegrationTarget::Claude).unwrap();
+
+        let session_start = settings["hooks"]["SessionStart"].as_array().unwrap();
+        // the user's hook is preserved...
+        assert!(session_start
+            .iter()
+            .any(|entry| entry["hooks"][0]["command"] == "echo user"));
+        // ...and herdr's manifest entry is exactly one, present verbatim in the
+        // post-install settings (the subset / no-drift property).
+        let manifest_session = manifest["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(manifest_session.len(), 1);
+        assert!(session_start.contains(&manifest_session[0]));
+
+        clear_integration_path_env();
+        let _ = fs::remove_dir_all(base);
     }
 
     #[test]

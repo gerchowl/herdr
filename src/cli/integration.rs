@@ -104,10 +104,13 @@ fn print_integration_manifest_summary(manifest: &serde_json::Value) {
     println!("hooks fragment to merge into settings.json:");
     if let Some(hooks) = manifest.get("hooks") {
         let fragment = serde_json::json!({ "hooks": hooks });
-        if let Ok(rendered) = serde_json::to_string_pretty(&fragment) {
-            for line in rendered.lines() {
-                println!("  {line}");
+        match serde_json::to_string_pretty(&fragment) {
+            Ok(rendered) => {
+                for line in rendered.lines() {
+                    println!("  {line}");
+                }
             }
+            Err(err) => eprintln!("failed to render hooks fragment: {err}"),
         }
     }
 }
