@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>herdr</title>
+<!--
+  herdr web — gerchowl/herdr#131 (in-tree port of the #109 MVP).
+
+  The bridge sends raw ANSI from herdr (HERDR_RENDER_ENCODING=terminal-ansi)
+  as binary WS frames; xterm.js writes them straight to the buffer.
+  No JS painting, no server rerender — see #109's verdict.
+
+  Vendored offline (no CDN): xterm assets live in ./vendor/ and are embedded
+  in the herdr binary (rust-embed), so the phone needs only the tailnet.
+-->
+<script>
+  // Path-mount aware (#109): tailscale serve fronts us at / (port mode) or a
+  // stripped path mount (/herdr). Resolve assets + the websocket under that
+  // mount so a single build works at both.
+  (function () {
+    var b = location.pathname.replace(/index\.html$/, "");
+    if (!b.endsWith("/")) b += "/";
+    document.write('<base href="' + b + '">');
+    window.__HERDR_BASE = b;
+  })();
+</script>
+<link rel="stylesheet" href="vendor/xterm.min.css">
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #1a1b26; color: #c0caf5; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  #term { position: absolute; inset: 0; }
+  #status {
+    position: fixed; top: 8px; right: 12px; font-size: 11px;
+    padding: 3px 8px; border-radius: 4px; opacity: 0.8;
+    background: rgba(0,0,0,0.4); z-index: 10;
+  }
+  #status.ok { color: #9ece6a; }
+  #status.bad { color: #f7768e; }
+  /* Hide the iOS soft-keyboard hint accessory bar where possible. */
+  textarea { -webkit-appearance: none; }
+</style>
+</head>
+<body>
+<div id="term"></div>
+<div id="status">connecting…</div>
+
+<script src="vendor/xterm.min.js"></script>
+<script src="vendor/addon-fit.min.js"></script>
+
+<script>
+(() => {
+  const status = document.getElementById("status");
+  function setStatus(t, cls) { status.textContent = t; status.className = cls || ""; }
+
+  // Tokyo Night palette.
+  const term = new Terminal({
+    fontFamily: 'Menlo, "JetBrains Mono", Consolas, monospace',
+    fontSize: 13,
+    cursorBlink: true,
+    convertEol: false,
+    allowProposedApi: true,
+    theme: {
+      background: "#1a1b26",
+      foreground: "#c0caf5",
+      cursor: "#c0caf5",
+      selectionBackground: "#283457",
+      black: "#15161e", red: "#f7768e", green: "#9ece6a", yellow: "#e0af68",
+      blue: "#7aa2f7", magenta: "#bb9af7", cyan: "#7dcfff", white: "#a9b1d6",
+      brightBlack: "#414868", brightRed: "#f7768e", brightGreen: "#9ece6a",
+      brightYellow: "#e0af68", brightBlue: "#7aa2f7", brightMagenta: "#bb9af7",
+      brightCyan: "#7dcfff", brightWhite: "#c0caf5",
+    },
+  });
+
+  const fit = new FitAddon.FitAddon();
+  term.loadAddon(fit);
+  term.open(document.getElementById("term"));
+  fit.fit();
+
+  const wsProto = location.protocol === "https:" ? "wss:" : "ws:";
+  const base = window.__HERDR_BASE || "/";
+  const ws = new WebSocket(`${wsProto}//${location.host}${base}ws`);
+  ws.binaryType = "arraybuffer";
+
+  function sendCtrl(obj) {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify(obj));
+    }
+  }
+
+  ws.onopen = () => {
+    setStatus("connected", "ok");
+    const { cols, rows } = term;
+    sendCtrl({ type: "init", cols, rows });
+  };
+  ws.onclose = () => setStatus("disconnected", "bad");
+  ws.onerror = () => setStatus("error", "bad");
+
+  // PTY -> term: binary ANSI from herdr (terminal-ansi).
+  ws.onmessage = (ev) => {
+    if (ev.data instanceof ArrayBuffer) {
+      term.write(new Uint8Array(ev.data));
+    } else if (typeof ev.data === "string") {
+      term.write(ev.data);
+    }
+  };
+
+  // term -> PTY: raw keystrokes as text frames.
+  term.onData((data) => {
+    if (ws.readyState === WebSocket.OPEN) ws.send(data);
+  });
+
+  // Resize plumbing: FitAddon -> ctrl message + term itself.
+  function doFit() {
+    try {
+      fit.fit();
+      const { cols, rows } = term;
+      sendCtrl({ type: "resize", cols, rows });
+    } catch (_) { /* ignore until ws is open */ }
+  }
+  window.addEventListener("resize", doFit);
+  // VisualViewport: iOS soft keyboard appearing changes available height.
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener("resize", doFit);
+  }
+
+  // Focus on tap (helps iOS show the soft keyboard).
+  document.body.addEventListener("click", () => term.focus());
+  term.focus();
+})();
+</script>
+</body>
+</html>

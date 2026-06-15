@@ -57,6 +57,8 @@ mod terminal_notify;
 mod terminal_theme;
 mod ui;
 mod update;
+#[cfg(feature = "web")]
+mod web;
 mod workspace;
 mod worktree;
 
@@ -689,6 +691,7 @@ fn main() -> io::Result<()> {
         println!("       herdr wait <subcommand> ...");
         println!("       herdr session <subcommand> ...");
         println!("       herdr integration <subcommand> ...");
+        println!("       herdr web [--bind <addr>] (requires the `web` feature)");
         println!();
         println!("Common commands:");
         for (command, description) in [

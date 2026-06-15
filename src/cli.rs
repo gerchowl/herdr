@@ -48,10 +48,28 @@ pub fn maybe_run(args: &[String]) -> std::io::Result<CommandOutcome> {
         "wait" => run_wait_command(&args[2..])?,
         "integration" => integration::run_integration_command(&args[2..])?,
         "session" => run_session_command(&args[2..])?,
+        "web" => run_web_command(&args[2..])?,
         _ => return Ok(CommandOutcome::NotCli),
     };
 
     Ok(CommandOutcome::Handled(exit_code))
+}
+
+/// `herdr web` dispatch. Routed entirely through `maybe_run` so the feature gate
+/// lives in exactly one place: a build without `--features web` still recognizes
+/// the subcommand and prints how to enable it, rather than "unknown command".
+fn run_web_command(args: &[String]) -> std::io::Result<i32> {
+    #[cfg(feature = "web")]
+    {
+        crate::web::run_web_command(args)
+    }
+    #[cfg(not(feature = "web"))]
+    {
+        let _ = args;
+        eprintln!("herdr was built without the `web` feature.");
+        eprintln!("rebuild with: cargo build --release --features web");
+        Ok(2)
+    }
 }
 
 fn run_channel_command(args: &[String]) -> std::io::Result<i32> {

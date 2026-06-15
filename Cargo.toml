@@ -9,16 +9,26 @@ repository = "https://github.com/ogulcancelik/herdr"
 homepage = "https://herdr.dev"
 keywords = ["terminal", "tui", "ai", "agents", "multiplexer"]
 categories = ["command-line-utilities"]
-include = ["src/**/*", "assets/sounds/*", "README.md", "LICENSE", "Cargo.toml"]
+include = ["src/**/*", "assets/sounds/*", "assets/web/**/*", "README.md", "LICENSE", "Cargo.toml"]
+
+[features]
+# `herdr web`: xterm.js <-> herdr PTY bridge (gerchowl/herdr#131). Kept behind a
+# feature so axum/futures-util/rust-embed stay out of a default `herdr` build.
+# tokio/net + tokio/io-util are the runtime drivers axum needs for `axum::serve`.
+web = ["dep:anyhow", "dep:axum", "dep:futures-util", "dep:rust-embed", "tokio/net", "tokio/io-util"]
 
 [dependencies]
+anyhow = { version = "1", optional = true }
+axum = { version = "0.7", features = ["ws"], optional = true }
 base64 = "0.22.1"
 bincode = { version = "2", features = ["serde"] }
 bytes = "1"
 crossterm = "0.29"
 ctrlc = { version = "3", features = ["termination"] }
+futures-util = { version = "0.3", optional = true }
 libc = "0.2"
 portable-pty = "0.9"
+rust-embed = { version = "8", optional = true }
 png = "0.17"
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 regex = "1"
