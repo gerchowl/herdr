@@ -23,7 +23,7 @@ repos:
       # real leftover and blocks. Escape any one line with `guardrails-ok`.
       - id: no-debug-leftovers
         name: "no debug-print leftovers — use the tracing facade"
-        entry: env GUARDRAILS_OUTPUT_GLOBS=*/cli/*:*/cli.rs:*/update.rs:*/remote.rs:*/server/headless.rs:*/client/mod.rs:*/integration/mod.rs:scripts/*:vendor/* guardrails-no-debug-leftovers
+        entry: env GUARDRAILS_OUTPUT_GLOBS=*/cli/*:*/cli.rs:*/update.rs:*/remote.rs:*/server/headless.rs:*/client/mod.rs:*/integration/mod.rs:*/web/*:scripts/*:vendor/* guardrails-no-debug-leftovers
         language: system
         pass_filenames: true
       - id: no-commented-code

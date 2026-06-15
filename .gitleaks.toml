@@ -1,0 +1,12 @@
+# herdr gitleaks config — keep the full default ruleset, but don't scan
+# vendored third-party assets. Minified bundles (e.g. xterm.js) contain
+# high-entropy identifiers that trip the generic-api-key heuristic; they are
+# upstream artifacts, not herdr secrets.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "vendored third-party web assets (embedded xterm.js bundle)"
+paths = [
+  '''assets/web/vendor/.*''',
+]

@@ -10,6 +10,8 @@ __pycache__/
 /docs/*
 !/docs/next/
 !/docs/next/**
+!/docs/adr/
+!/docs/adr/**
 /.local/
 
 /.pi/todos
