@@ -1,14 +1,17 @@
 # Fork-only: maintain the `latest` distribution channel for Nix users.
 #
-# Every push to the integration branch builds the flake package — exactly
+# Every push to the integration branch builds the flake packages — exactly
 # what `github:gerchowl/herdr/latest` consumers will get — and fast-forwards
 # `latest` only on success. Pin `latest` for newest-green, a tag/rev for
 # immutable, or the integration branch for bleeding edge.
+#
+# The integration branch is `master` (graduated from feat/sidebar-row-gap,
+# PR #86).
 name: latest-branch
 
 on:
   push:
-    branches: [feat/sidebar-row-gap]
+    branches: [master]
   workflow_dispatch:
 
 permissions:
@@ -30,7 +33,7 @@ jobs:
           extra_nix_config: |
             experimental-features = nix-command flakes
             always-allow-substitutes = true
-      - name: Build the flake package consumers receive
-        run: nix build .#default --print-build-logs
+      - name: Build the flake packages consumers receive
+        run: nix build .#default .#herdr-web --print-build-logs
       - name: Fast-forward latest
         run: git push --force origin "$GITHUB_SHA:refs/heads/latest"
