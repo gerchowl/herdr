@@ -21,7 +21,9 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
     extract::{
@@ -46,15 +48,28 @@ const DEFAULT_BIND: &str = "127.0.0.1:7681";
 #[folder = "assets/web/"]
 struct WebAssets;
 
+/// Default concurrent-session cap — a PTY-exhaustion backstop, generous for a
+/// personal fleet. `0` disables the cap.
+const DEFAULT_MAX_SESSIONS: usize = 16;
+
 /// Parsed `herdr web` configuration.
 struct WebConfig {
     bind: SocketAddr,
     herdr_bin: PathBuf,
+    /// Session name forwarded to the spawned client as `--session <name>`.
+    session: Option<String>,
     herdr_args: Vec<String>,
     allow_non_loopback: bool,
     allow_funnel: bool,
     allowed_origins: Vec<String>,
     allow_any_origin: bool,
+    /// Tailscale identities (`Tailscale-User-Login`) allowed to connect. Empty
+    /// = identity not enforced (loopback / tailnet membership is the boundary).
+    allowed_users: Vec<String>,
+    /// Concurrent WS sessions allowed (`0` = unlimited).
+    max_sessions: usize,
+    /// Close a WS after this long with no inbound frame (`None` = disabled).
+    idle_timeout: Option<Duration>,
 }
 
 #[derive(Clone)]
@@ -63,6 +78,22 @@ struct AppState {
     herdr_args: Arc<Vec<String>>,
     allowed_origins: Arc<Vec<String>>,
     allow_any_origin: bool,
+    allowed_users: Arc<Vec<String>>,
+    max_sessions: usize,
+    idle_timeout: Option<Duration>,
+    /// Live WS session count, for the concurrency cap.
+    sessions: Arc<AtomicUsize>,
+}
+
+/// Decrements the live-session count when a connection ends (any exit path).
+struct SessionGuard {
+    sessions: Arc<AtomicUsize>,
+}
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        self.sessions.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 pub fn run_web_command(args: &[String]) -> std::io::Result<i32> {
@@ -129,11 +160,23 @@ pub fn run_web_command(args: &[String]) -> std::io::Result<i32> {
 
 async fn serve(cfg: WebConfig) -> std::io::Result<i32> {
     let bind = cfg.bind;
+    // `--session <name>` is a global herdr flag, so it must precede any
+    // passthrough args and the (absent) subcommand for the default attach.
+    let mut spawn_args = Vec::new();
+    if let Some(session) = &cfg.session {
+        spawn_args.push("--session".to_string());
+        spawn_args.push(session.clone());
+    }
+    spawn_args.extend(cfg.herdr_args);
     let state = AppState {
         herdr_bin: Arc::new(cfg.herdr_bin),
-        herdr_args: Arc::new(cfg.herdr_args),
+        herdr_args: Arc::new(spawn_args),
         allowed_origins: Arc::new(cfg.allowed_origins),
         allow_any_origin: cfg.allow_any_origin,
+        allowed_users: Arc::new(cfg.allowed_users),
+        max_sessions: cfg.max_sessions,
+        idle_timeout: cfg.idle_timeout,
+        sessions: Arc::new(AtomicUsize::new(0)),
     };
 
     let app = Router::new()
@@ -211,7 +254,40 @@ async fn ws_handler(
         warn!(?origin, ?host, "rejecting cross-origin WS upgrade");
         return (StatusCode::FORBIDDEN, "cross-origin websocket rejected").into_response();
     }
-    ws.on_upgrade(move |socket| handle_socket(socket, state))
+
+    // Identity allow-list (#147). When configured, `tailscale serve` injects
+    // `Tailscale-User-Login`; only listed identities may connect. Empty list =
+    // not enforced (loopback / tailnet membership stays the boundary).
+    let user = header_str(&headers, "tailscale-user-login");
+    if !identity_allowed(user.as_deref(), &state.allowed_users) {
+        warn!(?user, "rejecting WS upgrade: identity not in allow-list");
+        return (StatusCode::FORBIDDEN, "identity not allowed").into_response();
+    }
+
+    // Concurrency cap (#148): reserve a slot before upgrading; the guard
+    // releases it when the connection ends.
+    if state.max_sessions != 0 {
+        let prior = state.sessions.fetch_add(1, Ordering::SeqCst);
+        if prior >= state.max_sessions {
+            state.sessions.fetch_sub(1, Ordering::SeqCst);
+            warn!(
+                max = state.max_sessions,
+                "rejecting WS upgrade: session cap reached"
+            );
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "herdr web: session limit reached",
+            )
+                .into_response();
+        }
+    } else {
+        state.sessions.fetch_add(1, Ordering::SeqCst);
+    }
+    let guard = SessionGuard {
+        sessions: state.sessions.clone(),
+    };
+    let idle = state.idle_timeout;
+    ws.on_upgrade(move |socket| handle_socket(socket, state, guard, idle))
 }
 
 fn header_str(headers: &HeaderMap, name: &str) -> Option<String> {
@@ -221,15 +297,22 @@ fn header_str(headers: &HeaderMap, name: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-async fn handle_socket(socket: WebSocket, state: AppState) {
-    if let Err(e) = pump(socket, state).await {
+async fn handle_socket(
+    socket: WebSocket,
+    state: AppState,
+    guard: SessionGuard,
+    idle: Option<Duration>,
+) {
+    // Held for the connection lifetime; drops (releasing the slot) on return.
+    let _guard = guard;
+    if let Err(e) = pump(socket, state, idle).await {
         warn!(error = %e, "ws session ended with error");
     } else {
         info!("ws session ended cleanly");
     }
 }
 
-async fn pump(socket: WebSocket, state: AppState) -> anyhow::Result<()> {
+async fn pump(socket: WebSocket, state: AppState, idle: Option<Duration>) -> anyhow::Result<()> {
     use anyhow::Context;
     let (mut ws_sink, mut ws_stream) = socket.split();
 
@@ -328,7 +411,20 @@ async fn pump(socket: WebSocket, state: AppState) -> anyhow::Result<()> {
         // writer fd. So this task MUST be aborted on every exit path below,
         // otherwise a client that stops reading but never closes TCP pins a
         // thread + fd per connection.
-        while let Some(msg) = ws_stream.next().await {
+        loop {
+            // Idle timeout (#148): close if no inbound frame within the window.
+            // Bounds a forgotten/abandoned tab; `None` disables it.
+            let msg = match idle {
+                Some(dur) => match tokio::time::timeout(dur, ws_stream.next()).await {
+                    Ok(m) => m,
+                    Err(_) => {
+                        info!("ws idle timeout — closing");
+                        break;
+                    }
+                },
+                None => ws_stream.next().await,
+            };
+            let Some(msg) = msg else { break };
             match msg {
                 Ok(Message::Binary(b)) => {
                     if stdin_tx.send(b).is_err() {
@@ -479,6 +575,20 @@ fn origin_allowed(
     matches!(host, Some(h) if h.eq_ignore_ascii_case(origin_authority))
 }
 
+/// Identity allow-list check for the WS upgrade (#147).
+///
+/// - Empty `allowed` ⇒ not enforced (returns true): loopback + tailnet
+///   membership stay the boundary.
+/// - Otherwise the `Tailscale-User-Login` identity must be present and listed
+///   (case-insensitive; logins are emails). An absent identity is rejected when
+///   a list is configured — we can't verify who is connecting.
+fn identity_allowed(user: Option<&str>, allowed: &[String]) -> bool {
+    if allowed.is_empty() {
+        return true;
+    }
+    matches!(user, Some(u) if allowed.iter().any(|a| a.eq_ignore_ascii_case(u)))
+}
+
 enum FunnelCheck {
     Active,
     Inactive,
@@ -540,18 +650,22 @@ fn parse_args(args: &[String]) -> ParseResult {
     }
     let mut herdr_bin = default_herdr_bin();
     let mut herdr_args: Vec<String> = Vec::new();
+    let mut session: Option<String> = std::env::var("HERDR_WEB_SESSION")
+        .ok()
+        .filter(|s| !s.is_empty());
     let mut allow_non_loopback = false;
     let mut allow_funnel = false;
     let mut allow_any_origin = false;
-    let mut allowed_origins: Vec<String> = std::env::var("HERDR_WEB_ALLOWED_ORIGINS")
+    let mut allowed_origins = csv_env("HERDR_WEB_ALLOWED_ORIGINS");
+    let mut allowed_users = csv_env("HERDR_WEB_ALLOWED_USERS");
+    let mut max_sessions: usize = std::env::var("HERDR_WEB_MAX_SESSIONS")
         .ok()
-        .map(|v| {
-            v.split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect()
-        })
-        .unwrap_or_default();
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_MAX_SESSIONS);
+    let mut idle_secs: u64 = std::env::var("HERDR_WEB_IDLE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
 
     let mut i = 0;
     while i < args.len() {
@@ -573,12 +687,56 @@ fn parse_args(args: &[String]) -> ParseResult {
                 herdr_bin = PathBuf::from(v);
                 i += 2;
             }
+            "--session" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("herdr web: missing value for --session");
+                    return ParseResult::Err(2);
+                };
+                session = Some(v.clone());
+                i += 2;
+            }
             "--allowed-origin" => {
                 let Some(v) = args.get(i + 1) else {
                     eprintln!("herdr web: missing value for --allowed-origin");
                     return ParseResult::Err(2);
                 };
                 allowed_origins.push(v.clone());
+                i += 2;
+            }
+            "--allowed-user" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("herdr web: missing value for --allowed-user");
+                    return ParseResult::Err(2);
+                };
+                allowed_users.push(v.clone());
+                i += 2;
+            }
+            "--max-sessions" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("herdr web: missing value for --max-sessions");
+                    return ParseResult::Err(2);
+                };
+                match v.parse() {
+                    Ok(n) => max_sessions = n,
+                    Err(_) => {
+                        eprintln!("herdr web: invalid --max-sessions: {v}");
+                        return ParseResult::Err(2);
+                    }
+                }
+                i += 2;
+            }
+            "--idle-timeout" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("herdr web: missing value for --idle-timeout");
+                    return ParseResult::Err(2);
+                };
+                match v.parse() {
+                    Ok(n) => idle_secs = n,
+                    Err(_) => {
+                        eprintln!("herdr web: invalid --idle-timeout (seconds): {v}");
+                        return ParseResult::Err(2);
+                    }
+                }
                 i += 2;
             }
             "--allow-non-loopback" => {
@@ -615,12 +773,29 @@ fn parse_args(args: &[String]) -> ParseResult {
     ParseResult::Ok(WebConfig {
         bind,
         herdr_bin,
+        session,
         herdr_args,
         allow_non_loopback,
         allow_funnel,
         allowed_origins,
         allow_any_origin,
+        allowed_users,
+        max_sessions,
+        idle_timeout: (idle_secs > 0).then(|| Duration::from_secs(idle_secs)),
     })
+}
+
+/// Parse a comma-separated env var into a trimmed, non-empty list.
+fn csv_env(name: &str) -> Vec<String> {
+    std::env::var(name)
+        .ok()
+        .map(|v| {
+            v.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn print_web_help() {
@@ -635,12 +810,22 @@ fn print_web_help() {
     println!("                           env: HERDR_WEB_BIND");
     println!("  --herdr-bin <path>       herdr binary to spawn per connection");
     println!("                           (default: this binary; env HERDR_WEB_HERDR_BIN)");
+    println!("  --session <name>         herdr session the bridge attaches to");
+    println!("                           env: HERDR_WEB_SESSION");
     println!("  --allowed-origin <o>     extra allowed WS Origin (repeatable)");
     println!("                           env: HERDR_WEB_ALLOWED_ORIGINS (comma-separated)");
+    println!("  --allowed-user <login>   tailscale identity allowed to connect (repeatable);");
+    println!("                           empty = not enforced. env: HERDR_WEB_ALLOWED_USERS");
+    println!("  --max-sessions <n>       concurrent WS cap (0 = unlimited;");
+    println!(
+        "                           default {DEFAULT_MAX_SESSIONS}). env: HERDR_WEB_MAX_SESSIONS"
+    );
+    println!("  --idle-timeout <secs>    close a WS idle this long (0 = off;");
+    println!("                           default 0). env: HERDR_WEB_IDLE_TIMEOUT_SECS");
     println!("  --allow-non-loopback     permit a routable --bind (you provide auth)");
     println!("  --allow-funnel           start even if `tailscale funnel` is active");
     println!("  --allow-any-origin       disable the same-origin WS check (unsafe)");
-    println!("  -- <herdr args>          args passed to the spawned herdr (e.g. --session)");
+    println!("  -- <herdr args>          extra args passed to the spawned herdr");
 }
 
 #[cfg(test)]
@@ -712,6 +897,26 @@ mod tests {
             &[],
             true
         ));
+    }
+
+    #[test]
+    fn identity_not_enforced_when_list_empty() {
+        assert!(identity_allowed(None, &[]));
+        assert!(identity_allowed(Some("anyone@example.com"), &[]));
+    }
+
+    #[test]
+    fn identity_allowed_when_listed_case_insensitive() {
+        let allowed = vec!["lars@example.com".to_string()];
+        assert!(identity_allowed(Some("Lars@Example.com"), &allowed));
+    }
+
+    #[test]
+    fn identity_rejected_when_not_listed_or_absent() {
+        let allowed = vec!["lars@example.com".to_string()];
+        assert!(!identity_allowed(Some("eve@example.com"), &allowed));
+        // Absent identity but a list is configured → can't verify → reject.
+        assert!(!identity_allowed(None, &allowed));
     }
 
     #[test]
