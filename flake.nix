@@ -33,9 +33,17 @@
             buildChannel = "fork";
             buildId = self.shortRev or self.dirtyShortRev or null;
           };
+          # Same binary plus the `web` feature (the `herdr web` xterm bridge,
+          # gerchowl/herdr#131). Kept out of `default` so a stock build stays
+          # lean; hosts that serve the web terminal pin this output.
+          herdr-web = pkgs.callPackage ./nix/package.nix {
+            buildChannel = "fork";
+            buildId = self.shortRev or self.dirtyShortRev or null;
+            withWeb = true;
+          };
         in
         {
-          inherit herdr;
+          inherit herdr herdr-web;
           default = herdr;
         }
       );
