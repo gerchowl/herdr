@@ -21,6 +21,20 @@ const CLAUDE_HOOK_INSTALL_NAME: &str = "herdr-agent-state.sh";
 const CLAUDE_HOOK_ASSET: &str = include_str!("assets/claude/herdr-agent-state.sh");
 const CLAUDE_INTEGRATION_VERSION: u32 = 7;
 const CLAUDE_CONFIG_DIR_ENV_VAR: &str = "CLAUDE_CONFIG_DIR";
+// Canonical settings.json hook entries herdr installs for Claude Code, as
+// (event, hook-script arg, matcher). Single source of truth shared by
+// `install_claude` (which writes them) and `claude_hooks_fragment` (which the
+// `integration manifest` command emits) so the two cannot drift — see ADR
+// recorded on #136. The legacy-variant removals in `install_claude` are
+// migration cleanup and intentionally stay separate from this table.
+const CLAUDE_HOOK_ENTRIES: &[(&str, &str, Option<&str>)] = &[
+    ("SessionStart", "session", Some("*")),
+    ("UserPromptSubmit", "prompt", None),
+    // Stop: scrape transcript, POST reply + recap, decision:block when the
+    // `※ recap:` sentinel is missing (self-healing nudge). See the shim asset.
+    ("Stop", "stop", None),
+];
+const CLAUDE_HOOK_TIMEOUT: u64 = 10;
 const CODEX_HOOK_INSTALL_NAME: &str = "herdr-agent-state.sh";
 const CODEX_HOOK_ASSET: &str = include_str!("assets/codex/herdr-agent-state.sh");
 const CODEX_INTEGRATION_VERSION: u32 = 5;
@@ -919,31 +933,20 @@ pub(crate) fn install_claude() -> io::Result<ClaudeInstallPaths> {
         "SessionEnd",
         &format!("bash {quoted_hook_path} release"),
     )?;
-    ensure_command_hook(
-        hooks,
-        "SessionStart",
-        format!("bash {quoted_hook_path} session"),
-        10,
-        Some("*"),
-    )?;
-    ensure_command_hook(
-        hooks,
-        "UserPromptSubmit",
-        format!("bash {quoted_hook_path} prompt"),
-        10,
-        None,
-    )?;
-    // Stop: scrape the transcript for the last assistant message, POST it
-    // as a reply, lift the `※ recap:` sentinel line as a recap. Missing
-    // sentinel returns decision:block so the agent gets one more turn to
-    // emit one — self-healing, never user-facing. See the shim asset.
-    ensure_command_hook(
-        hooks,
-        "Stop",
-        format!("bash {quoted_hook_path} stop"),
-        10,
-        None,
-    )?;
+    // SessionStart, UserPromptSubmit, Stop — three table-driven hooks from
+    // CLAUDE_HOOK_ENTRIES, the single source of truth shared by install and
+    // by `integration manifest`. Stop's behavior (scrape transcript, POST
+    // reply, lift `※ recap:`, decision:block on missing sentinel) lives in
+    // the shim asset; install only wires the entry.
+    for (event, arg, matcher) in CLAUDE_HOOK_ENTRIES {
+        ensure_command_hook(
+            hooks,
+            event,
+            format!("bash {quoted_hook_path} {arg}"),
+            CLAUDE_HOOK_TIMEOUT,
+            *matcher,
+        )?;
+    }
 
     fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)?;
 
@@ -951,6 +954,66 @@ pub(crate) fn install_claude() -> io::Result<ClaudeInstallPaths> {
         hook_path,
         settings_path,
     })
+}
+
+/// The settings.json `hooks` fragment herdr installs for Claude Code, built
+/// from [`CLAUDE_HOOK_ENTRIES`] so it is byte-for-byte what `install_claude`
+/// writes via [`ensure_command_hook`]. This is the canonical thing a consumer
+/// merges into its own (possibly read-only / externally-managed) settings.json
+/// instead of relying on herdr to patch the file — the manifest "seam".
+fn claude_hooks_fragment(hook_path: &Path) -> Value {
+    let quoted_hook_path = shell_single_quote(&hook_path.display().to_string());
+    let mut hooks = Map::new();
+    for (event, arg, matcher) in CLAUDE_HOOK_ENTRIES {
+        let mut entry = Map::new();
+        if let Some(matcher) = matcher {
+            entry.insert("matcher".to_string(), Value::String((*matcher).to_string()));
+        }
+        entry.insert(
+            "hooks".to_string(),
+            json!([
+                {
+                    "type": "command",
+                    "command": format!("bash {quoted_hook_path} {arg}"),
+                    "timeout": CLAUDE_HOOK_TIMEOUT,
+                }
+            ]),
+        );
+        hooks.insert(
+            (*event).to_string(),
+            Value::Array(vec![Value::Object(entry)]),
+        );
+    }
+    Value::Object(hooks)
+}
+
+/// Emit the integration contract for `target` as data: the version, the hook
+/// script path, the settings path, and the exact `hooks` fragment to declare.
+/// Consumers (Nix/Home-Manager, Ansible, a human, a postinstall) read this and
+/// own the merge themselves — herdr never has to write a read-only or
+/// externally-co-owned settings.json. See ADR on #136.
+pub(crate) fn integration_manifest(
+    target: crate::api::schema::IntegrationTarget,
+) -> io::Result<Value> {
+    match target {
+        crate::api::schema::IntegrationTarget::Claude => {
+            let dir = claude_dir()?;
+            let hook_path = dir.join("hooks").join(CLAUDE_HOOK_INSTALL_NAME);
+            let settings_path = dir.join("settings.json");
+            Ok(json!({
+                "target": integration_target_label(target),
+                "version": CLAUDE_INTEGRATION_VERSION,
+                "hookScript": hook_path.display().to_string(),
+                "settingsPath": settings_path.display().to_string(),
+                "hooks": claude_hooks_fragment(&hook_path),
+            }))
+        }
+        other => Err(io::Error::other(format!(
+            "manifest is not available for {} yet; use `herdr integration install {}`",
+            integration_target_label(other),
+            integration_target_command(other)
+        ))),
+    }
 }
 
 pub(crate) fn install_codex() -> io::Result<CodexInstallPaths> {
@@ -2760,6 +2823,84 @@ mod tests {
             asset.contains("\"decision\": \"block\"") || asset.contains("'decision': 'block'"),
             "decision:block nudge missing"
         );
+    }
+
+    #[test]
+    fn manifest_hooks_match_installed_settings() {
+        let _lock = integration_env_lock();
+        let base = unique_base();
+        let claude_dir = base.join("custom-claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+        std::env::set_var(CLAUDE_CONFIG_DIR_ENV_VAR, &claude_dir);
+
+        // install writes the canonical hook entries into settings.json...
+        let installed = install_claude().unwrap();
+        let settings: Value =
+            serde_json::from_str(&fs::read_to_string(&installed.settings_path).unwrap()).unwrap();
+
+        // ...and the manifest emits the EXACT same fragment a consumer declares,
+        // so the two sources of truth cannot drift (ADR on #136).
+        let manifest = integration_manifest(crate::api::schema::IntegrationTarget::Claude).unwrap();
+        assert_eq!(manifest["hooks"], settings["hooks"]);
+        assert_eq!(manifest["version"], json!(CLAUDE_INTEGRATION_VERSION));
+        assert_eq!(
+            manifest["hookScript"].as_str().unwrap(),
+            installed.hook_path.display().to_string()
+        );
+        assert_eq!(
+            manifest["settingsPath"].as_str().unwrap(),
+            installed.settings_path.display().to_string()
+        );
+
+        clear_integration_path_env();
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn manifest_unsupported_target_errors() {
+        let _lock = integration_env_lock();
+        let err = integration_manifest(crate::api::schema::IntegrationTarget::Kimi).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("not available"));
+        // the target label/command must be interpolated (catch a wrong arg).
+        assert!(message.contains("kimi"));
+    }
+
+    #[test]
+    fn manifest_matches_install_with_preexisting_user_hooks() {
+        let _lock = integration_env_lock();
+        let base = unique_base();
+        let claude_dir = base.join("custom-claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+        // A user-defined SessionStart hook unrelated to herdr must survive
+        // install AND must not bleed into the manifest (manifest = herdr's
+        // entries only). This exercises ensure_command_hook's "append to an
+        // existing array" branch, which the empty-settings test does not.
+        fs::write(
+            claude_dir.join("settings.json"),
+            r#"{"hooks":{"SessionStart":[{"matcher":"*","hooks":[{"type":"command","command":"echo user","timeout":5}]}]}}"#,
+        )
+        .unwrap();
+        std::env::set_var(CLAUDE_CONFIG_DIR_ENV_VAR, &claude_dir);
+
+        let installed = install_claude().unwrap();
+        let settings: Value =
+            serde_json::from_str(&fs::read_to_string(&installed.settings_path).unwrap()).unwrap();
+        let manifest = integration_manifest(crate::api::schema::IntegrationTarget::Claude).unwrap();
+
+        let session_start = settings["hooks"]["SessionStart"].as_array().unwrap();
+        // the user's hook is preserved...
+        assert!(session_start
+            .iter()
+            .any(|entry| entry["hooks"][0]["command"] == "echo user"));
+        // ...and herdr's manifest entry is exactly one, present verbatim in the
+        // post-install settings (the subset / no-drift property).
+        let manifest_session = manifest["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(manifest_session.len(), 1);
+        assert!(session_start.contains(&manifest_session[0]));
+
+        clear_integration_path_env();
+        let _ = fs::remove_dir_all(base);
     }
 
     #[test]
