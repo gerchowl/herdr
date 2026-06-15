@@ -8,11 +8,14 @@
   herdr web — gerchowl/herdr#131 (in-tree port of the #109 MVP).
 
   The bridge sends raw ANSI from herdr (HERDR_RENDER_ENCODING=terminal-ansi)
-  as binary WS frames; xterm.js writes them straight to the buffer.
-  No JS painting, no server rerender — see #109's verdict.
+  as binary WS frames; xterm.js writes them straight to the buffer. The herdr
+  client enables mouse reporting (DECSET 1000/1006) over that same stream, so
+  xterm forwards mouse/wheel back through term.onData automatically; this page
+  adds touch→mouse mapping for phones (#130), an on-screen CLI key bar (#129),
+  and an auto-hiding status badge (#128).
 
-  Vendored offline (no CDN): xterm assets live in ./vendor/ and are embedded
-  in the herdr binary (rust-embed), so the phone needs only the tailnet.
+  Vendored offline (no CDN): xterm assets in ./vendor/, embedded in the herdr
+  binary, so the phone needs only the tailnet.
 -->
 <script>
   // Path-mount aware (#109): tailscale serve fronts us at / (port mode) or a
@@ -27,31 +30,70 @@
 </script>
 <link rel="stylesheet" href="vendor/xterm.min.css">
 <style>
+  :root { --keybar-h: 40px; }
   html, body { margin: 0; padding: 0; height: 100%; background: #1a1b26; color: #c0caf5; }
   body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
-  #term { position: absolute; inset: 0; }
+  /* Leave room for the key bar at the bottom (#129). */
+  #term { position: absolute; top: 0; left: 0; right: 0; bottom: var(--keybar-h); }
+
+  /* #128 — status badge. Top-right, but auto-hides a couple seconds after
+     'connected' so it stops covering herdr's server/repo header; it returns
+     for connecting/disconnected/error. */
   #status {
     position: fixed; top: 8px; right: 12px; font-size: 11px;
-    padding: 3px 8px; border-radius: 4px; opacity: 0.8;
-    background: rgba(0,0,0,0.4); z-index: 10;
+    padding: 3px 8px; border-radius: 4px;
+    background: rgba(0,0,0,0.55); z-index: 10;
+    transition: opacity 0.6s ease; opacity: 0.85; pointer-events: none;
   }
   #status.ok { color: #9ece6a; }
   #status.bad { color: #f7768e; }
-  /* Hide the iOS soft-keyboard hint accessory bar where possible. */
+  #status.hidden { opacity: 0; }
+
+  /* #129 — on-screen CLI key bar. The iOS soft keyboard has no Esc/Tab/Ctrl/
+     arrows/pipe and no way to send the herdr prefix; this bar emits the right
+     bytes over the existing WS. */
+  #keybar {
+    position: fixed; left: 0; right: 0; bottom: 0; height: var(--keybar-h);
+    display: flex; gap: 4px; align-items: center;
+    padding: 0 6px; box-sizing: border-box;
+    background: #16161e; border-top: 1px solid #2a2b3c;
+    overflow-x: auto; overflow-y: hidden; -webkit-overflow-scrolling: touch;
+    z-index: 11;
+  }
+  #keybar button {
+    flex: 0 0 auto; min-width: 34px; height: 30px;
+    border: 1px solid #2a2b3c; border-radius: 6px;
+    background: #1f2030; color: #c0caf5;
+    font-size: 13px; font-family: Menlo, monospace; cursor: pointer;
+    -webkit-appearance: none; touch-action: manipulation; user-select: none;
+  }
+  #keybar button:active { background: #2a2b40; }
+  #keybar button.sticky-on { background: #7aa2f7; color: #16161e; border-color: #7aa2f7; }
   textarea { -webkit-appearance: none; }
 </style>
 </head>
 <body>
 <div id="term"></div>
 <div id="status">connecting…</div>
+<div id="keybar"></div>
 
 <script src="vendor/xterm.min.js"></script>
 <script src="vendor/addon-fit.min.js"></script>
 
 <script>
 (() => {
-  const status = document.getElementById("status");
-  function setStatus(t, cls) { status.textContent = t; status.className = cls || ""; }
+  const statusEl = document.getElementById("status");
+  let hideTimer = null;
+  function setStatus(text, cls) {
+    statusEl.textContent = text;
+    statusEl.className = cls || "";
+    if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; }
+    // #128: once connected, fade the badge out after 2s; keep transient
+    // states (connecting/disconnected/error) visible.
+    if (cls === "ok") {
+      hideTimer = setTimeout(() => statusEl.classList.add("hidden"), 2000);
+    }
+  }
 
   // Tokyo Night palette.
   const term = new Terminal({
@@ -83,10 +125,11 @@
   const ws = new WebSocket(`${wsProto}//${location.host}${base}ws`);
   ws.binaryType = "arraybuffer";
 
+  function sendBytes(data) {
+    if (ws.readyState === WebSocket.OPEN) ws.send(data);
+  }
   function sendCtrl(obj) {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify(obj));
-    }
+    if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
   }
 
   ws.onopen = () => {
@@ -106,12 +149,124 @@
     }
   };
 
-  // term -> PTY: raw keystrokes as text frames.
+  // ── #129: sticky Ctrl + key bar ──────────────────────────────────────
+  let ctrlSticky = false;
+  let ctrlBtn = null;
+  function setCtrl(on) {
+    ctrlSticky = on;
+    if (ctrlBtn) ctrlBtn.classList.toggle("sticky-on", on);
+  }
+  // Convert a single printable char to its Ctrl- control code (c & 0x1f).
+  function ctrlByte(ch) {
+    const c = ch.charCodeAt(0);
+    if (c >= 0x40 && c <= 0x7e) return String.fromCharCode(c & 0x1f);
+    if (c === 0x20) return "\x00"; // Ctrl-Space
+    return ch;
+  }
+
+  // term -> PTY: keystrokes (and xterm's own mouse reports when herdr has
+  // mouse reporting on) as text frames. Sticky Ctrl rewrites the next char.
   term.onData((data) => {
-    if (ws.readyState === WebSocket.OPEN) ws.send(data);
+    if (ctrlSticky && data.length === 1) {
+      sendBytes(ctrlByte(data));
+      setCtrl(false);
+      return;
+    }
+    sendBytes(data);
   });
 
-  // Resize plumbing: FitAddon -> ctrl message + term itself.
+  const KEYS = [
+    { label: "Esc", bytes: "\x1b" },
+    { label: "Tab", bytes: "\t" },
+    { label: "Ctrl", ctrl: true },
+    { label: "↑", bytes: "\x1b[A" },
+    { label: "↓", bytes: "\x1b[B" },
+    { label: "←", bytes: "\x1b[D" },
+    { label: "→", bytes: "\x1b[C" },
+    { label: "|", bytes: "|" },
+    { label: "/", bytes: "/" },
+    { label: "-", bytes: "-" },
+    { label: "~", bytes: "~" },
+    { label: "`", bytes: "`" },
+    // herdr prefix chord (ctrl+space → NUL). Unlocks prefix-driven features
+    // (new worktree, navigate, kill) from a phone.
+    { label: "prefix", bytes: "\x00" },
+  ];
+  const keybar = document.getElementById("keybar");
+  for (const key of KEYS) {
+    const btn = document.createElement("button");
+    btn.textContent = key.label;
+    if (key.ctrl) {
+      ctrlBtn = btn;
+      btn.addEventListener("click", (e) => { e.preventDefault(); setCtrl(!ctrlSticky); term.focus(); });
+    } else {
+      btn.addEventListener("click", (e) => {
+        e.preventDefault();
+        sendBytes(key.bytes);
+        term.focus();
+      });
+    }
+    keybar.appendChild(btn);
+  }
+
+  // ── #130: touch → mouse (phones have no pointer) ─────────────────────
+  // Only synthesize when herdr actually has mouse reporting on, so we never
+  // inject stray escape sequences as keystrokes. Vertical drag → wheel
+  // (scrolls herdr's pane); long-press → right-click (sidebar menu).
+  function mouseReportingOn() {
+    try { return term.modes && term.modes.mouseTrackingMode &&
+                 term.modes.mouseTrackingMode !== "none"; }
+    catch (_) { return false; }
+  }
+  // SGR 1006 mouse report: ESC [ < b ; x ; y (M=press, m=release).
+  function sgrMouse(button, x, y, press) {
+    return `\x1b[<${button};${x};${y}${press ? "M" : "m"}`;
+  }
+  function cellAt(clientX, clientY) {
+    const el = document.getElementById("term");
+    const r = el.getBoundingClientRect();
+    const cw = r.width / term.cols, ch = r.height / term.rows;
+    const x = Math.min(term.cols, Math.max(1, Math.floor((clientX - r.left) / cw) + 1));
+    const y = Math.min(term.rows, Math.max(1, Math.floor((clientY - r.top) / ch) + 1));
+    return { x, y };
+  }
+
+  const termEl = document.getElementById("term");
+  let touchStartY = 0, touchStartX = 0, touchMoved = false, longPressTimer = null;
+  const WHEEL_STEP_PX = 24;
+  termEl.addEventListener("touchstart", (e) => {
+    if (!mouseReportingOn() || e.touches.length !== 1) return;
+    const t = e.touches[0];
+    touchStartY = t.clientY; touchStartX = t.clientX; touchMoved = false;
+    longPressTimer = setTimeout(() => {
+      if (touchMoved) return;
+      const { x, y } = cellAt(t.clientX, t.clientY);
+      sendBytes(sgrMouse(2, x, y, true));   // right button press
+      sendBytes(sgrMouse(2, x, y, false));  // release
+    }, 450);
+  }, { passive: true });
+  termEl.addEventListener("touchmove", (e) => {
+    if (!mouseReportingOn() || e.touches.length !== 1) return;
+    const t = e.touches[0];
+    const dy = t.clientY - touchStartY;
+    if (Math.abs(dy) < 6 && Math.abs(t.clientX - touchStartX) < 6) return;
+    touchMoved = true;
+    if (longPressTimer) { clearTimeout(longPressTimer); longPressTimer = null; }
+    // Emit one wheel notch per WHEEL_STEP_PX of drag. Drag down = content up.
+    let steps = Math.trunc(dy / WHEEL_STEP_PX);
+    if (steps === 0) return;
+    const button = steps > 0 ? 64 : 65; // 64 = wheel up, 65 = wheel down
+    const { x, y } = cellAt(t.clientX, t.clientY);
+    for (let i = 0; i < Math.min(Math.abs(steps), 5); i++) {
+      sendBytes(sgrMouse(button, x, y, true));
+    }
+    touchStartY = t.clientY;
+  }, { passive: true });
+  termEl.addEventListener("touchend", () => {
+    if (longPressTimer) { clearTimeout(longPressTimer); longPressTimer = null; }
+  });
+
+  // ── resize plumbing ──────────────────────────────────────────────────
   function doFit() {
     try {
       fit.fit();
@@ -120,13 +275,12 @@
     } catch (_) { /* ignore until ws is open */ }
   }
   window.addEventListener("resize", doFit);
-  // VisualViewport: iOS soft keyboard appearing changes available height.
   if (window.visualViewport) {
     window.visualViewport.addEventListener("resize", doFit);
   }
 
   // Focus on tap (helps iOS show the soft keyboard).
-  document.body.addEventListener("click", () => term.focus());
+  termEl.addEventListener("click", () => term.focus());
   term.focus();
 })();
 </script>
