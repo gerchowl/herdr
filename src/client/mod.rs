@@ -1475,6 +1475,9 @@ async fn run_client_loop(
     // without releasing the terminal. When disabled, `slot_manager` is None and
     // the legacy exit-and-relaunch leg path drives every switch.
     let mut slot_manager = build_slot_manager(&write_stream, max_frame_size);
+    // Whether the warm sweep pre-warms cold ssh peers by building their bridge
+    // ahead of time (#139), not just home + the active leg. Read once at start.
+    let prewarm_ssh_peers = crate::config::Config::load().config.slots.prewarm_ssh_peers;
 
     // Bytes consumed from stdin during the pre-handshake theme capture:
     // forward them as the session's first input so no keystroke is lost. The
@@ -1916,24 +1919,36 @@ async fn run_client_loop(
                 if disposition == DialDisposition::Pending {
                     if let Some(manager) = slot_manager.as_mut() {
                         let target = slots::SlotTarget::from_key(&key);
-                        // Register the new connection as warm (with bridge
-                        // ownership), then flip to it in-process.
-                        let conn = slots::SlotConnection {
-                            target: target.clone(),
-                            write_stream: stream,
-                            bridge,
-                        };
-                        if let Err(err) = manager.add_warm(conn) {
-                            warn!(target = %key, err = %err, "switch-dial warmed slot but pause failed");
-                            // Treat as failure-beat.
-                            if let Some(p) = pending_switch.as_mut() {
-                                p.outcome_beat = Some((
-                                    Instant::now() + POPUP_FAILURE_BEAT,
-                                    format!("switch to {} failed: {err}", p.target_display),
-                                ));
-                                paint_switch_popup(p, state.reported_size, Instant::now());
+                        if manager.has_connection(&target) {
+                            // A background pre-warm (#139) connected this slot
+                            // before the switch dial returned. Keep the existing
+                            // warm connection and drop the redundant transport
+                            // off-loop (bridge teardown can block on the loop
+                            // thread); then flip to the already-warm slot below.
+                            std::thread::spawn(move || {
+                                drop(stream);
+                                drop(bridge);
+                            });
+                        } else {
+                            // Register the new connection as warm (with bridge
+                            // ownership), then flip to it in-process.
+                            let conn = slots::SlotConnection {
+                                target: target.clone(),
+                                write_stream: stream,
+                                bridge,
+                            };
+                            if let Err(err) = manager.add_warm(conn) {
+                                warn!(target = %key, err = %err, "switch-dial warmed slot but pause failed");
+                                // Treat as failure-beat.
+                                if let Some(p) = pending_switch.as_mut() {
+                                    p.outcome_beat = Some((
+                                        Instant::now() + POPUP_FAILURE_BEAT,
+                                        format!("switch to {} failed: {err}", p.target_display),
+                                    ));
+                                    paint_switch_popup(p, state.reported_size, Instant::now());
+                                }
+                                continue;
                             }
-                            continue;
                         }
                         match manager.flip_to(&target) {
                             Ok(Some(new_stream)) => {
@@ -1973,15 +1988,27 @@ async fn run_client_loop(
                     slot_dials_in_flight.remove(&key);
                     if let Some(manager) = slot_manager.as_mut() {
                         let target = slots::SlotTarget::from_key(&key);
-                        let conn = slots::SlotConnection {
-                            target,
-                            write_stream: stream,
-                            bridge,
-                        };
-                        if let Err(err) = manager.add_warm(conn) {
-                            debug!(target = %key, err = %err, "failed to pause newly warmed slot");
+                        if manager.has_connection(&target) {
+                            // Already active/warm (a switch dial or an earlier
+                            // sweep won the race for this peer). Drop the
+                            // redundant transport off-loop rather than orphaning
+                            // the live one (#139).
+                            debug!(target = %key, "slot already connected; dropping redundant pre-warm");
+                            std::thread::spawn(move || {
+                                drop(stream);
+                                drop(bridge);
+                            });
                         } else {
-                            debug!(target = %key, "slot warmed and paused");
+                            let conn = slots::SlotConnection {
+                                target,
+                                write_stream: stream,
+                                bridge,
+                            };
+                            if let Err(err) = manager.add_warm(conn) {
+                                debug!(target = %key, err = %err, "failed to pause newly warmed slot");
+                            } else {
+                                debug!(target = %key, "slot warmed and paused");
+                            }
                         }
                     }
                 } else {
@@ -2057,30 +2084,51 @@ async fn run_client_loop(
                         let geometry = (state.reported_size.0, state.reported_size.1, 0, 0);
                         for effect in manager.registry.pending_dials(now) {
                             if let slots::SlotEffect::Dial(target) = effect {
-                                // Only attempt targets with a REAL reachable
-                                // socket (#65, blocker 3): home and the active
-                                // leg's bridge. An additional peer has no bridge
-                                // in stage 1 (#75) — leave it cold-by-design so a
-                                // switch falls back to the relaunch leg, rather
-                                // than dialing a path that never exists.
-                                let Some(socket_path) = slot_socket_path(&target) else {
-                                    continue;
-                                };
                                 let key = target.key().to_string();
                                 if slot_dials_in_flight.contains_key(&key) {
                                     continue;
                                 }
                                 let gen = next_dial_gen;
-                                next_dial_gen = next_dial_gen.wrapping_add(1);
-                                slot_dials_in_flight.insert(key, gen);
-                                spawn_warm_dial(
-                                    gen,
-                                    target.clone(),
-                                    socket_path,
-                                    geometry,
-                                    negotiated_encoding,
-                                    event_tx.clone(),
-                                );
+                                match slot_socket_path(&target) {
+                                    // Home and the active leg's bridge have a
+                                    // REAL reachable socket — dial it directly.
+                                    Some(socket_path) => {
+                                        next_dial_gen = next_dial_gen.wrapping_add(1);
+                                        slot_dials_in_flight.insert(key, gen);
+                                        spawn_warm_dial(
+                                            gen,
+                                            target.clone(),
+                                            socket_path,
+                                            geometry,
+                                            negotiated_encoding,
+                                            event_tx.clone(),
+                                        );
+                                    }
+                                    // A cold ssh peer with no bridge yet (#139):
+                                    // pre-warm it by building the bridge in the
+                                    // background so a switch to it is an instant
+                                    // flip. Bounded by the `[slots] max` cap (each
+                                    // warm peer holds one ssh bridge) and gated by
+                                    // `prewarm_ssh_peers`; a failed dial ghosts
+                                    // with the registry's existing backoff.
+                                    None if prewarm_ssh_peers
+                                        && matches!(target, slots::SlotTarget::Ssh(_)) =>
+                                    {
+                                        next_dial_gen = next_dial_gen.wrapping_add(1);
+                                        slot_dials_in_flight.insert(key, gen);
+                                        spawn_warm_bridge_dial(
+                                            gen,
+                                            target.clone(),
+                                            geometry,
+                                            negotiated_encoding,
+                                            event_tx.clone(),
+                                        );
+                                    }
+                                    // No live socket and pre-warm disabled: leave
+                                    // it cold-by-design so a switch falls back to
+                                    // the cold dial / relaunch leg.
+                                    None => continue,
+                                }
                             }
                         }
                     }
@@ -2529,10 +2577,11 @@ fn build_slot_manager(
 /// Background-dial a warm slot: connect its socket and complete the handshake
 /// so the server holds a session, then report the writable stream back to the
 /// loop (which pauses it). Runs on a detached thread — a slow or failing dial
-/// must never stall the active paint path (#65). Stage 1 warms slots whose
-/// transport is reachable as a local socket: home (the local client socket) and
-/// any peer whose ssh-stdio bridge socket is already live; a cold peer with no
-/// bridge stays cold and a switch to it falls back to the relaunch leg.
+/// must never stall the active paint path (#65). This dials slots whose
+/// transport is already reachable as a local socket: home (the local client
+/// socket) and any peer whose ssh-stdio bridge socket is already live. A cold
+/// peer with no bridge is warmed instead by [`spawn_warm_bridge_dial`] (#139),
+/// which stands the bridge up first.
 fn spawn_warm_dial(
     gen: u64,
     target: slots::SlotTarget,
@@ -2584,6 +2633,24 @@ fn spawn_warm_dial(
         };
         let _ = event_tx.blocking_send(event);
     });
+}
+
+/// Background pre-warm dial for a cold ssh PEER that has no live bridge yet
+/// (#139): build its `SshStdioBridge` non-interactively and warm the slot, so a
+/// later switch to it is an instant flip instead of a cold dial. Reuses the
+/// deadline-bounded bridge dialer ([`spawn_switch_dial`]); `fleet` is `None`
+/// because a pre-warm predates any switch (a genuinely-warm spoke gets its
+/// snapshot on the post-flip push). Disposition is decided by `gen` at apply
+/// time: the sweep tracks this gen in `slot_dials_in_flight`, so the resulting
+/// `SlotWarmed` classifies as a `Sweep` and registers the slot warm-and-paused.
+fn spawn_warm_bridge_dial(
+    gen: u64,
+    target: slots::SlotTarget,
+    geometry: (u16, u16, u32, u32),
+    requested_encoding: RenderEncoding,
+    event_tx: tokio::sync::mpsc::Sender<ClientLoopEvent>,
+) {
+    spawn_switch_dial(gen, target, geometry, requested_encoding, None, event_tx);
 }
 
 /// Spawn an on-demand SWITCH dial for a cold slot (#93). Targets with a live
@@ -2733,10 +2800,11 @@ fn connect_with_brief_retry(path: &std::path::Path) -> io::Result<UnixStream> {
 ///   `local_forward_socket_path` (which keys on `std::process::id()` — the
 ///   launcher's pid, never the client's). Recomputing it was the bug: every ssh
 ///   warm-dial missed and the slot stayed cold.
-/// - Any OTHER ssh peer: there is no bridge for it in stage 1, so it has no
-///   reachable socket. It returns `None` and stays cold-by-design; a switch to
-///   it falls through to the exit-and-relaunch leg that bootstraps the bridge.
-///   Warming additional peers over their own bridges is stage-2 scope (#75).
+/// - Any OTHER ssh peer: there is no pre-existing bridge for it, so it has no
+///   reachable socket here and returns `None`. With `[slots] prewarm_ssh_peers`
+///   (default on, #139) the warm sweep then builds a bridge for it in the
+///   background via [`spawn_warm_bridge_dial`]; with pre-warm disabled it stays
+///   cold-by-design and a switch falls through to the cold dial / relaunch leg.
 fn slot_socket_path(target: &slots::SlotTarget) -> Option<std::path::PathBuf> {
     match target {
         slots::SlotTarget::Home => Some(crate::server::socket_paths::client_socket_path()),

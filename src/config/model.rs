@@ -632,6 +632,16 @@ pub struct SlotsConfig {
     /// including home and the active slot. Far above a personal fleet; only a
     /// large-fleet guard.
     pub max: usize,
+    /// Pre-warm cold ssh PEERS in the background (#139), not just home and the
+    /// active leg. When true (the default, matching the original warm-all
+    /// design), the warm sweep stands up an `SshStdioBridge` for each
+    /// reachable config/snapshot peer ahead of time, so a switch to it is an
+    /// instant in-process flip instead of a cold dial. Still bounded by `max`
+    /// (each warm peer holds one ssh bridge); failed dials ghost with backoff.
+    /// Set false to keep ssh peers cold-by-design (stage-1 behaviour) — useful
+    /// for a very large fleet or a flaky link where many idle bridges are
+    /// undesirable.
+    pub prewarm_ssh_peers: bool,
 }
 
 impl Default for SlotsConfig {
@@ -639,6 +649,7 @@ impl Default for SlotsConfig {
         Self {
             enabled: false,
             max: 8,
+            prewarm_ssh_peers: true,
         }
     }
 }

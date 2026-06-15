@@ -409,8 +409,18 @@ impl SlotManager {
         }
     }
 
+    /// True if this slot already holds a live connection (active or warm). The
+    /// loop uses this to drop a redundant background pre-warm / switch dial (#139)
+    /// instead of overwriting — and orphaning — an established connection when
+    /// two dials race for the same peer.
+    pub(crate) fn has_connection(&self, target: &SlotTarget) -> bool {
+        self.connections.contains_key(target.key())
+    }
+
     /// Register a freshly-dialed warm connection and pause its frames at the
-    /// server. The connection joins the registry as warm.
+    /// server. The connection joins the registry as warm. The caller must only
+    /// call this for a slot with no existing connection (see [`has_connection`]),
+    /// so a racing dial can never replace a live transport.
     pub(crate) fn add_warm(&mut self, mut conn: SlotConnection) -> std::io::Result<()> {
         let key = conn.target.key().to_string();
         if let Some(SlotEffect::Pause(_)) = self.registry.mark_warm(&conn.target) {
@@ -770,6 +780,43 @@ mod tests {
             manager.registry.request_switch(&ssh("anvil")),
             SwitchOutcome::ColdDial(ssh("anvil"))
         );
+    }
+
+    /// `has_connection` is the race guard for #139 pre-warming: it reports a
+    /// live transport for the active slot and any warmed slot, and false for a
+    /// cold or unknown one — so a redundant background dial is dropped instead
+    /// of overwriting an established connection.
+    #[test]
+    fn has_connection_reflects_active_and_warm_only() {
+        let (home_local, _home_peer) = UnixStream::pair().unwrap();
+        let mut manager = SlotManager::new(
+            SlotConnection {
+                target: SlotTarget::Home,
+                write_stream: home_local,
+                bridge: None,
+            },
+            vec![ssh("anvil")],
+            8,
+        );
+        // Active slot: connected. Cold/unknown peers: not.
+        assert!(manager.has_connection(&SlotTarget::Home));
+        assert!(!manager.has_connection(&ssh("anvil")));
+        assert!(!manager.has_connection(&ssh("never-registered")));
+
+        // Warming a slot gives it a connection.
+        let (anvil_local, _anvil_peer) = UnixStream::pair().unwrap();
+        manager
+            .add_warm(SlotConnection {
+                target: ssh("anvil"),
+                write_stream: anvil_local,
+                bridge: None,
+            })
+            .unwrap();
+        assert!(manager.has_connection(&ssh("anvil")));
+
+        // A demoted (dead) slot loses its connection, so a re-dial may re-add it.
+        manager.handle_dead(&ssh("anvil"));
+        assert!(!manager.has_connection(&ssh("anvil")));
     }
 
     #[test]
