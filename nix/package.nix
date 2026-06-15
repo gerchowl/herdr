@@ -18,6 +18,11 @@
   # ("0.6.8" / proto N). null keeps the plain upstream version string.
   buildChannel ? null,
   buildId ? null,
+  # Build the `web` cargo feature (the `herdr web` xterm bridge, gerchowl/herdr#131).
+  # Off by default so the standard build stays lean (no axum/rust-embed); the
+  # flake exposes a `herdr-web` package with this on. The binary is still
+  # `bin/herdr` — the feature only adds the `web` subcommand.
+  withWeb ? false,
 }:
 
 let
@@ -55,8 +60,10 @@ let
   '';
 in
 rustPlatform.buildRustPackage {
-  pname = "herdr";
+  pname = "herdr" + lib.optionalString withWeb "-web";
   version = manifest.package.version;
+
+  buildFeatures = lib.optionals withWeb [ "web" ];
 
   src = lib.fileset.toSource {
     root = ./..;
