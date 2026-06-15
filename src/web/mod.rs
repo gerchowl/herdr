@@ -272,6 +272,22 @@ async fn pump(socket: WebSocket, state: AppState) -> anyhow::Result<()> {
     for a in state.herdr_args.iter() {
         cmd.arg(a);
     }
+    // Start the spawned client from a clean herdr environment. CommandBuilder
+    // seeds env from the current process; if `herdr web` is run from inside a
+    // herdr pane, the inherited `HERDR_*` vars break the child: `HERDR_ENV=1`
+    // trips the nested-launch guard (`exit_if_nested_disabled`) so every
+    // connection flash-exits, and the leg/handoff/switch/socket/pane vars make
+    // it resume stale state or point at the launcher's socket instead of doing
+    // a clean default-launch attach to the persistent server. Strip every
+    // inherited `HERDR_*` (the set grows over time, so blanket-strip rather
+    // than enumerate) except the user's config pointer, then set only what the
+    // bridge needs below.
+    const KEEP_HERDR_ENV: &[&str] = &[crate::config::CONFIG_PATH_ENV_VAR];
+    for (key, _) in std::env::vars() {
+        if key.starts_with("HERDR_") && !KEEP_HERDR_ENV.contains(&key.as_str()) {
+            cmd.env_remove(&key);
+        }
+    }
     // Server-side ANSI diff encoding — the whole reason this bridge exists.
     cmd.env("HERDR_RENDER_ENCODING", "terminal-ansi");
     cmd.env("TERM", "xterm-256color");
@@ -307,6 +323,11 @@ async fn pump(socket: WebSocket, state: AppState) -> anyhow::Result<()> {
     std::thread::spawn(move || pty_writer_loop(writer, stdin_rx));
 
     let ws_to_pty = tokio::spawn(async move {
+        // Owns `stdin_tx`: when this task ends, the sync writer thread's
+        // `rx.recv()` returns Err and the thread exits, releasing the PTY
+        // writer fd. So this task MUST be aborted on every exit path below,
+        // otherwise a client that stops reading but never closes TCP pins a
+        // thread + fd per connection.
         while let Some(msg) = ws_stream.next().await {
             match msg {
                 Ok(Message::Binary(b)) => {
@@ -334,6 +355,10 @@ async fn pump(socket: WebSocket, state: AppState) -> anyhow::Result<()> {
         }
         debug!("ws->pty loop ended");
     });
+
+    // Held so we can abort the WS->PTY task after select! even when another
+    // arm wins (the JoinHandle is consumed by the macro).
+    let ws_to_pty_abort = ws_to_pty.abort_handle();
 
     // Resize listener.
     let master_for_resize = master.clone();
@@ -375,8 +400,12 @@ async fn pump(socket: WebSocket, state: AppState) -> anyhow::Result<()> {
         _ = child_done_rx.recv() => { info!("herdr child exited"); }
     }
 
-    // Dropping the master closes the PTY; herdr will see EOF and exit.
+    // Drop the master and stop the side tasks. The cloned reader fd (held by
+    // the reader thread) is what ultimately sees EOF once the child exits, so
+    // the reader thread unwinds then; aborting ws_to_pty drops `stdin_tx`,
+    // which unblocks and ends the writer thread.
     drop(master);
+    ws_to_pty_abort.abort();
     resize_task.abort();
     Ok(())
 }
@@ -434,11 +463,20 @@ fn origin_allowed(
     let Some(origin) = origin else {
         return true;
     };
-    let origin_authority = origin.split_once("://").map(|(_, a)| a).unwrap_or(origin);
-    if allowed.iter().any(|a| a == origin || a == origin_authority) {
+    // Hostnames are case-insensitive (DNS); compare accordingly so e.g.
+    // `https://Sage.tailnet.ts.net` matches Host `sage.tailnet.ts.net`.
+    let origin_lower = origin.to_ascii_lowercase();
+    let origin_authority = origin_lower
+        .split_once("://")
+        .map(|(_, a)| a)
+        .unwrap_or(origin_lower.as_str());
+    if allowed
+        .iter()
+        .any(|a| a.eq_ignore_ascii_case(origin) || a.eq_ignore_ascii_case(origin_authority))
+    {
         return true;
     }
-    matches!(host, Some(h) if h == origin_authority)
+    matches!(host, Some(h) if h.eq_ignore_ascii_case(origin_authority))
 }
 
 enum FunnelCheck {
@@ -618,6 +656,27 @@ mod tests {
     fn same_origin_is_allowed() {
         assert!(origin_allowed(
             Some("https://sage.tailnet.ts.net"),
+            Some("sage.tailnet.ts.net"),
+            &[],
+            false
+        ));
+    }
+
+    #[test]
+    fn same_origin_is_case_insensitive() {
+        assert!(origin_allowed(
+            Some("https://Sage.Tailnet.ts.net"),
+            Some("sage.tailnet.ts.net"),
+            &[],
+            false
+        ));
+    }
+
+    #[test]
+    fn null_origin_is_rejected() {
+        // Sandboxed/opaque-origin pages send `Origin: null`; not same-origin.
+        assert!(!origin_allowed(
+            Some("null"),
             Some("sage.tailnet.ts.net"),
             &[],
             false
